@@ -1,0 +1,81 @@
+services:
+  ui:
+    image: node:20
+    container_name: face_ui
+    working_dir: /app
+    volumes:
+      - ./ui:/app
+    environment:
+      - VITE_API_BASE=${VITE_API_BASE:-http://localhost:8001}
+    command: bash -lc "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    depends_on:
+      - face_service
+
+  face_service:
+    container_name: face_service
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    volumes:
+      - ./input:/data/input:ro
+      - ./facefolder:/data/facefolder:ro
+      - ./buffalo_l/models:/models:ro
+      - ./data/thumbs:/data/thumbs
+      - ./data/images:/data/images
+      - ./data/events:/data/events
+      - ./config.yaml:/app/config.yaml:ro
+
+    environment:
+      # - FACE_DIR=/media/frigate/facefolder/security
+      - FACE_DIR=/data/facefolder/security
+      - CONFIG_PATH=/app/config.yaml
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_COLLECTION=frigate_faces
+      - BUFFALO_MODEL_ROOT=/models
+      - BUFFALO_MODEL_NAME=buffalo_l
+      - BUFFALO_DET_SIZE=640
+      - FACE_SERVICE_DEBUG=1
+      - BUFFALO_MIN_DET_SCORE=0.3
+      - BUFFALO_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider
+      - FACE_EMBEDDINGS_INDEX=/data/facefolder/security_embeddings/index.json
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://face.service.tools.thefusionapps.com}
+
+    ports:
+      - "8001:8000"
+
+  sftp_poller:
+    container_name: sftp_poller
+    restart: unless-stopped
+    depends_on:
+      - face_service
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "sftp_poller.py"]
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+      - API_BASE_URL=http://face_service:8000
+      - SFTP_CAMERAS_ALLOWLIST=BEWELL-CHN-Entrance,BEWELL-CHN-Entry
+      - SFTP_FILENAME_INCLUDE_ANY=FACE_SNAP
+      - SFTP_FILENAME_EXCLUDE_ANY=FACE_BACKGROUND
+      - SFTP_MAX_FILES_PER_CAMERA_PER_TICK=50
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  qdrant_storage:
