@@ -24,9 +24,21 @@ export default function Recognition() {
   const [camera, setCamera] = useState<string>('');
   const [decision, setDecision] = useState<DecisionFilter>('');
   const [subjectId, setSubjectId] = useState<string>('');
+  const [minSim, setMinSim] = useState<string>('');
+  const [maxSim, setMaxSim] = useState<string>('');
   const [nextCursor, setNextCursor] = useState<number | null>(null);
   const [pageSize, setPageSize] = useState<number>(200);
   const [subjectImgById, setSubjectImgById] = useState<Record<string, string>>({});
+
+  const minSimNum = useMemo(() => {
+    const v = Number(minSim);
+    return Number.isFinite(v) && minSim.trim() !== '' ? v : null;
+  }, [minSim]);
+
+  const maxSimNum = useMemo(() => {
+    const v = Number(maxSim);
+    return Number.isFinite(v) && maxSim.trim() !== '' ? v : null;
+  }, [maxSim]);
 
   const cameras = useMemo(() => {
     const s = new Set<string>();
@@ -43,6 +55,8 @@ export default function Recognition() {
         decision: decision || undefined,
         camera: camera || undefined,
         subject_id: subjectId || undefined,
+        min_similarity: minSimNum != null ? minSimNum : undefined,
+        max_similarity: maxSimNum != null ? maxSimNum : undefined,
         limit: pageSize,
         cursor: cur,
       });
@@ -71,6 +85,8 @@ export default function Recognition() {
         decision: decision || undefined,
         camera: camera || undefined,
         subject_id: subjectId || undefined,
+        min_similarity: minSimNum != null ? minSimNum : undefined,
+        max_similarity: maxSimNum != null ? maxSimNum : undefined,
         limit: pageSize,
         cursor: nextCursor,
       });
@@ -93,6 +109,12 @@ export default function Recognition() {
     load(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [decision, camera, subjectId, pageSize]);
+
+  useEffect(() => {
+    setNextCursor(null);
+    load(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [minSim, maxSim]);
 
   useEffect(() => {
     let cancelled = false;
@@ -176,9 +198,9 @@ export default function Recognition() {
           <input
             type="number"
             min={50}
-            max={500}
+            max={5000}
             value={pageSize}
-            onChange={e => setPageSize(Math.max(50, Math.min(500, Number(e.target.value) || 200)))}
+            onChange={e => setPageSize(Math.max(50, Math.min(5000, Number(e.target.value) || 200)))}
             style={{ width: 90, background: '#111', color: '#e5e5e5', border: '1px solid #222', borderRadius: 8, padding: '6px 10px' }}
           />
         </label>
@@ -206,6 +228,12 @@ export default function Recognition() {
         <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <span style={{ color: '#9ca3af' }}>Subject</span>
           <input value={subjectId} onChange={e => setSubjectId(e.target.value)} placeholder="subject_id" style={{ background: '#111', color: '#e5e5e5', border: '1px solid #222', borderRadius: 8, padding: '6px 10px' }} />
+        </label>
+
+        <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <span style={{ color: '#9ca3af' }}>Conf</span>
+          <input value={minSim} onChange={e => setMinSim(e.target.value)} placeholder="min" style={{ width: 80, background: '#111', color: '#e5e5e5', border: '1px solid #222', borderRadius: 8, padding: '6px 10px' }} />
+          <input value={maxSim} onChange={e => setMaxSim(e.target.value)} placeholder="max" style={{ width: 80, background: '#111', color: '#e5e5e5', border: '1px solid #222', borderRadius: 8, padding: '6px 10px' }} />
         </label>
 
         <div style={{ color: '#9ca3af' }}>
@@ -254,6 +282,12 @@ export default function Recognition() {
 
               <div style={{ color: '#9ca3af' }}>Similarity</div>
               <div>{ev.similarity != null ? ev.similarity.toFixed(4) : '—'}</div>
+
+              <div style={{ color: '#9ca3af' }}>Proc ms</div>
+              <div>{ev.processing_ms != null ? String(ev.processing_ms) : '—'}</div>
+
+              <div style={{ color: '#9ca3af' }}>Model ms</div>
+              <div>{ev.model_ms != null ? String(ev.model_ms) : '—'}</div>
 
               <div style={{ color: '#9ca3af' }}>Reason</div>
               <div style={{ color: '#ef4444', fontWeight: 700 }}>{ev.rejected_reason || '—'}</div>

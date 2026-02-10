@@ -3,11 +3,14 @@ import hashlib
 import json
 import logging
 import os
+import ipaddress
+import socket
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -26,6 +29,8 @@ from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_
 from ui_page import ui_html
 from events_store import EventsStore, RecognitionEvent
 from config_loader import apply_env_defaults_from_config, load_config
+
+import httpx
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -199,6 +204,8 @@ class RecognitionEventResponse(BaseModel):
     decision: str
     subject_id: str | None = None
     similarity: float | None = None
+    processing_ms: int | None = None
+    model_ms: int | None = None
     rejected_reason: str | None = None
     bbox: list[float] | None = None
     det_score: float | None = None
@@ -211,6 +218,16 @@ class RecognitionEventResponse(BaseModel):
 class RecognitionEventsListResponse(BaseModel):
     items: list[RecognitionEventResponse]
     cursor: float | None = None
+
+
+class RecognitionFetchRequest(BaseModel):
+    url: str
+    camera: str
+    source_path: str | None = None
+    ts: float | None = None
+    top_k: int = 5
+    min_similarity: float | None = None
+    process_all_faces: bool = False
 
 
 class FaceSubjectsResponse(BaseModel):
@@ -446,6 +463,29 @@ def _ensure_qdrant_collection(client, collection: str, vector_size: int) -> None
     except Exception:
         exists = False
     if exists:
+        try:
+            info = client.get_collection(collection_name=collection)
+            cfg = getattr(info, "config", None)
+            params = getattr(cfg, "params", None) if cfg is not None else None
+            vectors = getattr(params, "vectors", None) if params is not None else None
+
+            existing_size: int | None = None
+            if vectors is not None:
+                if hasattr(vectors, "size"):
+                    existing_size = int(getattr(vectors, "size"))
+                elif isinstance(vectors, dict) and vectors:
+                    v0 = next(iter(vectors.values()))
+                    if hasattr(v0, "size"):
+                        existing_size = int(getattr(v0, "size"))
+
+            if existing_size is not None and int(existing_size) != int(vector_size):
+                raise RuntimeError(
+                    f"qdrant collection '{collection}' vector_size mismatch: existing={existing_size} expected={int(vector_size)}"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
         return
 
     try:
@@ -984,7 +1024,7 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
         # Deterministic IDs: image_hash and point_id
         image_hash = hashlib.sha256(image_bytes).hexdigest()
         image_id = image_hash[:16]
-        point_id = hashlib.sha256(f"{subject_id}:{image_hash}".encode("utf-8")).hexdigest()
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{subject_id}:{image_hash}"))
         thumb_path = _save_thumb(bgr, app.state.thumbs_dir, image_id)
         image_path = _save_image(bgr, os.environ.get("IMAGES_DIR", "/data/images"), subject_id, image_id)
 
@@ -1072,7 +1112,7 @@ async def faces_add_upload(
         # Deterministic IDs: image_hash and point_id
         image_hash = hashlib.sha256(image_bytes).hexdigest()
         image_id = image_hash[:16]
-        point_id = hashlib.sha256(f"{subject_id}:{image_hash}".encode("utf-8")).hexdigest()
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{subject_id}:{image_hash}"))
         thumb_path = _save_thumb(bgr, app.state.thumbs_dir, image_id)
         image_path = _save_image(bgr, os.environ.get("IMAGES_DIR", "/data/images"), subject_id, image_id)
         try:
@@ -1219,6 +1259,86 @@ async def ingest_recognition_event(
     min_similarity: float | None = Form(None),
     process_all_faces: bool = Form(False),
 ) -> RecognitionEventResponse:
+    image_bytes = await file.read()
+    source_path = str(source_path or str(getattr(file, "filename", "") or "")).strip()
+    return await _process_recognition_image(
+        image_bytes=image_bytes,
+        camera=camera,
+        source_path=source_path,
+        ts=ts,
+        top_k=top_k,
+        min_similarity=min_similarity,
+        process_all_faces=process_all_faces,
+    )
+
+
+def _is_private_address(host: str) -> bool:
+    host = str(host or "").strip()
+    if not host:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return True
+
+    for info in infos or []:
+        try:
+            ip_str = info[4][0]
+            ip = ipaddress.ip_address(ip_str)
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return True
+        except Exception:
+            return True
+    return False
+
+
+async def _fetch_image_bytes(url: str) -> bytes:
+    url = str(url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="url must be http or https")
+    if not p.hostname:
+        raise HTTPException(status_code=400, detail="url hostname is required")
+    if _is_private_address(p.hostname):
+        raise HTTPException(status_code=400, detail="url hostname is not allowed")
+
+    timeout_s = float(os.environ.get("FACE_SERVICE_FETCH_TIMEOUT_SEC", "10") or "10")
+    max_bytes = int(os.environ.get("FACE_SERVICE_FETCH_MAX_BYTES", str(10 * 1024 * 1024)) or str(10 * 1024 * 1024))
+    timeout = httpx.Timeout(timeout_s)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        try:
+            r = await client.get(url)
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=400, detail=f"fetch failed: {str(e)}")
+        if r.status_code >= 400:
+            raise HTTPException(status_code=400, detail=f"fetch failed: status={r.status_code}")
+        data = bytes(r.content or b"")
+        if not data:
+            raise HTTPException(status_code=400, detail="fetch returned empty body")
+        if len(data) > max_bytes:
+            raise HTTPException(status_code=400, detail="fetch response too large")
+        return data
+
+
+async def _process_recognition_image(
+    *,
+    image_bytes: bytes,
+    camera: str,
+    source_path: str,
+    ts: float | None,
+    top_k: int,
+    min_similarity: float | None,
+    process_all_faces: bool,
+) -> RecognitionEventResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
         raise HTTPException(status_code=500, detail="events store not configured")
@@ -1227,13 +1347,13 @@ async def ingest_recognition_event(
     if not camera:
         raise HTTPException(status_code=400, detail="camera is required")
 
-    image_bytes = await file.read()
+    t_req0 = _t()
     bgr = _decode_image_bytes(image_bytes)
     h, w = bgr.shape[:2]
 
     event_id = str(uuid.uuid4())
     ts_val = float(ts) if ts is not None else _now_ts()
-    source_path = str(source_path or str(getattr(file, "filename", "") or "")).strip()
+    source_path = str(source_path or "").strip()
 
     events_dir = os.environ.get("EVENTS_DIR", "/data/events")
 
@@ -1261,6 +1381,7 @@ async def ingest_recognition_event(
         return _l2_normalize(np.asarray(emb, dtype=np.float32))
 
     # detect faces
+    t_model0 = _t()
     faces: list[Any] = []
     try:
         if process_all_faces:
@@ -1268,20 +1389,41 @@ async def ingest_recognition_event(
         else:
             faces = [app.state.embedder.detect_best(bgr)]
     except ValueError:
-        # no faces at all
-        img_path = _save_event_image(bgr, events_dir, f"rejected/{camera}/{event_id}.jpg")
-        thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"evt-{event_id}")
-        image_saved_at = _now_ts() if img_path else None
-        reason = "no_face_detected"
-        meta = {
-            "quality": {"status": "rejected", "reason": reason},
-            "decision": {"status": "rejected"},
-            "faces_total": 0,
-            "faces_processed": 0,
-            "multi_face": bool(process_all_faces),
-        }
-        store.insert_event(
-            RecognitionEvent(
+        if primary_resp is None:
+            # should be rare (e.g. all faces were None)
+            reason = "no_face_detected"
+            processing_ms = int(max(0.0, (_t() - t_req0)) * 1000.0)
+            img_path = _save_event_image(bgr, events_dir, f"rejected/{camera}/{event_id}.jpg")
+            thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"evt-{event_id}")
+            image_saved_at = _now_ts() if img_path else None
+            meta = {
+                "quality": {"status": "rejected", "reason": reason},
+                "decision": {"status": "rejected"},
+                "faces_total": int(faces_total),
+                "faces_processed": int(faces_processed),
+                "multi_face": bool(process_all_faces),
+            }
+            store.insert_event(
+                RecognitionEvent(
+                    event_id=event_id,
+                    ts=ts_val,
+                    camera=camera,
+                    source_path=source_path,
+                    decision="rejected",
+                    subject_id=None,
+                    similarity=None,
+                    processing_ms=processing_ms,
+                    model_ms=processing_ms,
+                    rejected_reason=reason,
+                    bbox=None,
+                    det_score=None,
+                    image_path=img_path,
+                    thumb_path=thumb_path,
+                    image_saved_at=image_saved_at,
+                    meta=meta,
+                )
+            )
+            return RecognitionEventResponse(
                 event_id=event_id,
                 ts=ts_val,
                 camera=camera,
@@ -1289,6 +1431,8 @@ async def ingest_recognition_event(
                 decision="rejected",
                 subject_id=None,
                 similarity=None,
+                processing_ms=processing_ms,
+                model_ms=processing_ms,
                 rejected_reason=reason,
                 bbox=None,
                 det_score=None,
@@ -1297,23 +1441,10 @@ async def ingest_recognition_event(
                 image_saved_at=image_saved_at,
                 meta=meta,
             )
-        )
-        return RecognitionEventResponse(
-            event_id=event_id,
-            ts=ts_val,
-            camera=camera,
-            source_path=source_path,
-            decision="rejected",
-            subject_id=None,
-            similarity=None,
-            rejected_reason=reason,
-            bbox=None,
-            det_score=None,
-            image_path=img_path,
-            thumb_path=thumb_path,
-            image_saved_at=image_saved_at,
-            meta=meta,
-        )
+        else:
+            return primary_resp
+
+    detect_ms = int(max(0.0, (_t() - t_model0)) * 1000.0)
 
     evaluator = getattr(app.state, "quality", None)
     q = getattr(app.state, "qdrant", None)
@@ -1337,7 +1468,10 @@ async def ingest_recognition_event(
 
     primary_resp: RecognitionEventResponse | None = None
     faces_processed = 0
+    face_model_ms_total = 0
     for idx, face in enumerate(faces_sorted):
+        t_face0 = _t()
+        t_face_model0 = _t()
         ev_id = str(uuid.uuid4())
         bbox, det_score = _face_bbox_for_meta(face)
 
@@ -1349,9 +1483,13 @@ async def ingest_recognition_event(
                 quality_meta = {"status": "rejected", "reason": "quality_eval_failed"}
             if isinstance(quality_meta, dict) and quality_meta.get("status") == "rejected":
                 reason = str(quality_meta.get("reason") or "unknown")
+                face_model_ms = int(max(0.0, (_t() - t_face_model0)) * 1000.0)
+                face_model_ms_total += face_model_ms
                 img_path = _save_event_image(bgr, events_dir, f"rejected/{camera}/{ev_id}.jpg")
                 thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"evt-{ev_id}")
                 image_saved_at = _now_ts() if img_path else None
+                processing_ms = int(max(0.0, (_t() - t_face0)) * 1000.0)
+                model_ms = int(detect_ms + face_model_ms_total)
                 meta = {
                     "quality": quality_meta,
                     "decision": {"status": "rejected"},
@@ -1369,6 +1507,8 @@ async def ingest_recognition_event(
                         decision="rejected",
                         subject_id=None,
                         similarity=None,
+                        processing_ms=processing_ms,
+                        model_ms=model_ms,
                         rejected_reason=reason,
                         bbox=bbox,
                         det_score=det_score,
@@ -1388,6 +1528,8 @@ async def ingest_recognition_event(
                         decision="rejected",
                         subject_id=None,
                         similarity=None,
+                        processing_ms=processing_ms,
+                        model_ms=model_ms,
                         rejected_reason=reason,
                         bbox=bbox,
                         det_score=det_score,
@@ -1401,9 +1543,13 @@ async def ingest_recognition_event(
         emb = _embed_from_face(face)
         if emb is None:
             reason = "no_embedding"
+            face_model_ms = int(max(0.0, (_t() - t_face_model0)) * 1000.0)
+            face_model_ms_total += face_model_ms
             img_path = _save_event_image(bgr, events_dir, f"rejected/{camera}/{ev_id}.jpg")
             thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"evt-{ev_id}")
             image_saved_at = _now_ts() if img_path else None
+            processing_ms = int(max(0.0, (_t() - t_face0)) * 1000.0)
+            model_ms = int(detect_ms + face_model_ms_total)
             meta = {
                 "quality": quality_meta,
                 "decision": {"status": "rejected"},
@@ -1421,6 +1567,8 @@ async def ingest_recognition_event(
                     decision="rejected",
                     subject_id=None,
                     similarity=None,
+                    processing_ms=processing_ms,
+                    model_ms=model_ms,
                     rejected_reason=reason,
                     bbox=bbox,
                     det_score=det_score,
@@ -1440,6 +1588,8 @@ async def ingest_recognition_event(
                     decision="rejected",
                     subject_id=None,
                     similarity=None,
+                    processing_ms=processing_ms,
+                    model_ms=model_ms,
                     rejected_reason=reason,
                     bbox=bbox,
                     det_score=det_score,
@@ -1472,6 +1622,10 @@ async def ingest_recognition_event(
                 matched = False
 
         decision = "match" if matched else "no_match"
+
+        face_model_ms = int(max(0.0, (_t() - t_face_model0)) * 1000.0)
+        face_model_ms_total += face_model_ms
+        model_ms = int(detect_ms + face_model_ms_total)
         img_path = _save_event_image(
             bgr,
             events_dir,
@@ -1479,6 +1633,7 @@ async def ingest_recognition_event(
         )
         thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"evt-{ev_id}")
         image_saved_at = _now_ts() if img_path else None
+        processing_ms = int(max(0.0, (_t() - t_face0)) * 1000.0)
 
         meta = {
             "quality": quality_meta,
@@ -1505,6 +1660,8 @@ async def ingest_recognition_event(
                 decision=decision,
                 subject_id=subject_id,
                 similarity=similarity,
+                processing_ms=processing_ms,
+                model_ms=model_ms,
                 rejected_reason=None,
                 bbox=bbox,
                 det_score=det_score,
@@ -1525,6 +1682,8 @@ async def ingest_recognition_event(
                 decision=decision,
                 subject_id=subject_id,
                 similarity=similarity,
+                processing_ms=processing_ms,
+                model_ms=model_ms,
                 rejected_reason=None,
                 bbox=bbox,
                 det_score=det_score,
@@ -1553,6 +1712,8 @@ def list_recognition_events(
     camera: str | None = None,
     subject_id: str | None = None,
     decision: str | None = None,
+    min_similarity: float | None = None,
+    max_similarity: float | None = None,
     since_ts: float | None = None,
     until_ts: float | None = None,
     limit: int = 100,
@@ -1565,6 +1726,8 @@ def list_recognition_events(
         camera=camera,
         subject_id=subject_id,
         decision=decision,
+        min_similarity=min_similarity,
+        max_similarity=max_similarity,
         since_ts=since_ts,
         until_ts=until_ts,
         limit=limit,
@@ -1574,6 +1737,67 @@ def list_recognition_events(
         items=[RecognitionEventResponse(**it) for it in items],
         cursor=next_cur,
     )
+
+
+class ForwardEventRequest(BaseModel):
+    event_id: str
+    target_url: str | None = None
+
+
+@app.post("/v1/events/recognition/forward")
+async def forward_recognition_event(req: ForwardEventRequest) -> dict[str, Any]:
+    store: EventsStore | None = getattr(app.state, "events", None)
+    if store is None:
+        raise HTTPException(status_code=500, detail="events store not configured")
+
+    event_id = str(req.event_id or "").strip()
+    if not event_id:
+        raise HTTPException(status_code=400, detail="event_id is required")
+
+    it = store.get_event(event_id)
+    if not it:
+        raise HTTPException(status_code=404, detail="event not found")
+
+    target_url = str(req.target_url or os.environ.get("FACE_SERVICE_FORWARD_URL", "") or "").strip()
+    if not target_url:
+        raise HTTPException(status_code=400, detail="target_url is required")
+
+    img_path = str(it.get("image_path") or "")
+    if not img_path.startswith("/events/"):
+        raise HTTPException(status_code=400, detail="event has no persisted image")
+
+    events_dir = os.environ.get("EVENTS_DIR", "/data/events")
+    abs_path = os.path.join(str(events_dir), img_path.replace("/events/", "", 1).lstrip("/"))
+    try:
+        with open(abs_path, "rb") as f:
+            img_bytes = f.read()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to read image: {e}")
+
+    payload = {
+        "event_id": it.get("event_id"),
+        "ts": it.get("ts"),
+        "camera": it.get("camera"),
+        "source_path": it.get("source_path"),
+        "decision": it.get("decision"),
+        "subject_id": it.get("subject_id"),
+        "similarity": it.get("similarity"),
+        "processing_ms": it.get("processing_ms"),
+        "rejected_reason": it.get("rejected_reason"),
+        "bbox": it.get("bbox"),
+        "det_score": it.get("det_score"),
+        "meta": it.get("meta"),
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.post(
+            target_url,
+            data={"metadata_json": json.dumps(payload)},
+            files={"file": (f"{event_id}.jpg", img_bytes, "image/jpeg")},
+        )
+    if r.status_code >= 300:
+        raise HTTPException(status_code=502, detail=f"forward failed: {r.status_code} {r.text[:300]}")
+    return {"forwarded": True, "status_code": int(r.status_code)}
 
 
 @app.get("/v1/events/recognition/{event_id}", response_model=RecognitionEventResponse)

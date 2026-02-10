@@ -36,7 +36,8 @@ services:
       - FACE_DIR=/data/facefolder/security
       - CONFIG_PATH=/app/config.yaml
       - QDRANT_URL=http://qdrant:6333
-      - QDRANT_COLLECTION=frigate_faces
+      - QDRANT_COLLECTION=frigate_faces_v2
+      # - QDRANT_COLLECTION=frigate_faces old emp db
       - BUFFALO_MODEL_ROOT=/models
       - BUFFALO_MODEL_NAME=buffalo_l
       - BUFFALO_DET_SIZE=640
@@ -45,9 +46,19 @@ services:
       - BUFFALO_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider
       - FACE_EMBEDDINGS_INDEX=/data/facefolder/security_embeddings/index.json
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://face.service.tools.thefusionapps.com}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
     ports:
       - "8001:8000"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   sftp_poller:
     container_name: sftp_poller
@@ -57,14 +68,21 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["python", "sftp_poller.py"]
+    command: ["python3.11", "sftp_poller.py"]
     environment:
       - CONFIG_PATH=/app/config.yaml
       - API_BASE_URL=http://face_service:8000
-      - SFTP_CAMERAS_ALLOWLIST=BEWELL-CHN-Entrance,BEWELL-CHN-Entry
+      - SFTP_BASE_PATH=/TMJ-CBE-Entry
+      - SFTP_CAMERAS_ALLOWLIST=processed
+      - SFTP_PROCESSED_DIRNAME=
+      # - SFTP_FILENAME_INCLUDE_ANY=
+      # - SFTP_FILENAME_EXCLUDE_ANY=
       - SFTP_FILENAME_INCLUDE_ANY=FACE_SNAP
       - SFTP_FILENAME_EXCLUDE_ANY=FACE_BACKGROUND
-      - SFTP_MAX_FILES_PER_CAMERA_PER_TICK=50
+      - SFTP_MAX_FILES_PER_CAMERA_PER_TICK=500
+      - SFTP_TIMEZONE=Asia/Kolkata
+      # - SFTP_SINCE_DATETIME=07-02-2026:09 pm
+      # - SFTP_UNTIL_DATETIME=07-02-2026:10 pm
     volumes:
       - ./config.yaml:/app/config.yaml:ro
 

@@ -17,6 +17,8 @@ class RecognitionEvent:
     decision: str
     subject_id: str | None
     similarity: float | None
+    processing_ms: int | None
+    model_ms: int | None
     rejected_reason: str | None
     bbox: list[float] | None
     det_score: float | None
@@ -50,6 +52,8 @@ class EventsStore:
                     decision TEXT NOT NULL,
                     subject_id TEXT,
                     similarity REAL,
+                    processing_ms INTEGER,
+                    model_ms INTEGER,
                     rejected_reason TEXT,
                     bbox_json TEXT,
                     det_score REAL,
@@ -71,6 +75,16 @@ class EventsStore:
                     conn.execute("ALTER TABLE recognition_events ADD COLUMN image_saved_at REAL")
                 except Exception:
                     pass
+            if "processing_ms" not in cols:
+                try:
+                    conn.execute("ALTER TABLE recognition_events ADD COLUMN processing_ms INTEGER")
+                except Exception:
+                    pass
+            if "model_ms" not in cols:
+                try:
+                    conn.execute("ALTER TABLE recognition_events ADD COLUMN model_ms INTEGER")
+                except Exception:
+                    pass
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_ts ON recognition_events (ts DESC)"
             )
@@ -88,10 +102,10 @@ class EventsStore:
                     """
                     INSERT OR REPLACE INTO recognition_events (
                         event_id, ts, camera, source_path, decision,
-                        subject_id, similarity, rejected_reason,
+                        subject_id, similarity, processing_ms, model_ms, rejected_reason,
                         bbox_json, det_score,
                         image_path, thumb_path, image_saved_at, meta_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ev.event_id,
@@ -101,6 +115,8 @@ class EventsStore:
                         str(ev.decision),
                         ev.subject_id,
                         float(ev.similarity) if ev.similarity is not None else None,
+                        int(ev.processing_ms) if ev.processing_ms is not None else None,
+                        int(ev.model_ms) if ev.model_ms is not None else None,
                         ev.rejected_reason,
                         json.dumps(ev.bbox) if ev.bbox is not None else None,
                         float(ev.det_score) if ev.det_score is not None else None,
@@ -117,12 +133,14 @@ class EventsStore:
         camera: str | None = None,
         subject_id: str | None = None,
         decision: str | None = None,
+        min_similarity: float | None = None,
+        max_similarity: float | None = None,
         since_ts: float | None = None,
         until_ts: float | None = None,
         limit: int = 100,
         cursor_ts: float | None = None,
     ) -> tuple[list[dict[str, Any]], float | None]:
-        limit = max(1, min(int(limit or 100), 500))
+        limit = max(1, min(int(limit or 100), 5000))
 
         where: list[str] = []
         args: list[Any] = []
@@ -135,6 +153,12 @@ class EventsStore:
         if decision:
             where.append("decision = ?")
             args.append(str(decision))
+        if min_similarity is not None:
+            where.append("similarity >= ?")
+            args.append(float(min_similarity))
+        if max_similarity is not None:
+            where.append("similarity <= ?")
+            args.append(float(max_similarity))
         if since_ts is not None:
             where.append("ts >= ?")
             args.append(float(since_ts))
@@ -174,6 +198,8 @@ class EventsStore:
                 "decision": r["decision"],
                 "subject_id": r["subject_id"],
                 "similarity": r["similarity"],
+                "processing_ms": r["processing_ms"],
+                "model_ms": r["model_ms"],
                 "rejected_reason": r["rejected_reason"],
                 "bbox": bbox,
                 "det_score": r["det_score"],
@@ -215,6 +241,8 @@ class EventsStore:
             "decision": r["decision"],
             "subject_id": r["subject_id"],
             "similarity": r["similarity"],
+            "processing_ms": r["processing_ms"],
+            "model_ms": r["model_ms"],
             "rejected_reason": r["rejected_reason"],
             "bbox": bbox,
             "det_score": r["det_score"],

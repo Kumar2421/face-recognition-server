@@ -3,25 +3,38 @@ api:
 
 sftp:
   host: "103.186.221.20"
-  port: 20022
+  port: 2022 
+  # list dir tmj 
+  # port: 20022
   username: "fusion"
   password: "admin123"
   base_path: "/"
   poll_interval_sec: 60
-  processed_dirname: "processed"
+  # processed_dirname: "processed"
 
 recognition:
-  min_similarity: 0.35
+  min_similarity: 0.45
   top_k: 5
-  min_top2_margin: 0.03
+  min_top2_margin: 0.06
   top2_high_conf_sim: 0.55
 
 quality:
   min_blur: 60.0
   min_face_ratio: 0.03
-  min_brightness: 40.0
+  min_brightness: 30.0
   max_brightness: 220.0
   min_landmark_conf: 0.3
-  max_abs_yaw: 50
-  max_abs_pitch: 35
+  max_abs_yaw: 70
+  max_abs_pitch: 65
   min_resolution: 64
+
+  
+# POST /v1/events/recognition/forward this is forword api for send no match / match images 
+# body 
+# {
+#   "event_id": "....",
+#   "target_url": "https://your-api/endpoint"   // optional if FACE_SERVICE_FORWARD_URL is set
+# }
+# curl -X POST http://localhost:8001/v1/events/recognition/forward \
+#   -H "Content-Type: application/json" \
+#   -d '{"event_id":"<EVENT_ID>","target_url":"https://your-api/receive"}'

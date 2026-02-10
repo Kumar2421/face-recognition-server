@@ -6,6 +6,13 @@ import posixpath
 import time
 from typing import Any
 
+from datetime import datetime
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore[assignment]
+
 import httpx
 import paramiko
 
@@ -29,6 +36,54 @@ def _as_float(v: Any, default: float) -> float:
         return float(v)
     except Exception:
         return default
+
+
+def _as_bool(v: Any, default: bool = False) -> bool:
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return bool(default)
+
+
+def _parse_human_dt(s: str, *, tz_name: str) -> float | None:
+    raw = str(s or "").strip()
+    if not raw:
+        return None
+
+    tz = None
+    if ZoneInfo is not None:
+        try:
+            tz = ZoneInfo(str(tz_name or "UTC"))
+        except Exception:
+            tz = None
+
+    # Supported inputs (examples):
+    # - 07-02-2026:07 pm
+    # - 07-02-2026:07:30 pm
+    # - 07-02-2026 07 pm
+    # - 07-02-2026 07:30 pm
+    s2 = " ".join(raw.replace("/", "-").split())
+    fmts = (
+        "%d-%m-%Y:%I %p",
+        "%d-%m-%Y:%I:%M %p",
+        "%d-%m-%Y %I %p",
+        "%d-%m-%Y %I:%M %p",
+    )
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(s2, fmt)
+            if tz is not None:
+                dt = dt.replace(tzinfo=tz)
+                return float(dt.timestamp())
+            # If timezone support is unavailable, treat as local time.
+            return float(dt.timestamp())
+        except Exception:
+            continue
+    return None
 
 
 def _is_image_name(name: str) -> bool:
@@ -106,10 +161,51 @@ def main() -> None:
     password = _env("SFTP_PASSWORD")
     base_path = _env("SFTP_BASE_PATH", "/")
     poll_interval = _as_int(_env("SFTP_POLL_INTERVAL_SEC", "60"), 60)
-    processed_dirname = _env("SFTP_PROCESSED_DIRNAME", "processed")
+    processed_dirname = str(_env("SFTP_PROCESSED_DIRNAME", "") or "").strip()
     max_files_per_cam = _as_int(_env("SFTP_MAX_FILES_PER_CAMERA_PER_TICK", "50"), 50)
     if max_files_per_cam < 1:
         max_files_per_cam = 1
+
+    # Optional time filter for remote files (use server-reported st_mtime)
+    # Examples:
+    # - SFTP_SINCE_HOURS=24  (only last 24 hours)
+    # - SFTP_SINCE_DAYS=7    (only last 7 days)
+    # - SFTP_SINCE_TS=1700000000 (unix seconds)
+    # - SFTP_UNTIL_TS=1700003600 (unix seconds)
+    now_ts = time.time()
+    tz_name = _env("SFTP_TIMEZONE", "Asia/Kolkata")
+    since_dt = _env("SFTP_SINCE_DATETIME", "")
+    until_dt = _env("SFTP_UNTIL_DATETIME", "")
+    since_dt_ts = _parse_human_dt(since_dt, tz_name=tz_name) if since_dt else None
+    until_dt_ts = _parse_human_dt(until_dt, tz_name=tz_name) if until_dt else None
+
+    since_ts_env = _as_float(_env("SFTP_SINCE_TS", ""), 0.0)
+    until_ts_env = _as_float(_env("SFTP_UNTIL_TS", ""), 0.0)
+    since_hours = _as_float(_env("SFTP_SINCE_HOURS", ""), 0.0)
+    since_days = _as_float(_env("SFTP_SINCE_DAYS", ""), 0.0)
+    allow_no_mtime = _as_bool(_env("SFTP_TIMEFILTER_ALLOW_NO_MTIME", "1"), True)
+
+    # Precedence: human datetime window > explicit ts > hours/days
+    since_ts: float | None = None
+    until_ts: float | None = None
+
+    if since_dt and since_dt_ts is None:
+        print(f"[sftp_poller] WARN invalid SFTP_SINCE_DATETIME='{since_dt}' (expected e.g. 07-02-2026:07 pm)")
+    if until_dt and until_dt_ts is None:
+        print(f"[sftp_poller] WARN invalid SFTP_UNTIL_DATETIME='{until_dt}' (expected e.g. 07-02-2026:10 pm)")
+
+    if since_dt_ts is not None or until_dt_ts is not None:
+        since_ts = float(since_dt_ts) if since_dt_ts is not None else None
+        until_ts = float(until_dt_ts) if until_dt_ts is not None else None
+    else:
+        if since_ts_env > 0:
+            since_ts = float(since_ts_env)
+        elif since_hours > 0:
+            since_ts = float(now_ts - (since_hours * 3600.0))
+        elif since_days > 0:
+            since_ts = float(now_ts - (since_days * 86400.0))
+
+        until_ts = float(until_ts_env) if until_ts_env > 0 else None
 
     # Optional filters (comma-separated)
     # Example: SFTP_CAMERAS_ALLOWLIST=BEWELL-CHN-Entrance,BEWELL-CHN-Entry
@@ -129,7 +225,8 @@ def main() -> None:
         f"[sftp_poller] connecting host={host} port={port} base_path={base_path} api_base={api_base} "
         f"allowlist={sorted(cameras_allowlist) if cameras_allowlist else 'ALL'} "
         f"include_any={filename_include_any or 'NONE'} exclude_any={filename_exclude_any or 'NONE'} "
-        f"max_files_per_cam={max_files_per_cam}"
+        f"max_files_per_cam={max_files_per_cam} "
+        f"since_ts={since_ts if since_ts is not None else 'NONE'} until_ts={until_ts if until_ts is not None else 'NONE'} tz={tz_name}"
     )
 
     transport = paramiko.Transport((host, port))
@@ -181,9 +278,24 @@ def main() -> None:
 
                 for it in items:
                     fn = getattr(it, "filename", "")
-                    if not fn or fn == processed_dirname:
+                    if not fn or (processed_dirname and fn == processed_dirname):
                         continue
                     if not _is_image_name(fn):
+                        continue
+
+                    mtime = None
+                    try:
+                        mtime = float(getattr(it, "st_mtime", None))
+                    except Exception:
+                        mtime = None
+                    if mtime is None and not allow_no_mtime and (since_ts is not None or until_ts is not None):
+                        print(f"[sftp_poller] skip cam={cam} file={fn} reason=no_mtime")
+                        continue
+                    if mtime is not None and since_ts is not None and float(mtime) < float(since_ts):
+                        print(f"[sftp_poller] skip cam={cam} file={fn} reason=too_old mtime={int(mtime)}")
+                        continue
+                    if mtime is not None and until_ts is not None and float(mtime) > float(until_ts):
+                        print(f"[sftp_poller] skip cam={cam} file={fn} reason=too_new mtime={int(mtime)}")
                         continue
 
                     skip, why = _should_skip_name(fn, include_any=filename_include_any, exclude_any=filename_exclude_any)
@@ -193,7 +305,7 @@ def main() -> None:
 
                     remote_path = posixpath.join(cam_dir, fn)
                     # Skip already-processed subfolders
-                    if f"/{processed_dirname}/" in remote_path:
+                    if processed_dirname and f"/{processed_dirname}/" in remote_path:
                         continue
 
                     print(f"[sftp_poller] pickup cam={cam} remote_path={remote_path}")
@@ -237,7 +349,7 @@ def main() -> None:
                         ok = False
 
                     # Move to processed/ regardless of match/no_match/rejected if API call succeeded
-                    if ok:
+                    if ok and processed_dirname:
                         processed_dir = posixpath.join(cam_dir, processed_dirname)
                         _ensure_remote_dir(sftp, processed_dir)
                         dst = posixpath.join(processed_dir, fn)

@@ -27,7 +27,14 @@ export async function apiPostForm<T = any>(path: string, form: FormData): Promis
     method: 'POST',
     body: form,
   });
-  if (!r.ok) throw new Error(`POST ${path} failed: ${r.status}`);
+  if (!r.ok) {
+    let detail = '';
+    try {
+      detail = await r.text();
+    } catch { }
+    const suffix = detail ? ` ${detail.slice(0, 500)}` : '';
+    throw new Error(`POST ${path} failed: ${r.status}${suffix}`);
+  }
   return r.json();
 }
 
@@ -96,14 +103,14 @@ export async function facesAddUpload(subjectId: string, files: File[]): Promise<
 
 export async function facesSearchUpload(file: File, topK: number = 5): Promise<any> {
   const form = new FormData();
-  form.append('file', file);
+  form.append('file', file, file.name || 'query.jpg');
   form.append('top_k', String(topK));
   return apiPostForm('/v1/faces/search_upload', form);
 }
 
 export async function facesRecognizeUpload(file: File, topK: number = 5): Promise<any> {
   const form = new FormData();
-  form.append('file', file);
+  form.append('file', file, file.name || 'query.jpg');
   form.append('top_k', String(topK));
   return apiPostForm('/v1/faces/recognize_upload', form);
 }
@@ -117,6 +124,8 @@ export type RecognitionEvent = {
   decision: string;
   subject_id?: string | null;
   similarity?: number | null;
+  processing_ms?: number | null;
+  model_ms?: number | null;
   rejected_reason?: string | null;
   bbox?: number[] | null;
   det_score?: number | null;
@@ -132,6 +141,8 @@ export async function recognitionEvents(params: {
   decision?: string;
   camera?: string;
   subject_id?: string;
+  min_similarity?: number;
+  max_similarity?: number;
   limit?: number;
   cursor?: number | null;
 } = {}): Promise<RecognitionEventsListResponse> {
@@ -139,6 +150,8 @@ export async function recognitionEvents(params: {
   if (params.decision) q.set('decision', params.decision);
   if (params.camera) q.set('camera', params.camera);
   if (params.subject_id) q.set('subject_id', params.subject_id);
+  if (params.min_similarity != null) q.set('min_similarity', String(params.min_similarity));
+  if (params.max_similarity != null) q.set('max_similarity', String(params.max_similarity));
   if (params.limit != null) q.set('limit', String(params.limit));
   if (params.cursor != null) q.set('cursor', String(params.cursor));
   const qs = q.toString();
