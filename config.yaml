@@ -38,3 +38,5 @@ quality:
 # curl -X POST http://localhost:8001/v1/events/recognition/forward \
 #   -H "Content-Type: application/json" \
 #   -d '{"event_id":"<EVENT_ID>","target_url":"https://your-api/receive"}'
+
+# Access web UI at http://localhost:6333/dashboard

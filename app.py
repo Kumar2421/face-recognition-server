@@ -25,12 +25,14 @@ from embedders.buffalo_l import (
     _l2_normalize,
     _quality_check_and_embed as _embed_quality_check_and_embed,
 )
+from inference_manager import GPUInferenceManager
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from ui_page import ui_html
 from events_store import EventsStore, RecognitionEvent
 from config_loader import apply_env_defaults_from_config, load_config
 
 import httpx
+ 
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -118,6 +120,13 @@ def _t() -> float:
         return time.time()
     except Exception:
         return float(datetime.now(tz=timezone.utc).timestamp())
+
+
+def _pc() -> float:
+    try:
+        return time.perf_counter()
+    except Exception:
+        return float(_t())
 
 
 def _debug_enabled() -> bool:
@@ -269,11 +278,16 @@ def _quality_check_and_embed(bgr: np.ndarray) -> tuple[np.ndarray, dict[str, Any
     except Exception:
         evaluator = None
 
+    try:
+        embedder = getattr(app.state, "gpu", None) or app.state.embedder
+    except Exception:
+        embedder = app.state.embedder
+
     t0 = _t()
     try:
         emb, meta = _embed_quality_check_and_embed(
             bgr,
-            embedder=app.state.embedder,
+            embedder=embedder,
             evaluator=evaluator,
         )
     except ValueError as e:
@@ -771,6 +785,62 @@ def metrics() -> Response:
     return Response(content=body, media_type=CONTENT_TYPE_LATEST)
 
 
+def _collect_provider_info() -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    try:
+        import onnxruntime as ort  # type: ignore
+
+        try:
+            out["onnxruntime"] = {
+                "version": str(getattr(ort, "__version__", "")),
+                "available_providers": list(ort.get_available_providers() or []),
+            }
+        except Exception:
+            out["onnxruntime"] = {"version": str(getattr(ort, "__version__", ""))}
+    except Exception as e:
+        out["onnxruntime"] = {"error": str(e)}
+
+    try:
+        embedder = getattr(app.state, "embedder", None)
+        out["embedder"] = {
+            "class": str(embedder.__class__.__name__) if embedder is not None else None,
+            "configured_providers": list(getattr(embedder, "providers", []) or []),
+        }
+    except Exception as e:
+        out["embedder"] = {"error": str(e)}
+
+    try:
+        embedder = getattr(app.state, "embedder", None)
+        fa = getattr(embedder, "app", None) if embedder is not None else None
+        models = getattr(fa, "models", None)
+        sess_providers: dict[str, Any] = {}
+        if isinstance(models, dict):
+            for k, m in models.items():
+                sess = getattr(m, "session", None)
+                if sess is None:
+                    sess = getattr(m, "sess", None)
+                if sess is not None and hasattr(sess, "get_providers"):
+                    try:
+                        sess_providers[str(k)] = list(sess.get_providers() or [])
+                    except Exception as e:
+                        sess_providers[str(k)] = {"error": str(e)}
+                else:
+                    sess_providers[str(k)] = None
+        out["insightface"] = {
+            "models": list(models.keys()) if isinstance(models, dict) else None,
+            "session_providers": sess_providers,
+        }
+    except Exception as e:
+        out["insightface"] = {"error": str(e)}
+
+    return out
+
+
+@app.get("/debug/providers")
+def debug_providers() -> dict[str, Any]:
+    return _collect_provider_info()
+
+
 @app.on_event("startup")
 def _startup() -> None:
     # Optional config.yaml for defaults (environment variables still take precedence)
@@ -817,6 +887,37 @@ def _startup() -> None:
         providers=providers,
     )
 
+    try:
+        logger.info("provider_info=%s", _collect_provider_info())
+    except Exception:
+        pass
+
+    # Single-GPU inference manager (caps concurrent GPU work; prevents thrash)
+    try:
+        gpu_enabled = str(os.environ.get("GPU_INFERENCE_MANAGER", "1") or "1").strip() not in (
+            "0",
+            "false",
+            "False",
+        )
+    except Exception:
+        gpu_enabled = True
+    if gpu_enabled:
+        try:
+            max_q = int(os.environ.get("GPU_QUEUE_MAX", "256") or "256")
+        except Exception:
+            max_q = 256
+        try:
+            batch_ms = int(os.environ.get("GPU_BATCH_WINDOW_MS", "0") or "0")
+        except Exception:
+            batch_ms = 0
+        app.state.gpu = GPUInferenceManager(
+            embedder=app.state.embedder,
+            max_queue=max_q,
+            batch_window_ms=batch_ms,
+        )
+    else:
+        app.state.gpu = None
+
     app.state.qdrant_url = os.environ.get("QDRANT_URL")
     app.state.qdrant_collection = os.environ.get("QDRANT_COLLECTION", "frigate_faces")
     app.state.qdrant = None
@@ -852,7 +953,11 @@ def _startup() -> None:
     if index_path:
         app.state.index = _load_index_json_embeddings(index_path)
     else:
-        app.state.index = _load_face_dataset(face_dir, app.state.embedder.embed_bgr)
+        try:
+            infer = getattr(app.state, "gpu", None) or app.state.embedder
+        except Exception:
+            infer = app.state.embedder
+        app.state.index = _load_face_dataset(face_dir, infer.embed_bgr)
 
     try:
         idx: FaceIndex = app.state.index
@@ -900,6 +1005,19 @@ def _startup() -> None:
     except Exception as e:
         logger.error("failed to init events store: %s", str(e))
         app.state.events = None
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    try:
+        mgr = getattr(app.state, "gpu", None)
+    except Exception:
+        mgr = None
+    if mgr is not None:
+        try:
+            mgr.close()
+        except Exception:
+            pass
 
 
 @app.post("/v1/face/search", response_model=FaceSearchResponse)
@@ -1259,86 +1377,6 @@ async def ingest_recognition_event(
     min_similarity: float | None = Form(None),
     process_all_faces: bool = Form(False),
 ) -> RecognitionEventResponse:
-    image_bytes = await file.read()
-    source_path = str(source_path or str(getattr(file, "filename", "") or "")).strip()
-    return await _process_recognition_image(
-        image_bytes=image_bytes,
-        camera=camera,
-        source_path=source_path,
-        ts=ts,
-        top_k=top_k,
-        min_similarity=min_similarity,
-        process_all_faces=process_all_faces,
-    )
-
-
-def _is_private_address(host: str) -> bool:
-    host = str(host or "").strip()
-    if not host:
-        return True
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except Exception:
-        return True
-
-    for info in infos or []:
-        try:
-            ip_str = info[4][0]
-            ip = ipaddress.ip_address(ip_str)
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_reserved
-                or ip.is_unspecified
-            ):
-                return True
-        except Exception:
-            return True
-    return False
-
-
-async def _fetch_image_bytes(url: str) -> bytes:
-    url = str(url or "").strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="url is required")
-    p = urlparse(url)
-    if p.scheme not in ("http", "https"):
-        raise HTTPException(status_code=400, detail="url must be http or https")
-    if not p.hostname:
-        raise HTTPException(status_code=400, detail="url hostname is required")
-    if _is_private_address(p.hostname):
-        raise HTTPException(status_code=400, detail="url hostname is not allowed")
-
-    timeout_s = float(os.environ.get("FACE_SERVICE_FETCH_TIMEOUT_SEC", "10") or "10")
-    max_bytes = int(os.environ.get("FACE_SERVICE_FETCH_MAX_BYTES", str(10 * 1024 * 1024)) or str(10 * 1024 * 1024))
-    timeout = httpx.Timeout(timeout_s)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        try:
-            r = await client.get(url)
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=400, detail=f"fetch failed: {str(e)}")
-        if r.status_code >= 400:
-            raise HTTPException(status_code=400, detail=f"fetch failed: status={r.status_code}")
-        data = bytes(r.content or b"")
-        if not data:
-            raise HTTPException(status_code=400, detail="fetch returned empty body")
-        if len(data) > max_bytes:
-            raise HTTPException(status_code=400, detail="fetch response too large")
-        return data
-
-
-async def _process_recognition_image(
-    *,
-    image_bytes: bytes,
-    camera: str,
-    source_path: str,
-    ts: float | None,
-    top_k: int,
-    min_similarity: float | None,
-    process_all_faces: bool,
-) -> RecognitionEventResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
         raise HTTPException(status_code=500, detail="events store not configured")
@@ -1348,14 +1386,31 @@ async def _process_recognition_image(
         raise HTTPException(status_code=400, detail="camera is required")
 
     t_req0 = _t()
+    t_total0 = _pc()
+    t_decode0 = _pc()
+    image_bytes = await file.read()
     bgr = _decode_image_bytes(image_bytes)
+    decode_ms = int(max(0.0, (_pc() - t_decode0)) * 1000.0)
     h, w = bgr.shape[:2]
 
     event_id = str(uuid.uuid4())
     ts_val = float(ts) if ts is not None else _now_ts()
-    source_path = str(source_path or "").strip()
+    source_path = str(source_path or str(getattr(file, "filename", "") or "")).strip()
 
     events_dir = os.environ.get("EVENTS_DIR", "/data/events")
+
+    def _model_ms_from_infer_timing(detect_embed_ms_val: int, infer_timing_val: dict[str, Any]) -> int:
+        try:
+            gpu_exec = float(infer_timing_val.get("exec_ms", 0.0) or 0.0)
+            if gpu_exec > 0.0:
+                return int(round(gpu_exec))
+        except Exception:
+            pass
+        return int(detect_embed_ms_val)
+
+    primary_resp: RecognitionEventResponse | None = None
+    faces_total = 0
+    faces_processed = 0
 
     def _face_bbox_for_meta(face: Any) -> tuple[list[float] | None, float | None]:
         bbox: list[float] | None = None
@@ -1382,23 +1437,45 @@ async def _process_recognition_image(
 
     # detect faces
     t_model0 = _t()
+    t_detect0 = _pc()
     faces: list[Any] = []
+    infer_timing: dict[str, Any] = {}
     try:
+        infer = getattr(app.state, "gpu", None) or app.state.embedder
         if process_all_faces:
-            faces = list(app.state.embedder.detect_all(bgr))
+            if hasattr(infer, "detect_all_timed"):
+                faces, tinfo = infer.detect_all_timed(bgr)
+                infer_timing = dict(tinfo or {})
+            else:
+                faces = list(infer.detect_all(bgr))
         else:
-            faces = [app.state.embedder.detect_best(bgr)]
+            if hasattr(infer, "detect_best_timed"):
+                face0, tinfo = infer.detect_best_timed(bgr)
+                faces = [face0]
+                infer_timing = dict(tinfo or {})
+            else:
+                faces = [infer.detect_best(bgr)]
+        faces_total = len(faces)
     except ValueError:
         if primary_resp is None:
             # should be rare (e.g. all faces were None)
             reason = "no_face_detected"
-            processing_ms = int(max(0.0, (_t() - t_req0)) * 1000.0)
+            detect_embed_ms = int(max(0.0, (_pc() - t_detect0)) * 1000.0)
+            processing_ms = _model_ms_from_infer_timing(detect_embed_ms, infer_timing)
             img_path = _save_event_image(bgr, events_dir, f"rejected/{camera}/{event_id}.jpg")
             thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"evt-{event_id}")
             image_saved_at = _now_ts() if img_path else None
+            total_ms = int(max(0.0, (_pc() - t_total0)) * 1000.0)
             meta = {
                 "quality": {"status": "rejected", "reason": reason},
                 "decision": {"status": "rejected"},
+                "timing": {
+                    "decode_ms": int(decode_ms),
+                    "detect_embed_ms": int(detect_embed_ms),
+                    "gpu_queue_wait_ms": float(infer_timing.get("queue_wait_ms", 0.0) or 0.0),
+                    "gpu_exec_ms": float(infer_timing.get("exec_ms", 0.0) or 0.0),
+                    "total_ms": int(total_ms),
+                },
                 "faces_total": int(faces_total),
                 "faces_processed": int(faces_processed),
                 "multi_face": bool(process_all_faces),
@@ -1444,7 +1521,9 @@ async def _process_recognition_image(
         else:
             return primary_resp
 
+
     detect_ms = int(max(0.0, (_t() - t_model0)) * 1000.0)
+    detect_embed_ms = int(max(0.0, (_pc() - t_detect0)) * 1000.0)
 
     evaluator = getattr(app.state, "quality", None)
     q = getattr(app.state, "qdrant", None)
@@ -1464,35 +1543,53 @@ async def _process_recognition_image(
             return 0.0
 
     faces_sorted = sorted([f for f in faces if f is not None], key=_score, reverse=True)[:max_faces]
-    faces_total = len(faces)
-
-    primary_resp: RecognitionEventResponse | None = None
     faces_processed = 0
     face_model_ms_total = 0
     for idx, face in enumerate(faces_sorted):
         t_face0 = _t()
         t_face_model0 = _t()
+        t_face_pc0 = _pc()
         ev_id = str(uuid.uuid4())
         bbox, det_score = _face_bbox_for_meta(face)
+
+        quality_ms = 0
+        qdrant_ms = 0
+        save_ms = 0
 
         quality_meta: dict[str, Any] | None = None
         if evaluator is not None:
             try:
+                t_q0 = _pc()
                 quality_meta = evaluator.evaluate(bgr, face)
+                quality_ms = int(max(0.0, (_pc() - t_q0)) * 1000.0)
             except Exception:
                 quality_meta = {"status": "rejected", "reason": "quality_eval_failed"}
             if isinstance(quality_meta, dict) and quality_meta.get("status") == "rejected":
                 reason = str(quality_meta.get("reason") or "unknown")
                 face_model_ms = int(max(0.0, (_t() - t_face_model0)) * 1000.0)
                 face_model_ms_total += face_model_ms
+                t_s0 = _pc()
                 img_path = _save_event_image(bgr, events_dir, f"rejected/{camera}/{ev_id}.jpg")
                 thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"evt-{ev_id}")
+                save_ms = int(max(0.0, (_pc() - t_s0)) * 1000.0)
                 image_saved_at = _now_ts() if img_path else None
-                processing_ms = int(max(0.0, (_t() - t_face0)) * 1000.0)
+                processing_ms = _model_ms_from_infer_timing(detect_embed_ms, infer_timing)
                 model_ms = int(detect_ms + face_model_ms_total)
+                total_ms = int(max(0.0, (_pc() - t_total0)) * 1000.0)
                 meta = {
                     "quality": quality_meta,
                     "decision": {"status": "rejected"},
+                    "timing": {
+                        "decode_ms": int(decode_ms),
+                        "detect_embed_ms": int(detect_embed_ms),
+                        "gpu_queue_wait_ms": float(infer_timing.get("queue_wait_ms", 0.0) or 0.0),
+                        "gpu_exec_ms": float(infer_timing.get("exec_ms", 0.0) or 0.0),
+                        "quality_ms": int(quality_ms),
+                        "qdrant_ms": int(qdrant_ms),
+                        "save_ms": int(save_ms),
+                        "face_total_ms": int(max(0.0, (_pc() - t_face_pc0)) * 1000.0),
+                        "total_ms": int(total_ms),
+                    },
                     "face_index": int(idx),
                     "faces_total": int(faces_total),
                     "faces_processed": None,
@@ -1545,14 +1642,28 @@ async def _process_recognition_image(
             reason = "no_embedding"
             face_model_ms = int(max(0.0, (_t() - t_face_model0)) * 1000.0)
             face_model_ms_total += face_model_ms
+            t_s0 = _pc()
             img_path = _save_event_image(bgr, events_dir, f"rejected/{camera}/{ev_id}.jpg")
             thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"evt-{ev_id}")
+            save_ms = int(max(0.0, (_pc() - t_s0)) * 1000.0)
             image_saved_at = _now_ts() if img_path else None
-            processing_ms = int(max(0.0, (_t() - t_face0)) * 1000.0)
+            processing_ms = _model_ms_from_infer_timing(detect_embed_ms, infer_timing)
             model_ms = int(detect_ms + face_model_ms_total)
+            total_ms = int(max(0.0, (_pc() - t_total0)) * 1000.0)
             meta = {
                 "quality": quality_meta,
                 "decision": {"status": "rejected"},
+                "timing": {
+                    "decode_ms": int(decode_ms),
+                    "detect_embed_ms": int(detect_embed_ms),
+                    "gpu_queue_wait_ms": float(infer_timing.get("queue_wait_ms", 0.0) or 0.0),
+                    "gpu_exec_ms": float(infer_timing.get("exec_ms", 0.0) or 0.0),
+                    "quality_ms": int(quality_ms),
+                    "qdrant_ms": int(qdrant_ms),
+                    "save_ms": int(save_ms),
+                    "face_total_ms": int(max(0.0, (_pc() - t_face_pc0)) * 1000.0),
+                    "total_ms": int(total_ms),
+                },
                 "face_index": int(idx),
                 "faces_total": int(faces_total),
                 "faces_processed": None,
@@ -1600,7 +1711,9 @@ async def _process_recognition_image(
                 )
             continue
 
+        t_qs0 = _pc()
         results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
+        qdrant_ms = int(max(0.0, (_pc() - t_qs0)) * 1000.0)
         matched = False
         subject_id: str | None = None
         similarity: float | None = None
@@ -1626,14 +1739,17 @@ async def _process_recognition_image(
         face_model_ms = int(max(0.0, (_t() - t_face_model0)) * 1000.0)
         face_model_ms_total += face_model_ms
         model_ms = int(detect_ms + face_model_ms_total)
+        t_s0 = _pc()
         img_path = _save_event_image(
             bgr,
             events_dir,
             f"{'accepted' if matched else 'no_match'}/{camera}/{ev_id}.jpg",
         )
         thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"evt-{ev_id}")
+        save_ms = int(max(0.0, (_pc() - t_s0)) * 1000.0)
         image_saved_at = _now_ts() if img_path else None
-        processing_ms = int(max(0.0, (_t() - t_face0)) * 1000.0)
+        processing_ms = _model_ms_from_infer_timing(detect_embed_ms, infer_timing)
+        total_ms = int(max(0.0, (_pc() - t_total0)) * 1000.0)
 
         meta = {
             "quality": quality_meta,
@@ -1643,6 +1759,17 @@ async def _process_recognition_image(
                 "top2_second": top2_second,
                 "top2_margin": top2_margin,
                 "top2_required": top2_required,
+            },
+            "timing": {
+                "decode_ms": int(decode_ms),
+                "detect_embed_ms": int(detect_embed_ms),
+                "gpu_queue_wait_ms": float(infer_timing.get("queue_wait_ms", 0.0) or 0.0),
+                "gpu_exec_ms": float(infer_timing.get("exec_ms", 0.0) or 0.0),
+                "quality_ms": int(quality_ms),
+                "qdrant_ms": int(qdrant_ms),
+                "save_ms": int(save_ms),
+                "face_total_ms": int(max(0.0, (_pc() - t_face_pc0)) * 1000.0),
+                "total_ms": int(total_ms),
             },
             "top_k": int(top_k),
             "face_index": int(idx),

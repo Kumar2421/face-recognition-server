@@ -6,12 +6,12 @@ This service provides face embedding, enrollment, and similarity search using **
 
 FastAPI automatically serves Swagger UI:
 
-- `http://localhost:8000/docs` (Swagger UI)
-- `http://localhost:8000/redoc` (ReDoc)
+- `http://localhost:8001/docs` (Swagger UI)
+- `http://localhost:8001/redoc` (ReDoc)
 
 The built-in demo web UI is:
 
-- `http://localhost:8000/ui`
+- `http://localhost:8001/ui`
 
 ## Configuration
 
@@ -26,6 +26,19 @@ Environment variables (Docker Compose sets most of these):
 - `BUFFALO_DET_SIZE` (default: `640`)
 - `BUFFALO_MIN_DET_SCORE` (default: `0.5`) minimum detector score for accepting a face
 - `BUFFALO_PROVIDERS` (example: `CUDAExecutionProvider,CPUExecutionProvider`)
+
+GPU / performance:
+
+- `GPU_INFERENCE_MANAGER` (`1` enables serialized GPU execution, `0` disables)
+- `GPU_QUEUE_MAX` (default: `256`) max queue size for GPU inference manager
+- `GPU_BATCH_WINDOW_MS` (default: `0`) micro-batching window (0 disables batching)
+- `BUFFALO_ENABLE_FALLBACK_VARIANTS` (`0` disables expensive rotation/scale fallback on no-face)
+
+Storage:
+
+- `EVENTS_DIR` (default: `/data/events`) where event images are stored (`accepted/`, `rejected/`, `no_match/`)
+- `THUMBS_DIR` (default: `/data/thumbs`) thumbnails directory
+- `IMAGES_DIR` (default: `/data/images`) optional image storage directory
 
 Notes:
 
@@ -88,20 +101,36 @@ Response (example):
 
 ---
 
-## Roadmap endpoints (to be added)
+## Observability / Debug
 
-- `GET /v1/subjects?cursor=&limit=&with_counts=true`
-- `GET /v1/subjects/{subject_id}/images?cursor=&limit=`
-- `POST /v1/ingest/url`
-- `POST /v1/ingest/confirm`
-- `GET /v1/activity?cursor=&limit=`
+### `GET /metrics`
 
-Auth and Ops (Phase 4):
+Prometheus metrics.
 
-- API keys on mutating routes via `X-API-Key`.
-- Basic rate limiting per IP/key for enroll/search.
-- Audit log JSONL at `/data/logs/audit.jsonl`.
-- Prometheus metrics at `/metrics` in addition to `/v1/stats`.
+### `GET /debug/providers`
+
+Shows ONNXRuntime providers and what providers InsightFace sessions were created with.
+
+Response (example):
+```json
+{
+  "onnxruntime": {
+    "version": "1.17.1",
+    "available_providers": ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"]
+  },
+  "embedder": {
+    "class": "BuffaloLEmbedder",
+    "configured_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"]
+  },
+  "insightface": {
+    "models": ["detection", "recognition"],
+    "session_providers": {
+      "detection": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+      "recognition": ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    }
+  }
+}
+```
 
 ## Enrollment (Add)
 
@@ -129,7 +158,7 @@ Response:
 
 Curl:
 ```bash
-curl -s -X POST "http://localhost:8000/v1/faces/add" \
+curl -s -X POST "http://localhost:8001/v1/faces/add" \
   -H "Content-Type: application/json" \
   -d '{"subject_id":"alice","images_b64":["...base64..."]}'
 ```
@@ -143,7 +172,7 @@ Form fields:
 
 Curl (Windows `curl.exe`):
 ```powershell
-curl.exe -s -X POST "http://localhost:8000/v1/faces/add_upload" `
+curl.exe -s -X POST "http://localhost:8001/v1/faces/add_upload" `
   -F "subject_id=alice" `
   -F "files=@D:\\path\\to\\img1.jpg;type=image/jpeg" `
   -F "files=@D:\\path\\to\\img2.png;type=image/png"
@@ -182,7 +211,7 @@ Form fields:
 
 Curl:
 ```powershell
-curl.exe -s -X POST "http://localhost:8000/v1/faces/search_upload" `
+curl.exe -s -X POST "http://localhost:8001/v1/faces/search_upload" `
   -F "top_k=5" `
   -F "file=@D:\\path\\to\\query.jpg;type=image/jpeg"
 ```
@@ -234,7 +263,7 @@ Form fields:
 
 Curl:
 ```powershell
-curl.exe -s -X POST "http://localhost:8000/v1/faces/recognize_upload" `
+curl.exe -s -X POST "http://localhost:8001/v1/faces/recognize_upload" `
   -F "top_k=5" `
   -F "min_similarity=0.75" `
   -F "file=@D:\\path\\to\\query.jpg;type=image/jpeg"
@@ -280,7 +309,7 @@ Form fields:
 
 Curl:
 ```powershell
-curl.exe -s -X POST "http://localhost:8000/v1/face/search_upload" `
+curl.exe -s -X POST "http://localhost:8001/v1/face/search_upload" `
   -F "file=@D:\\path\\to\\query.png;type=image/png"
 ```
 
@@ -313,6 +342,90 @@ Response:
 
 ---
 
+## Subjects browser (Qdrant)
+
+These endpoints are implemented and used by the web UI to browse subjects and their images.
+
+### `GET /v1/subjects`
+
+Query params:
+
+- `cursor` (optional)
+- `limit` (default `50`)
+- `with_counts` (default `true`) include embeddings count per subject
+
+Response (example):
+```json
+{
+  "items": [
+    {"subject_id": "alice", "embeddings_count": 12},
+    {"subject_id": "bob", "embeddings_count": 4}
+  ],
+  "cursor": null
+}
+```
+
+### `GET /v1/subjects/{subject_id}/images`
+
+Query params:
+
+- `cursor` (optional)
+- `limit` (default `50`)
+
+Response contains a paginated list of subject images/vectors (includes `image_id` and `thumb_path` where available).
+
+---
+
+## Recognition events (ingestion + audit)
+
+These endpoints store recognition attempts in the local events DB (SQLite) and save event images/thumbnails.
+
+### `POST /v1/events/recognition` (multipart)
+
+Form fields:
+
+- `file` (image)
+- `camera` (required)
+- `source_path` (optional)
+- `ts` (optional float seconds; default now)
+- `top_k` (optional, default `5`)
+- `min_similarity` (optional)
+- `process_all_faces` (optional, default `false`) process multiple faces per image
+
+Response includes `meta.timing` when available:
+
+- `decode_ms`
+- `detect_embed_ms`
+- `gpu_queue_wait_ms`
+- `gpu_exec_ms`
+- `quality_ms`
+- `qdrant_ms`
+- `save_ms`
+- `face_total_ms`
+- `total_ms`
+
+### `GET /v1/events/recognition`
+
+Query params:
+
+- `camera`, `subject_id`, `decision`
+- `since_ts`, `until_ts`
+- `limit` (default `100`)
+- `cursor` (optional)
+
+### `GET /v1/events/recognition/{event_id}`
+
+Fetch a single stored event.
+
+### `POST /v1/events/recognition/forward`
+
+Request body:
+```json
+{ "event_id": "<uuid>", "target_url": "https://example.com/hook" }
+```
+
+---
+
 ## Troubleshooting
 
 ### Face not detected
@@ -332,4 +445,11 @@ Try:
 - Ensure `qdrant` service is running:
   - `docker compose up -d qdrant`
 - Ensure `QDRANT_URL` is reachable from `face_service`
+
+### CUDA provider not used (slow inference)
+
+Check:
+
+- `GET /debug/providers` and confirm `CUDAExecutionProvider` appears in `insightface.session_providers`.
+- If it only shows `CPUExecutionProvider`, inference will be slow (hundreds of ms).
 

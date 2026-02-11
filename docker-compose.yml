@@ -29,6 +29,7 @@ services:
       - ./data/thumbs:/data/thumbs
       - ./data/images:/data/images
       - ./data/events:/data/events
+      - ./data/trt_cache:/data/trt_cache
       - ./config.yaml:/app/config.yaml:ro
 
     environment:
@@ -43,8 +44,15 @@ services:
       - BUFFALO_DET_SIZE=640
       - FACE_SERVICE_DEBUG=1
       - BUFFALO_MIN_DET_SCORE=0.3
-      - BUFFALO_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider
+      - BUFFALO_ENABLE_FALLBACK_VARIANTS=0
+      - BUFFALO_PROVIDERS=TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider
+      - ORT_TENSORRT_ENGINE_CACHE_ENABLE=1
+      - ORT_TENSORRT_CACHE_PATH=/data/trt_cache
+      - ORT_TENSORRT_FP16_ENABLE=1
       - FACE_EMBEDDINGS_INDEX=/data/facefolder/security_embeddings/index.json
+      - GPU_INFERENCE_MANAGER=1
+      - GPU_QUEUE_MAX=256
+      - GPU_BATCH_WINDOW_MS=0
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://face.service.tools.thefusionapps.com}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility

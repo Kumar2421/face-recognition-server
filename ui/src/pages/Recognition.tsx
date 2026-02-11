@@ -14,6 +14,20 @@ function fmtSavedAt(ev: { image_saved_at?: number | null; ts: number }): string 
   return fmtTs(t);
 }
 
+function fmtMs(v: any): string {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '—';
+  return String(Math.round(n));
+}
+
+function getTiming(ev: any): any {
+  try {
+    return ev?.meta?.timing || null;
+  } catch {
+    return null;
+  }
+}
+
 type DecisionFilter = '' | 'match' | 'no_match' | 'rejected';
 
 export default function Recognition() {
@@ -288,6 +302,24 @@ export default function Recognition() {
 
               <div style={{ color: '#9ca3af' }}>Model ms</div>
               <div>{ev.model_ms != null ? String(ev.model_ms) : '—'}</div>
+
+              <div style={{ color: '#9ca3af' }}>Timing</div>
+              <div style={{ color: '#9ca3af', fontSize: 12, lineHeight: 1.35 }}>
+                {(() => {
+                  const t = getTiming(ev);
+                  if (!t) return '—';
+                  return (
+                    `decode ${fmtMs(t.decode_ms)} | ` +
+                    `detect+embed ${fmtMs(t.detect_embed_ms)} | ` +
+                    `gpu_wait ${fmtMs(t.gpu_queue_wait_ms)} | ` +
+                    `gpu_exec ${fmtMs(t.gpu_exec_ms)} | ` +
+                    `quality ${fmtMs(t.quality_ms)} | ` +
+                    `qdrant ${fmtMs(t.qdrant_ms)} | ` +
+                    `save ${fmtMs(t.save_ms)} | ` +
+                    `face_total ${fmtMs(t.face_total_ms)}`
+                  );
+                })()}
+              </div>
 
               <div style={{ color: '#9ca3af' }}>Reason</div>
               <div style={{ color: '#ef4444', fontWeight: 700 }}>{ev.rejected_reason || '—'}</div>

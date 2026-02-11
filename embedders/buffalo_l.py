@@ -2,7 +2,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-
+import os
 
 def _l2_normalize(v: np.ndarray) -> np.ndarray:
     v = np.asarray(v, dtype=np.float32).reshape(-1)
@@ -73,7 +73,6 @@ def _quality_check_and_embed(
         emb = getattr(best_face, "embedding", None)
     if emb is None:
         raise ValueError("no embedding")
-
     out = _l2_normalize(np.asarray(emb, dtype=np.float32))
     meta: dict[str, Any] = {"quality": quality_meta, "decision": {"status": "embedded"}}
     return out, meta
@@ -98,6 +97,9 @@ class BuffaloLEmbedder:
         self.min_det_score = float(min_det_score)
         self.det_size = int(det_size)
         self.providers = [p.strip() for p in str(providers).split(",") if p.strip()]
+        self.enable_fallback_variants = str(
+            os.environ.get("BUFFALO_ENABLE_FALLBACK_VARIANTS", "1")
+        ).strip() not in ("0", "false", "False")
 
         self.app = FaceAnalysis(
             name=str(model_name),
@@ -109,6 +111,10 @@ class BuffaloLEmbedder:
     def detect_best(self, bgr: np.ndarray):
         faces = self.app.get(bgr)
         if not faces:
+            if not self.enable_fallback_variants:
+                _debug("detected_faces=0")
+                raise ValueError("no face detected")
+
             def _resize(img: np.ndarray, scale: float) -> np.ndarray:
                 if 0.999 <= float(scale) <= 1.001:
                     return img
