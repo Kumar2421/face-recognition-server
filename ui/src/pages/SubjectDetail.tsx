@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { getApiBase, subjectImages, type SubjectImageItem } from '../lib/api';
+import { getApiBase, getSubject, subjectImages, type SubjectImageItem, type SubjectItem } from '../lib/api';
 
 export default function SubjectDetail() {
   const { id } = useParams<{ id: string }>();
   const subjectId = decodeURIComponent(id || '');
   const [items, setItems] = useState<SubjectImageItem[]>([]);
+  const [subject, setSubject] = useState<SubjectItem | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
   const [limit, setLimit] = useState<number>(30);
   const [loading, setLoading] = useState<boolean>(false);
@@ -29,6 +30,15 @@ export default function SubjectDetail() {
   }
 
   useEffect(() => {
+    (async () => {
+      if (!subjectId) return;
+      try {
+        const s = await getSubject(subjectId);
+        setSubject(s);
+      } catch {
+        setSubject(null);
+      }
+    })();
     load(null, limit);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subjectId, limit]);
@@ -38,6 +48,12 @@ export default function SubjectDetail() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <Link to="/subjects" style={{ color: '#a3e635', textDecoration: 'none' }}>← Back</Link>
         <h2 style={{ margin: 0 }}>Subject: {subjectId}</h2>
+        {subject && (
+          <div style={{ color: '#9ca3af' }}>
+            embeddings: {typeof subject.embeddings_cap === 'number' ? `${subject.embeddings_count}/${subject.embeddings_cap}` : subject.embeddings_count}
+            {subject.embeddings_capped ? <span style={{ marginLeft: 8, color: '#f59e0b', fontWeight: 700 }}>capped</span> : null}
+          </div>
+        )}
       </div>
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 12, marginBottom: 12 }}>

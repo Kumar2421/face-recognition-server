@@ -417,6 +417,38 @@ def _save_thumb(bgr: np.ndarray, thumbs_dir: str, image_id: str) -> str:
         return ""
 
 
+def _quarantine_enroll_possible_match(
+    bgr: np.ndarray,
+    subject_id: str,
+    image_id: str,
+    reason: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        events_dir = os.environ.get("EVENTS_DIR", "/data/events")
+        rel = f"no_match/enroll/{str(subject_id).strip()}/{str(image_id).strip()}.jpg"
+        img_path = _save_event_image(bgr, events_dir, rel)
+        thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"enroll-{image_id}")
+    except Exception:
+        img_path = ""
+        thumb_path = ""
+
+    out: dict[str, Any] = {
+        "status": "no_match",
+        "reason": str(reason),
+        "subject_id": str(subject_id),
+        "image_id": str(image_id),
+        "image_path": img_path,
+        "thumb_path": thumb_path,
+    }
+    if extra:
+        try:
+            out.update(extra)
+        except Exception:
+            pass
+    return out
+
+
 def _save_event_image(bgr: np.ndarray, events_dir: str, rel_path: str) -> str:
     try:
         abs_path = os.path.join(str(events_dir), str(rel_path).lstrip("/"))
@@ -498,8 +530,7 @@ def _ensure_qdrant_collection(client, collection: str, vector_size: int) -> None
                 )
         except RuntimeError:
             raise
-        except Exception:
-            pass
+
         return
 
     try:
@@ -523,6 +554,91 @@ def _ensure_qdrant_collection(client, collection: str, vector_size: int) -> None
         if "already exists" in hay and collection.lower() in hay:
             return
         raise
+
+
+def _subject_embedding_cap() -> int:
+    try:
+        return max(1, int(os.environ.get("SUBJECT_MAX_EMBEDDINGS", "10") or "10"))
+    except Exception:
+        return 10
+
+
+def _qdrant_count_subject_embeddings(client, collection: str, subject_id: str) -> int:
+    subject_id = str(subject_id or "").strip()
+    if not subject_id:
+        return 0
+    try:
+        from qdrant_client.http.models import FieldCondition, Filter, MatchValue
+    except Exception:
+        return 0
+    try:
+        cnt = client.count(
+            collection_name=collection,
+            exact=True,
+            count_filter=Filter(must=[FieldCondition(key="subject_id", match=MatchValue(value=subject_id))]),
+        )
+        return int(getattr(cnt, "count", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _auto_add_enabled() -> bool:
+    return str(os.environ.get("AUTO_ADD_EMBEDDING_ENABLE", "0") or "0").strip() in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "YES",
+    )
+
+
+def _auto_add_min_similarity() -> float:
+    try:
+        return float(os.environ.get("AUTO_ADD_EMBEDDING_MIN_SIM", "0.95") or "0.95")
+    except Exception:
+        return 0.95
+
+
+def _enroll_dup_check_enabled() -> bool:
+    return str(os.environ.get("ENROLL_DUPLICATE_CHECK_ENABLE", "1") or "1").strip() in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "YES",
+    )
+
+
+def _enroll_dup_min_similarity() -> float:
+    try:
+        return float(os.environ.get("ENROLL_DUPLICATE_MIN_SIM", "0.80") or "0.55")
+    except Exception:
+        return 0.55
+
+
+def _no_match_auto_enroll_enabled() -> bool:
+    return str(os.environ.get("NO_MATCH_AUTO_ENROLL_ENABLE", "0") or "0").strip() in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "YES",
+    )
+
+
+def _no_match_auto_enroll_prefix() -> str:
+    try:
+        p = str(os.environ.get("NO_MATCH_AUTO_ENROLL_PREFIX", "unknown") or "unknown").strip()
+        return p if p else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _no_match_auto_enroll_block_min_similarity() -> float:
+    try:
+        return float(os.environ.get("NO_MATCH_AUTO_ENROLL_BLOCK_MIN_SIM", "0.80") or "0.80")
+    except Exception:
+        return 0.80
 
 
 def _qdrant_search(client, collection: str, emb: np.ndarray, top_k: int) -> list[dict[str, Any]]:
@@ -1120,11 +1236,18 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
 
+    cap = _subject_embedding_cap()
+    existing = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id)
+    if existing >= cap:
+        raise HTTPException(status_code=409, detail=f"subject embedding cap reached ({existing}/{cap})")
+
     num_embedded = 0
     emb_dim: int | None = None
     last_meta: dict[str, Any] | None = None
 
     for i, img_b64 in enumerate(req.images_b64):
+        if existing >= cap:
+            break
         image_bytes = _decode_b64_bytes(img_b64)
         bgr = _decode_image_bytes(image_bytes)
         try:
@@ -1145,6 +1268,32 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
         point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{subject_id}:{image_hash}"))
         thumb_path = _save_thumb(bgr, app.state.thumbs_dir, image_id)
         image_path = _save_image(bgr, os.environ.get("IMAGES_DIR", "/data/images"), subject_id, image_id)
+
+        if _enroll_dup_check_enabled():
+            try:
+                thr = float(_enroll_dup_min_similarity())
+                hits = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1)
+                if hits:
+                    best = hits[0]
+                    best_sid = str(best.get("subject_id") or "").strip()
+                    best_sim = float(best.get("similarity") or 0.0)
+                    if best_sid and best_sid != subject_id and best_sim >= thr:
+                        extra = {
+                            "matched_subject_id": best_sid,
+                            "similarity": float(best_sim),
+                            "threshold": float(thr),
+                        }
+                        last_meta = last_meta or {}
+                        last_meta["enroll_duplicate_check"] = _quarantine_enroll_possible_match(
+                            bgr,
+                            subject_id=subject_id,
+                            image_id=image_id,
+                            reason="possible_match",
+                            extra=extra,
+                        )
+                        continue
+            except Exception:
+                pass
 
         try:
             from qdrant_client.http.models import PointStruct
@@ -1180,6 +1329,8 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
                 pass
 
         num_embedded += 1
+        existing += 1
+ 
 
     if num_embedded == 0:
         raise HTTPException(status_code=404, detail="no faces embedded from provided images")
@@ -1209,10 +1360,18 @@ async def faces_add_upload(
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
 
+    cap = _subject_embedding_cap()
+    existing = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id)
+    if existing >= cap:
+        raise HTTPException(status_code=409, detail=f"subject embedding cap reached ({existing}/{cap})")
+
     num_embedded = 0
     emb_dim: int | None = None
+    last_meta: dict[str, Any] | None = None
 
     for i, f in enumerate(files):
+        if existing >= cap:
+            break
         image_bytes = await f.read()
         bgr = _decode_image_bytes(image_bytes)
         try:
@@ -1233,6 +1392,33 @@ async def faces_add_upload(
         point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{subject_id}:{image_hash}"))
         thumb_path = _save_thumb(bgr, app.state.thumbs_dir, image_id)
         image_path = _save_image(bgr, os.environ.get("IMAGES_DIR", "/data/images"), subject_id, image_id)
+
+        if _enroll_dup_check_enabled():
+            try:
+                thr = float(_enroll_dup_min_similarity())
+                hits = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1)
+                if hits:
+                    best = hits[0]
+                    best_sid = str(best.get("subject_id") or "").strip()
+                    best_sim = float(best.get("similarity") or 0.0)
+                    if best_sid and best_sid != subject_id and best_sim >= thr:
+                        extra = {
+                            "matched_subject_id": best_sid,
+                            "similarity": float(best_sim),
+                            "threshold": float(thr),
+                            "filename": str(getattr(f, "filename", "") or ""),
+                        }
+                        last_meta = last_meta or {}
+                        last_meta["enroll_duplicate_check"] = _quarantine_enroll_possible_match(
+                            bgr,
+                            subject_id=subject_id,
+                            image_id=image_id,
+                            reason="possible_match",
+                            extra=extra,
+                        )
+                        continue
+            except Exception:
+                pass
         try:
             from qdrant_client.http.models import PointStruct
         except Exception as e:
@@ -1268,6 +1454,7 @@ async def faces_add_upload(
                 pass
 
         num_embedded += 1
+        existing += 1
 
     if num_embedded == 0:
         raise HTTPException(status_code=404, detail="no faces embedded from provided images")
@@ -1559,9 +1746,17 @@ async def ingest_recognition_event(
         quality_meta: dict[str, Any] | None = None
         if evaluator is not None:
             try:
-                t_q0 = _pc()
-                quality_meta = evaluator.evaluate(bgr, face)
-                quality_ms = int(max(0.0, (_pc() - t_q0)) * 1000.0)
+                t_e0 = _pc()
+                emb, quality_meta = _quality_check_and_embed(bgr)
+                quality_ms = int(max(0.0, (_pc() - t_e0)) * 1000.0)
+
+                try:
+                    emb_dim = int(np.asarray(emb).reshape(-1).shape[0])
+                    _ensure_qdrant_collection(q, app.state.qdrant_collection, vector_size=emb_dim)
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"qdrant init failed: {str(e)}")
             except Exception:
                 quality_meta = {"status": "rejected", "reason": "quality_eval_failed"}
             if isinstance(quality_meta, dict) and quality_meta.get("status") == "rejected":
@@ -1711,6 +1906,14 @@ async def ingest_recognition_event(
                 )
             continue
 
+        try:
+            emb_dim = int(np.asarray(emb).reshape(-1).shape[0])
+            _ensure_qdrant_collection(q, app.state.qdrant_collection, vector_size=emb_dim)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"qdrant init failed: {str(e)}")
+
         t_qs0 = _pc()
         results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
         qdrant_ms = int(max(0.0, (_pc() - t_qs0)) * 1000.0)
@@ -1736,6 +1939,9 @@ async def ingest_recognition_event(
 
         decision = "match" if matched else "no_match"
 
+        auto_added = False
+        auto_add_reason: str | None = None
+
         face_model_ms = int(max(0.0, (_t() - t_face_model0)) * 1000.0)
         face_model_ms_total += face_model_ms
         model_ms = int(detect_ms + face_model_ms_total)
@@ -1748,6 +1954,145 @@ async def ingest_recognition_event(
         thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"evt-{ev_id}")
         save_ms = int(max(0.0, (_pc() - t_s0)) * 1000.0)
         image_saved_at = _now_ts() if img_path else None
+
+        no_match_auto_enroll: dict[str, Any] | None = None
+        if (not matched) and _no_match_auto_enroll_enabled():
+            try:
+                try:
+                    block_thr = float(_no_match_auto_enroll_block_min_similarity())
+                except Exception:
+                    block_thr = 0.80
+
+                try:
+                    best_sid = str((results[0].get("subject_id") if results else "") or "").strip()
+                    best_sim = float((results[0].get("similarity") if results else 0.0) or 0.0)
+                except Exception:
+                    best_sid = ""
+                    best_sim = 0.0
+
+                if best_sid and best_sim >= block_thr:
+                    no_match_auto_enroll = {
+                        "enabled": True,
+                        "enrolled": False,
+                        "reason": "possible_match",
+                        "matched_subject_id": best_sid,
+                        "similarity": float(best_sim),
+                        "threshold": float(block_thr),
+                    }
+                    raise RuntimeError("skip_auto_enroll_possible_match")
+
+                prefix = _no_match_auto_enroll_prefix()
+                try:
+                    seq = store.next_counter(f"no_match_auto_enroll:{prefix}", start=1)
+                except Exception:
+                    seq = int(_now_ts())
+                new_subject_id = f"{prefix}-{int(seq)}"
+                try:
+                    from qdrant_client.http.models import PointStruct
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"qdrant client error: {str(e)}")
+
+                nm_image_id = f"nm-{ev_id}"
+                nm_point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{new_subject_id}:{ev_id}"))
+                t0_up = _t()
+                try:
+                    q.upsert(
+                        collection_name=app.state.qdrant_collection,
+                        points=[
+                            PointStruct(
+                                id=nm_point_id,
+                                vector=np.asarray(emb, dtype=np.float32).reshape(-1).tolist(),
+                                payload={
+                                    "subject_id": str(new_subject_id),
+                                    "image_id": str(nm_image_id),
+                                    "created_at": _iso_now(),
+                                    "thumb_path": thumb_path,
+                                    "image_path": img_path,
+                                    "source": "no_match_auto_enroll",
+                                    "event_id": str(ev_id),
+                                    "camera": str(camera),
+                                },
+                            )
+                        ],
+                    )
+                    no_match_auto_enroll = {
+                        "enabled": True,
+                        "enrolled": True,
+                        "subject_id": str(new_subject_id),
+                        "point_id": str(nm_point_id),
+                    }
+                except Exception as e:
+                    _QDRANT_ERR.inc()
+                    no_match_auto_enroll = {
+                        "enabled": True,
+                        "enrolled": False,
+                        "error": str(e),
+                    }
+                finally:
+                    try:
+                        _QDRANT_UPSERT_LAT.observe(max(0.0, _t() - t0_up))
+                    except Exception:
+                        pass
+            except Exception as e:
+                if str(e) == "skip_auto_enroll_possible_match":
+                    pass
+                else:
+                    no_match_auto_enroll = {
+                        "enabled": True,
+                        "enrolled": False,
+                        "error": str(e),
+                    }
+
+        if matched and subject_id and similarity is not None and _auto_add_enabled():
+            if float(similarity) >= float(_auto_add_min_similarity()):
+                try:
+                    cap = _subject_embedding_cap()
+                    existing = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id)
+                    if existing >= cap:
+                        auto_add_reason = "cap_reached"
+                    else:
+                        try:
+                            from qdrant_client.http.models import PointStruct
+                        except Exception as e:
+                            raise HTTPException(status_code=500, detail=f"qdrant client error: {str(e)}")
+
+                        auto_image_id = f"auto-{ev_id}"
+                        auto_point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{subject_id}:{ev_id}"))
+                        t0_up = _t()
+                        try:
+                            q.upsert(
+                                collection_name=app.state.qdrant_collection,
+                                points=[
+                                    PointStruct(
+                                        id=auto_point_id,
+                                        vector=np.asarray(emb, dtype=np.float32).reshape(-1).tolist(),
+                                        payload={
+                                            "subject_id": str(subject_id),
+                                            "image_id": str(auto_image_id),
+                                            "created_at": _iso_now(),
+                                            "thumb_path": thumb_path,
+                                            "image_path": img_path,
+                                            "source": "auto_recognized",
+                                            "event_id": str(ev_id),
+                                            "camera": str(camera),
+                                            "similarity": float(similarity),
+                                        },
+                                    )
+                                ],
+                            )
+                            auto_added = True
+                        except Exception as e:
+                            _QDRANT_ERR.inc()
+                            auto_add_reason = f"qdrant_upsert_failed:{str(e)}"
+                        finally:
+                            try:
+                                _QDRANT_UPSERT_LAT.observe(max(0.0, _t() - t0_up))
+                            except Exception:
+                                pass
+                except Exception as e:
+                    auto_add_reason = f"auto_add_failed:{str(e)}"
+            else:
+                auto_add_reason = "below_auto_add_min_sim"
         processing_ms = _model_ms_from_infer_timing(detect_embed_ms, infer_timing)
         total_ms = int(max(0.0, (_pc() - t_total0)) * 1000.0)
 
@@ -1755,11 +2100,23 @@ async def ingest_recognition_event(
             "quality": quality_meta,
             "decision": {
                 "status": decision,
+                "matched": bool(matched),
                 "min_similarity": float(min_sim),
-                "top2_second": top2_second,
-                "top2_margin": top2_margin,
-                "top2_required": top2_required,
+                "auto_add_embedding": {
+                    "enabled": bool(_auto_add_enabled()),
+                    "added": bool(auto_added),
+                    "reason": auto_add_reason,
+                    "min_similarity": float(_auto_add_min_similarity()),
+                },
+                "no_match_auto_enroll": (
+                    no_match_auto_enroll
+                    if no_match_auto_enroll is not None
+                    else {"enabled": bool(_no_match_auto_enroll_enabled()), "enrolled": False}
+                ),
             },
+            "top2_second": top2_second,
+            "top2_margin": top2_margin,
+            "top2_required": top2_required,
             "timing": {
                 "decode_ms": int(decode_ms),
                 "detect_embed_ms": int(detect_embed_ms),
@@ -2069,6 +2426,8 @@ def stats() -> dict[str, Any]:
 class SubjectItem(BaseModel):
     subject_id: str
     embeddings_count: int
+    embeddings_cap: int | None = None
+    embeddings_capped: bool | None = None
 
 
 class SubjectsListResponse(BaseModel):
@@ -2118,6 +2477,7 @@ def list_subjects(cursor: str | None = None, limit: int = 50, with_counts: bool 
         except Exception:
             continue
 
+    cap = _subject_embedding_cap()
     items: list[SubjectItem] = []
     if with_counts:
         try:
@@ -2134,9 +2494,24 @@ def list_subjects(cursor: str | None = None, limit: int = 50, with_counts: bool 
                 n = int(getattr(cnt, "count", 0) or 0)
             except Exception:
                 n = 0
-            items.append(SubjectItem(subject_id=sid, embeddings_count=n))
+            items.append(
+                SubjectItem(
+                    subject_id=sid,
+                    embeddings_count=n,
+                    embeddings_cap=cap,
+                    embeddings_capped=bool(n >= cap),
+                )
+            )
     else:
-        items = [SubjectItem(subject_id=sid, embeddings_count=0) for sid in uniq.keys()]
+        items = [
+            SubjectItem(
+                subject_id=sid,
+                embeddings_count=0,
+                embeddings_cap=cap,
+                embeddings_capped=False,
+            )
+            for sid in uniq.keys()
+        ]
 
     next_cursor = str(next_cur) if next_cur is not None else None
     return SubjectsListResponse(items=items, cursor=next_cursor)
@@ -2194,6 +2569,19 @@ def list_subject_images(subject_id: str, cursor: str | None = None, limit: int =
 
     next_cursor = str(next_cur) if next_cur is not None else None
     return SubjectImagesResponse(items=items, cursor=next_cursor)
+
+
+@app.get("/v1/subjects/{subject_id}", response_model=SubjectItem)
+def get_subject(subject_id: str) -> SubjectItem:
+    subject_id = str(subject_id or "").strip()
+    if not subject_id:
+        raise HTTPException(status_code=400, detail="subject_id is required")
+    q = getattr(app.state, "qdrant", None)
+    if q is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+    cap = _subject_embedding_cap()
+    n = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id)
+    return SubjectItem(subject_id=subject_id, embeddings_count=n, embeddings_cap=cap, embeddings_capped=bool(n >= cap))
 @app.get("/health")
 def health() -> dict[str, Any]:
     q = getattr(app.state, "qdrant", None)

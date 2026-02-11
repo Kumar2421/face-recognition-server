@@ -37,7 +37,8 @@ services:
       - FACE_DIR=/data/facefolder/security
       - CONFIG_PATH=/app/config.yaml
       - QDRANT_URL=http://qdrant:6333
-      - QDRANT_COLLECTION=frigate_faces_v2
+      - QDRANT_COLLECTION=frigate_faces_v3
+      # - QDRANT_COLLECTION=frigate_faces_v2
       # - QDRANT_COLLECTION=frigate_faces old emp db
       - BUFFALO_MODEL_ROOT=/models
       - BUFFALO_MODEL_NAME=buffalo_l
@@ -56,6 +57,13 @@ services:
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://face.service.tools.thefusionapps.com}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - AUTO_ADD_EMBEDDING_ENABLE=1
+      - AUTO_ADD_EMBEDDING_MIN_SIM=0.95
+      - SUBJECT_MAX_EMBEDDINGS=10
+      - ENROLL_DUPLICATE_CHECK_ENABLE=1
+      - ENROLL_DUPLICATE_MIN_SIM=0.75
+      - NO_MATCH_AUTO_ENROLL_ENABLE=1
+      - NO_MATCH_AUTO_ENROLL_PREFIX=customer
 
     ports:
       - "8001:8000"

@@ -65,6 +65,15 @@ class EventsStore:
                 """
             )
 
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS counters (
+                    key TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                )
+                """
+            )
+
             # Lightweight migration for older DBs
             try:
                 cols = [str(r[1]) for r in conn.execute("PRAGMA table_info(recognition_events)").fetchall()]
@@ -94,6 +103,26 @@ class EventsStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_camera ON recognition_events (camera)"
             )
+
+    def next_counter(self, key: str, start: int = 1) -> int:
+        key = str(key or "").strip()
+        if not key:
+            raise ValueError("counter key is required")
+        start = int(start or 1)
+        if start < 0:
+            start = 0
+
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO counters (key, value) VALUES (?, ?)",
+                    (key, int(start - 1)),
+                )
+                conn.execute("UPDATE counters SET value = value + 1 WHERE key = ?", (key,))
+                row = conn.execute("SELECT value FROM counters WHERE key = ?", (key,)).fetchone()
+                if row is None:
+                    return int(start)
+                return int(row[0])
 
     def insert_event(self, ev: RecognitionEvent) -> None:
         with self._lock:

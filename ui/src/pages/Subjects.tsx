@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { deleteSubject, subjects, type SubjectItem, subjectImages, type SubjectImageItem, getApiBase } from '../lib/api';
 
 export default function Subjects() {
@@ -194,7 +195,10 @@ export default function Subjects() {
               {filtered.map((it) => (
                 <tr key={it.subject_id}>
                   <td style={{ borderBottom: '1px solid #222', padding: '6px' }}>{it.subject_id}</td>
-                  <td style={{ borderBottom: '1px solid #222', padding: '6px' }}>{it.embeddings_count}</td>
+                  <td style={{ borderBottom: '1px solid #222', padding: '6px' }}>
+                    {typeof it.embeddings_cap === 'number' ? `${it.embeddings_count}/${it.embeddings_cap}` : it.embeddings_count}
+                    {it.embeddings_capped ? <span style={{ marginLeft: 8, color: '#f59e0b', fontWeight: 700 }}>capped</span> : null}
+                  </td>
                   <td style={{ borderBottom: '1px solid #222', padding: '6px' }}>
                     {(() => {
                       const p = previews[it.subject_id];
@@ -211,13 +215,21 @@ export default function Subjects() {
                     })()}
                   </td>
                   <td style={{ borderBottom: '1px solid #222', padding: '6px' }}>
-                    <button onClick={() => onDelete(it.subject_id)} style={{ background: '#ef4444', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>Delete</button>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                      <Link
+                        to={`/subjects/${encodeURIComponent(it.subject_id)}`}
+                        style={{ background: '#0ea5e9', color: '#111', border: 'none', padding: '6px 10px', borderRadius: 6, cursor: 'pointer', fontWeight: 600, textDecoration: 'none', display: 'inline-block' }}
+                      >
+                        Open
+                      </Link>
+                      <button onClick={() => onDelete(it.subject_id)} style={{ background: '#ef4444', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: 6, cursor: 'pointer' }}>Delete</button>
+                    </div>
                   </td>
                 </tr>
               ))}
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={3} style={{ padding: '8px' }}>No subjects.</td>
+                  <td colSpan={4} style={{ padding: '8px' }}>No subjects.</td>
                 </tr>
               )}
             </tbody>

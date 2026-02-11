@@ -67,7 +67,7 @@ export async function facesSubjects(): Promise<{ subjects: string[] }> {
 }
 
 // Phase 2 endpoints
-export type SubjectItem = { subject_id: string; embeddings_count: number };
+export type SubjectItem = { subject_id: string; embeddings_count: number; embeddings_cap?: number | null; embeddings_capped?: boolean | null };
 export type SubjectsListResponse = { items: SubjectItem[]; cursor?: string | null };
 
 export async function subjects(params: { cursor?: string | null; limit?: number; with_counts?: boolean } = {}): Promise<SubjectsListResponse> {
@@ -77,6 +77,10 @@ export async function subjects(params: { cursor?: string | null; limit?: number;
   if (params.with_counts != null) q.set('with_counts', String(params.with_counts));
   const qs = q.toString();
   return apiGet(`/v1/subjects${qs ? `?${qs}` : ''}`);
+}
+
+export async function getSubject(subjectId: string): Promise<SubjectItem> {
+  return apiGet(`/v1/subjects/${encodeURIComponent(subjectId)}`);
 }
 
 export type SubjectImageItem = { image_id: string; thumb_path?: string | null; image_path?: string | null; created_at?: string | null; source?: string | null };
