@@ -30,24 +30,53 @@ export default function Settings() {
   }
 
   return (
-    <div>
-      <h2>Settings</h2>
-      <div style={{ display: 'grid', gap: 12, maxWidth: 560 }}>
-        <label style={{ display: 'grid', gap: 6 }}>
-          <span>API Base URL</span>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
+      <header>
+        <h2 style={{ fontSize: '1.875rem', fontWeight: 800, color: 'var(--text-primary)', marginBottom: '4px' }}>System Settings</h2>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '0.9375rem' }}>Configure API endpoints and local dashboard preferences.</p>
+      </header>
+
+      <div className="card" style={{ display: 'grid', gap: '24px', maxWidth: '600px', background: 'var(--bg-primary)' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>API Base URL</label>
           <input
             value={apiBase}
             onChange={(e) => setApiBase(e.target.value)}
             placeholder="http://localhost:8001"
-            style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid #333', background: '#0a0a0a', color: '#e5e5e5' }}
+            style={{ padding: '12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: '1rem' }}
           />
-        </label>
-        <div style={{ display: 'flex', gap: 12 }}>
-          <button onClick={save} style={{ background: '#22c55e', color: '#111', border: 'none', padding: '8px 12px', borderRadius: 8, cursor: 'pointer', fontWeight: 600 }}>Save</button>
-          <button onClick={clearOverride} style={{ background: '#374151', color: '#fff', border: 'none', padding: '8px 12px', borderRadius: 8, cursor: 'pointer' }}>Clear Override</button>
+          <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>The URL where the Face Service API is hosted. Usually http://localhost:8001 during development.</span>
         </div>
-        {saved && <div style={{ color: '#a3e635' }}>{saved}</div>}
+
+        <div style={{ display: 'flex', gap: '12px', borderTop: '1px solid var(--border)', paddingTop: '20px' }}>
+          <button onClick={save} className="primary" style={{ flex: 1, padding: '12px', fontWeight: 700 }}>Save Changes</button>
+          <button onClick={clearOverride} style={{ flex: 1, padding: '12px', fontWeight: 600 }}>Clear Override</button>
+        </div>
+
+        {saved && (
+          <div style={{ 
+            padding: '12px', 
+            borderRadius: 'var(--radius-md)', 
+            background: 'rgba(16, 185, 129, 0.1)', 
+            color: 'var(--success)', 
+            fontSize: '0.875rem', 
+            fontWeight: 600,
+            textAlign: 'center'
+          }}>
+            {saved}
+          </div>
+        )}
       </div>
+
+      <section className="card" style={{ maxWidth: '600px', border: '1px solid var(--warning)', background: 'rgba(245, 158, 11, 0.05)' }}>
+        <h3 style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--warning)', marginBottom: '8px' }}>Environment Information</h3>
+        <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', display: 'grid', gridTemplateColumns: '120px 1fr', gap: '8px' }}>
+          <span>Current Base:</span>
+          <code style={{ color: 'var(--text-primary)' }}>{getApiBase()}</code>
+          <span>Storage:</span>
+          <span>{localStorage.getItem('api_base') ? 'Local Storage (Overridden)' : 'Default (.env)'}</span>
+        </div>
+      </section>
     </div>
   );
 }

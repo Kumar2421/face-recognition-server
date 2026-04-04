@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from urllib.parse import urlparse
 
 import cv2
@@ -18,7 +18,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, AliasChoices
 from quality import FaceQualityEvaluator
 from embedders.buffalo_l import (
     BuffaloLEmbedder,
@@ -31,9 +31,14 @@ from ui_page import ui_html
 from events_store import EventsStore, RecognitionEvent
 from config_loader import apply_env_defaults_from_config, load_config
 
-import httpx
- 
+from cross_check import cross_check_router
 
+import httpx
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -43,6 +48,53 @@ def _as_float(v: Any, default: float) -> float:
         return float(v)
     except Exception:
         return default
+
+
+def _tz() -> Any:
+    name = str(os.environ.get("FACE_SERVICE_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata").strip() or "Asia/Kolkata"
+    if ZoneInfo is None:
+        return timezone.utc
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return timezone.utc
+
+
+def _day_range_ts(day_str: str) -> tuple[float | None, float | None]:
+    s = str(day_str or "").strip()
+    if not s:
+        return None, None
+    try:
+        d = date.fromisoformat(s)
+    except Exception:
+        return None, None
+    tz = _tz()
+    start = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz).timestamp()
+    end = (datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz) + timedelta(days=1)).timestamp()
+    return float(start), float(end)
+
+
+def _date_window_from_params(
+    *,
+    day: str | None,
+    from_day: str | None,
+    to_day: str | None,
+    since_ts: float | None,
+    until_ts: float | None,
+) -> tuple[float | None, float | None]:
+    if since_ts is not None or until_ts is not None:
+        return since_ts, until_ts
+
+    if day:
+        return _day_range_ts(day)
+
+    s0 = None
+    e0 = None
+    if from_day:
+        s0, _ = _day_range_ts(from_day)
+    if to_day:
+        _, e0 = _day_range_ts(to_day)
+    return s0, e0
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -174,7 +226,7 @@ class FaceAddResponse(BaseModel):
 
 
 class FaceSearchTopKRequest(BaseModel):
-    image_b64: str
+    image_b64: str = Field(..., validation_alias=AliasChoices("image_b64", "image"))
     top_k: int = 5
 
 
@@ -205,6 +257,15 @@ class FaceRecognizeResponse(BaseModel):
     meta: dict[str, Any] | None = None
 
 
+class QualityCheckResponse(BaseModel):
+    ok: bool
+    total_quality: str | None = None
+    quality: dict[str, Any] | None = None
+    det_score: float | None = None
+    bbox: list[float] | None = None
+    timing: dict[str, Any] | None = None
+
+
 class RecognitionEventResponse(BaseModel):
     event_id: str
     ts: float
@@ -222,11 +283,39 @@ class RecognitionEventResponse(BaseModel):
     thumb_path: str
     image_saved_at: float | None = None
     meta: dict[str, Any] | None = None
+    feedback_label: str | None = None
+    feedback_note: str | None = None
+    feedback_updated_at: float | None = None
 
 
 class RecognitionEventsListResponse(BaseModel):
     items: list[RecognitionEventResponse]
     cursor: float | None = None
+
+
+class EventFeedbackRequest(BaseModel):
+    label: str | None = None
+    note: str | None = None
+
+
+class EventFeedbackResponse(BaseModel):
+    event_id: str
+    updated: bool
+    feedback_label: str | None = None
+    feedback_note: str | None = None
+    feedback_updated_at: float | None = None
+
+
+class FeedbackStatsResponse(BaseModel):
+    total: int
+    labeled: int
+    unlabeled: int
+    tp: int
+    fp: int
+    fn: int
+    ignore: int
+    fp_rate_match: float | None = None
+    by_decision: dict[str, dict[str, int]]
 
 
 class RecognitionFetchRequest(BaseModel):
@@ -337,22 +426,48 @@ def _quality_check_and_embed(bgr: np.ndarray) -> tuple[np.ndarray, dict[str, Any
         except Exception:
             pass
 
-    # keep existing logging for quality meta (if present)
-    try:
-        q = (meta or {}).get("quality") if isinstance(meta, dict) else None
-        if isinstance(q, dict):
-            _QCHECK_TOTAL.inc()
-            logger.info(json.dumps({
-                "event": "quality_check",
-                "status": q.get("status"),
-                "reason": q.get("reason"),
-                "blur": q.get("blur"),
-                "brightness": q.get("brightness"),
-            }))
-    except Exception:
-        pass
-
     return emb, meta
+
+
+def _quality_check_only(bgr: np.ndarray) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    try:
+        evaluator = getattr(app.state, "quality", None)
+    except Exception:
+        evaluator = None
+
+    try:
+        embedder = getattr(app.state, "gpu", None) or app.state.embedder
+    except Exception:
+        embedder = app.state.embedder
+
+    t0 = _t()
+    try:
+        face = embedder.detect_best(bgr)
+        det_score = float(getattr(face, "det_score", 0.0) or 0.0)
+        bbox_arr = np.asarray(getattr(face, "bbox", None), dtype=np.float32).reshape(-1)
+        bbox = [float(x) for x in bbox_arr.tolist()] if bbox_arr.size == 4 else None
+
+        q = None
+        if evaluator is not None:
+            try:
+                q = evaluator.evaluate(bgr, face)
+            except RuntimeError:
+                raise HTTPException(status_code=500, detail="quality evaluator failure")
+            except Exception:
+                raise HTTPException(status_code=500, detail="quality evaluator failure")
+
+        timing = {"detect_ms": int(max(0.0, (_t() - t0)) * 1000.0)}
+        return q, {"det_score": det_score, "bbox": bbox, "timing": timing}
+    except ValueError as e:
+        msg = str(e)
+        if "no face" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=422, detail=msg)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="detect failure")
+
 
 
 def _decode_b64_bytes(image_b64: str) -> bytes:
@@ -641,15 +756,62 @@ def _no_match_auto_enroll_block_min_similarity() -> float:
         return 0.80
 
 
+def _no_match_auto_attach_min_similarity() -> float:
+    try:
+        return float(os.environ.get("NO_MATCH_AUTO_ATTACH_MIN_SIM", "0.70") or "0.70")
+    except Exception:
+        return 0.70
+
+
+def _no_match_auto_attach_min_margin() -> float:
+    try:
+        return float(os.environ.get("NO_MATCH_AUTO_ATTACH_MIN_MARGIN", "0.10") or "0.10")
+    except Exception:
+        return 0.10
+
+
 def _qdrant_search(client, collection: str, emb: np.ndarray, top_k: int) -> list[dict[str, Any]]:
     t0 = _t()
     try:
-        hits = client.search(
+        search_params = None
+        try:
+            from qdrant_client.http.models import SearchParams
+        except Exception:
+            SearchParams = None  # type: ignore
+
+        if SearchParams is not None:
+            try:
+                ef_raw = str(os.environ.get("QDRANT_HNSW_EF", "") or "").strip()
+                ef = int(ef_raw) if ef_raw else None
+            except Exception:
+                ef = None
+
+            exact_raw = str(os.environ.get("QDRANT_EXACT", "") or "").strip().lower()
+            exact = exact_raw in ("1", "true", "yes") if exact_raw else None
+
+            indexed_only_raw = str(os.environ.get("QDRANT_INDEXED_ONLY", "") or "").strip().lower()
+            indexed_only = indexed_only_raw in ("1", "true", "yes") if indexed_only_raw else None
+
+            try:
+                search_params = SearchParams(hnsw_ef=ef, exact=exact, indexed_only=indexed_only)
+            except Exception:
+                search_params = None
+
+        kwargs = dict(
             collection_name=collection,
             query_vector=emb.astype(np.float32).reshape(-1).tolist(),
             limit=int(top_k),
-            with_payload=True,
+            with_payload=["subject_id", "image_id", "thumb_path"],
         )
+        if search_params is not None:
+            kwargs["search_params"] = search_params
+
+        try:
+            hits = client.search(**kwargs)
+        except TypeError:
+            # older qdrant_client versions may not support search_params
+            kwargs.pop("search_params", None)
+            hits = client.search(**kwargs)
     except Exception as e:
         _QDRANT_ERR.inc()
         raise HTTPException(status_code=500, detail=f"qdrant search failed: {str(e)}")
@@ -819,6 +981,8 @@ def _infer_tflite(model_path: str, input_data: np.ndarray) -> np.ndarray:
 
 app = FastAPI()
 
+app.include_router(cross_check_router)
+
 # CORS for UI and external clients
 cors_origins_env = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
 cors_origins = [
@@ -957,6 +1121,17 @@ def debug_providers() -> dict[str, Any]:
     return _collect_provider_info()
 
 
+from fastapi.exceptions import RequestValidationError
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    logger.error("422 Validation Error at %s: %s", request.url, exc.errors())
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": str(exc)},
+    )
+
+
 @app.on_event("startup")
 def _startup() -> None:
     # Optional config.yaml for defaults (environment variables still take precedence)
@@ -1002,6 +1177,10 @@ def _startup() -> None:
         min_det_score=min_det_score,
         providers=providers,
     )
+
+    # Expose internal helpers for cross_check module
+    app.state.decode_image_bytes = _decode_image_bytes
+    app.state.quality_check_and_embed = _quality_check_and_embed
 
     try:
         logger.info("provider_info=%s", _collect_provider_info())
@@ -1544,6 +1723,7 @@ def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
             pass
         if not ok:
             return FaceRecognizeResponse(matched=False, results=items, meta=meta)
+
         return FaceRecognizeResponse(
             matched=True,
             subject_id=best.subject_id,
@@ -1551,7 +1731,63 @@ def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
             results=items,
             meta=meta,
         )
+
     return FaceRecognizeResponse(matched=False, results=items, meta=meta)
+
+
+@app.get("/v1/faces/cross_match/{subject_id}", response_model=FaceSearchTopKResponse)
+async def faces_cross_match(subject_id: str, top_k: int = 20) -> FaceSearchTopKResponse:
+    q = getattr(app.state, "qdrant", None)
+    if q is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+
+    # 1. Get embedding for the subject
+    vector = None
+    try:
+        idx_obj = getattr(app.state, "index", None)
+        if idx_obj and subject_id in idx_obj.subject_ids:
+            i = idx_obj.subject_ids.index(subject_id)
+            vector = idx_obj.mean_embeddings[i]
+    except Exception:
+        pass
+
+    if vector is None:
+        # Fallback: Search Qdrant for the subject's own points to get a vector
+        try:
+            from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+            hits = q.scroll(
+                collection_name=app.state.qdrant_collection,
+                scroll_filter=Filter(must=[FieldCondition(key="subject_id", match=MatchValue(value=subject_id))]),
+                limit=1,
+                with_vectors=True
+            )
+            if hits and hits[0]:
+                vector = hits[0][0].vector
+        except Exception as e:
+            logger.error("cross_match fallback failed: %s", str(e))
+
+    if vector is None:
+        # One last try: if it's the subject name directly
+        raise HTTPException(status_code=404, detail=f"subject {subject_id} not found or has no embeddings")
+
+    # 2. Search for similar subjects
+    hits = _qdrant_search(q, app.state.qdrant_collection, vector, top_k=100)
+    
+    # 3. Filter for different subject_ids (usually visitor-*) and high similarity
+    threshold = 0.85
+    filtered = []
+    seen_sids = {subject_id}
+    
+    for h in hits:
+        sid = str(h.get("subject_id") or "").strip()
+        sim = float(h.get("similarity") or 0.0)
+        if sid and sid not in seen_sids and sim >= threshold:
+            filtered.append(FaceSearchTopKItem(**h))
+            seen_sids.add(sid)
+            if len(filtered) >= top_k:
+                break
+
+    return FaceSearchTopKResponse(results=filtered)
 
 
 @app.post("/v1/events/recognition", response_model=RecognitionEventResponse)
@@ -1964,11 +2200,57 @@ async def ingest_recognition_event(
                     block_thr = 0.80
 
                 try:
+                    attach_thr = float(_no_match_auto_attach_min_similarity())
+                except Exception:
+                    attach_thr = 0.70
+                try:
+                    attach_margin_thr = float(_no_match_auto_attach_min_margin())
+                except Exception:
+                    attach_margin_thr = 0.10
+
+                try:
                     best_sid = str((results[0].get("subject_id") if results else "") or "").strip()
                     best_sim = float((results[0].get("similarity") if results else 0.0) or 0.0)
                 except Exception:
                     best_sid = ""
                     best_sim = 0.0
+
+                second_sim: float | None = None
+                try:
+                    if results and len(results) >= 2:
+                        second_sim = float(results[1].get("similarity") or 0.0)
+                except Exception:
+                    second_sim = None
+
+                if best_sid:
+                    try:
+                        prefix = _no_match_auto_enroll_prefix()
+                    except Exception:
+                        prefix = "unknown"
+
+                    if prefix and best_sid.startswith(f"{prefix}-") and best_sim >= float(attach_thr):
+                        margin_ok = True
+                        if second_sim is not None:
+                            try:
+                                margin_ok = (float(best_sim) - float(second_sim)) >= float(attach_margin_thr)
+                            except Exception:
+                                margin_ok = False
+                        if margin_ok:
+                            matched = True
+                            subject_id = best_sid
+                            similarity = float(best_sim)
+                            decision = "match"
+                            no_match_auto_enroll = {
+                                "enabled": True,
+                                "enrolled": False,
+                                "reason": "attached_existing_visitor",
+                                "subject_id": str(best_sid),
+                                "similarity": float(best_sim),
+                                "threshold": float(attach_thr),
+                                "second_similarity": float(second_sim) if second_sim is not None else None,
+                                "margin_threshold": float(attach_margin_thr),
+                            }
+                            raise RuntimeError("skip_auto_enroll_attached_existing")
 
                 if best_sid and best_sim >= block_thr:
                     no_match_auto_enroll = {
@@ -2035,6 +2317,8 @@ async def ingest_recognition_event(
                         pass
             except Exception as e:
                 if str(e) == "skip_auto_enroll_possible_match":
+                    pass
+                elif str(e) == "skip_auto_enroll_attached_existing":
                     pass
                 else:
                     no_match_auto_enroll = {
@@ -2198,6 +2482,9 @@ def list_recognition_events(
     decision: str | None = None,
     min_similarity: float | None = None,
     max_similarity: float | None = None,
+    day: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
     since_ts: float | None = None,
     until_ts: float | None = None,
     limit: int = 100,
@@ -2206,6 +2493,14 @@ def list_recognition_events(
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
         raise HTTPException(status_code=500, detail="events store not configured")
+
+    since_ts, until_ts = _date_window_from_params(
+        day=day,
+        from_day=from_day,
+        to_day=to_day,
+        since_ts=since_ts,
+        until_ts=until_ts,
+    )
     items, next_cur = store.list_events(
         camera=camera,
         subject_id=subject_id,
@@ -2221,6 +2516,51 @@ def list_recognition_events(
         items=[RecognitionEventResponse(**it) for it in items],
         cursor=next_cur,
     )
+
+
+@app.get("/v1/events/recognition/cameras", response_model=list[str])
+def list_recognition_cameras(limit: int = 5000) -> list[str]:
+    store: EventsStore | None = getattr(app.state, "events", None)
+    if store is None:
+        raise HTTPException(status_code=500, detail="events store not configured")
+
+    out: set[str] = set()
+    try:
+        for c in store.list_cameras(limit=int(limit or 5000)):
+            c = str(c or "").strip()
+            if c:
+                out.add(c)
+    except Exception:
+        pass
+
+    events_dir = str(os.environ.get("EVENTS_DIR", "/data/events") or "/data/events")
+    try:
+        if os.path.isdir(events_dir):
+            for name in os.listdir(events_dir):
+                p = os.path.join(events_dir, name)
+                if not os.path.isdir(p):
+                    continue
+
+                # Common layout: /data/events/<bucket>/<camera>/...
+                try:
+                    for cam in os.listdir(p):
+                        cam_p = os.path.join(p, cam)
+                        if not os.path.isdir(cam_p):
+                            continue
+                        cam = str(cam or "").strip()
+                        if cam:
+                            out.add(cam)
+                except Exception:
+                    # Also allow layout: /data/events/<camera>/...
+                    name = str(name or "").strip()
+                    if name:
+                        out.add(name)
+    except Exception:
+        pass
+
+    cams = sorted(out)
+    lim = max(1, min(int(limit or 5000), 50000))
+    return cams[:lim]
 
 
 class ForwardEventRequest(BaseModel):
@@ -2284,6 +2624,20 @@ async def forward_recognition_event(req: ForwardEventRequest) -> dict[str, Any]:
     return {"forwarded": True, "status_code": int(r.status_code)}
 
 
+@app.get("/v1/events/recognition/feedback_stats", response_model=FeedbackStatsResponse)
+def recognition_feedback_stats(
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+    camera: str | None = None,
+) -> FeedbackStatsResponse:
+    store: EventsStore | None = getattr(app.state, "events", None)
+    if store is None:
+        raise HTTPException(status_code=500, detail="events store not configured")
+
+    st = store.feedback_stats(since_ts=since_ts, until_ts=until_ts, camera=camera)
+    return FeedbackStatsResponse(**st)
+
+
 @app.get("/v1/events/recognition/{event_id}", response_model=RecognitionEventResponse)
 def get_recognition_event(event_id: str) -> RecognitionEventResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
@@ -2293,6 +2647,38 @@ def get_recognition_event(event_id: str) -> RecognitionEventResponse:
     if not it:
         raise HTTPException(status_code=404, detail="event not found")
     return RecognitionEventResponse(**it)
+
+
+@app.post("/v1/events/recognition/{event_id}/feedback", response_model=EventFeedbackResponse)
+def set_recognition_event_feedback(event_id: str, req: EventFeedbackRequest) -> EventFeedbackResponse:
+    store: EventsStore | None = getattr(app.state, "events", None)
+    if store is None:
+        raise HTTPException(status_code=500, detail="events store not configured")
+
+    event_id = str(event_id or "").strip()
+    if not event_id:
+        raise HTTPException(status_code=400, detail="event_id is required")
+
+    label = str(req.label or "").strip().lower() if req.label is not None else None
+    if label is not None:
+        if label == "":
+            label = None
+        elif label not in ("tp", "fp", "fn", "ignore"):
+            raise HTTPException(status_code=400, detail="invalid label; use one of: tp, fp, fn, ignore")
+
+    note = str(req.note or "").strip() if req.note is not None else None
+    updated_at = float(_now_ts())
+    updated = bool(store.set_feedback(event_id, label=label, note=note, updated_at=updated_at))
+    if not updated:
+        raise HTTPException(status_code=404, detail="event not found")
+
+    return EventFeedbackResponse(
+        event_id=event_id,
+        updated=True,
+        feedback_label=label,
+        feedback_note=note,
+        feedback_updated_at=updated_at,
+    )
 
 
 @app.post("/v1/faces/recognize_upload", response_model=FaceRecognizeResponse)
@@ -2327,6 +2713,38 @@ async def faces_recognize_upload(
             meta=meta,
         )
     return FaceRecognizeResponse(matched=False, results=items, meta=meta)
+
+
+@app.post("/v1/quality/check_upload", response_model=QualityCheckResponse)
+async def quality_check_upload(file: UploadFile = File(...)) -> QualityCheckResponse:
+    t0 = _pc()
+    image_bytes = await file.read()
+    decode_t0 = _pc()
+    bgr = _decode_image_bytes(image_bytes)
+    decode_ms = int(max(0.0, (_pc() - decode_t0)) * 1000.0)
+
+    q_t0 = _pc()
+    q, meta = _quality_check_only(bgr)
+    quality_ms = int(max(0.0, (_pc() - q_t0)) * 1000.0)
+
+    ok = True
+    if isinstance(q, dict) and q.get("status") == "rejected":
+        ok = False
+
+    total_quality = "pass" if ok else "fail"
+
+    total_ms = int(max(0.0, (_pc() - t0)) * 1000.0)
+    timing = dict(meta.get("timing") or {})
+    timing.update({"decode_ms": int(decode_ms), "quality_ms": int(quality_ms), "total_ms": int(total_ms)})
+
+    return QualityCheckResponse(
+        ok=bool(ok),
+        total_quality=str(total_quality),
+        quality=q if isinstance(q, dict) else None,
+        det_score=meta.get("det_score"),
+        bbox=meta.get("bbox"),
+        timing=timing,
+    )
 
 
 @app.post("/v1/face/search_upload", response_model=FaceSearchResponse)
@@ -2449,33 +2867,68 @@ class SubjectImagesResponse(BaseModel):
 
 
 @app.get("/v1/subjects", response_model=SubjectsListResponse)
-def list_subjects(cursor: str | None = None, limit: int = 50, with_counts: bool = True) -> SubjectsListResponse:
-    q = getattr(app.state, "qdrant", None)
-    if q is None:
+def list_subjects(
+    cursor: str | None = None,
+    limit: int = 50,
+    with_counts: bool = True,
+    q: str | None = None,
+) -> SubjectsListResponse:
+    client = getattr(app.state, "qdrant", None)
+    if client is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
     limit = max(1, min(int(limit or 50), 500))
+
+    qstr = str(q or "").strip().lower()
+    want_filter = bool(qstr)
+
     try:
-        scroll_kwargs: dict[str, Any] = {
-            "collection_name": app.state.qdrant_collection,
-            "limit": int(limit),
-            "with_payload": True,
-            "with_vectors": False,
-        }
-        if cursor:
-            scroll_kwargs["offset"] = cursor
-        points, next_cur = q.scroll(**scroll_kwargs)
+        scan_limit = 5000 if want_filter else int(limit)
+        scan_limit = max(int(limit), min(int(scan_limit), 5000))
+
+        points: list[Any] = []
+        next_cur: Any = cursor
+        scanned = 0
+        uniq: dict[str, None] = {}
+        while True:
+            scroll_kwargs: dict[str, Any] = {
+                "collection_name": app.state.qdrant_collection,
+                "limit": int(scan_limit),
+                "with_payload": True,
+                "with_vectors": False,
+            }
+            if next_cur:
+                scroll_kwargs["offset"] = next_cur
+            batch, new_next = client.scroll(**scroll_kwargs)
+            next_cur = new_next
+
+            for pnt in batch or []:
+                scanned += 1
+                try:
+                    payload = getattr(pnt, "payload", None) or {}
+                    sid = str(payload.get("subject_id") or "").strip()
+                    if not sid:
+                        continue
+                    if want_filter and (qstr not in sid.lower()):
+                        continue
+                    if sid in uniq:
+                        continue
+                    uniq[sid] = None
+                except Exception:
+                    continue
+
+                if len(uniq) >= int(limit):
+                    break
+
+            if len(uniq) >= int(limit):
+                break
+            if not next_cur:
+                break
+            if want_filter and scanned >= 20000:
+                break
+
+        points = []
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"qdrant scroll failed: {str(e)}")
-
-    uniq: dict[str, None] = {}
-    for pnt in points or []:
-        try:
-            payload = getattr(pnt, "payload", None) or {}
-            sid = str(payload.get("subject_id") or '').strip()
-            if sid:
-                uniq.setdefault(sid, None)
-        except Exception:
-            continue
 
     cap = _subject_embedding_cap()
     items: list[SubjectItem] = []
@@ -2486,7 +2939,7 @@ def list_subjects(cursor: str | None = None, limit: int = 50, with_counts: bool 
             raise HTTPException(status_code=500, detail=f"qdrant client error: {str(e)}")
         for sid in uniq.keys():
             try:
-                cnt = q.count(
+                cnt = client.count(
                     collection_name=app.state.qdrant_collection,
                     exact=True,
                     count_filter=Filter(must=[FieldCondition(key="subject_id", match=MatchValue(value=sid))]),

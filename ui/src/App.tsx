@@ -8,6 +8,7 @@ import SubjectDetail from './pages/SubjectDetail';
 import Settings from './pages/Settings';
 import Rejections from './pages/Rejections';
 import Recognition from './pages/Recognition';
+import Employees from './pages/Employees';
 
 function App() {
   return (
@@ -17,6 +18,7 @@ function App() {
         <Route path="/enroll" element={<Enroll />} />
         <Route path="/search" element={<Search />} />
         <Route path="/recognition" element={<Recognition />} />
+        <Route path="/employees" element={<Employees />} />
         <Route path="/rejections" element={<Rejections />} />
         <Route path="/subjects" element={<Subjects />} />
         <Route path="/subjects/:id" element={<SubjectDetail />} />

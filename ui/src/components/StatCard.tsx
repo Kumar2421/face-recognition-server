@@ -1,13 +1,30 @@
 import React from 'react';
 
 export default function StatCard({ title, value, tone = 'default', hint }: { title: string; value: React.ReactNode; tone?: 'default' | 'good' | 'warn' | 'bad'; hint?: string }) {
-  const border = tone === 'good' ? '#14532d' : tone === 'warn' ? '#78350f' : tone === 'bad' ? '#7f1d1d' : '#222';
-  const bg = tone === 'good' ? '#052e16' : tone === 'warn' ? '#111827' : tone === 'bad' ? '#0b0f1a' : '#0f0f0f';
+  const getColors = () => {
+    switch (tone) {
+      case 'good': return { bg: 'rgba(16, 185, 129, 0.05)', border: 'rgba(16, 185, 129, 0.2)', text: 'var(--success)' };
+      case 'warn': return { bg: 'rgba(245, 158, 11, 0.05)', border: 'rgba(245, 158, 11, 0.2)', text: 'var(--warning)' };
+      case 'bad': return { bg: 'rgba(239, 68, 68, 0.05)', border: 'rgba(239, 68, 68, 0.2)', text: 'var(--error)' };
+      default: return { bg: 'var(--bg-primary)', border: 'var(--border)', text: 'var(--text-primary)' };
+    }
+  };
+
+  const colors = getColors();
+
   return (
-    <div style={{ border: `1px solid ${border}`, borderRadius: 10, padding: 12, background: bg }}>
-      <div style={{ color: '#9ca3af', fontSize: 12 }}>{title}</div>
-      <div style={{ fontSize: 24, fontWeight: 700 }}>{value}</div>
-      {hint && <div style={{ color: '#6b7280', fontSize: 12, marginTop: 6 }}>{hint}</div>}
+    <div className="card" style={{ 
+      background: colors.bg, 
+      borderColor: colors.border,
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 4
+    }}>
+      <div style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', fontWeight: 500 }}>{title}</div>
+      <div style={{ fontSize: '1.5rem', fontWeight: 700, color: colors.text === 'var(--text-primary)' ? 'var(--text-primary)' : colors.text }}>
+        {value}
+      </div>
+      {hint && <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginTop: 4 }}>{hint}</div>}
     </div>
   );
 }

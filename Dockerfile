@@ -42,6 +42,7 @@ COPY requirements.txt /app/requirements.txt
 RUN python3.11 -m pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app.py /app/app.py
+COPY cross_check.py /app/cross_check.py
 COPY inference_manager.py /app/inference_manager.py
 COPY ui_page.py /app/ui_page.py
 COPY events_store.py /app/events_store.py

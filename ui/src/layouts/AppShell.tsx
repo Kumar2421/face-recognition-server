@@ -6,6 +6,7 @@ const nav = [
   { to: '/enroll', label: 'Enroll' },
   { to: '/search', label: 'Search' },
   { to: '/recognition', label: 'Recognition' },
+  { to: '/employees', label: 'Employees' },
   { to: '/rejections', label: 'Rejections' },
   { to: '/subjects', label: 'Subjects' },
   { to: '/settings', label: 'Settings' },
@@ -13,24 +14,38 @@ const nav = [
 
 export default function AppShell() {
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', background: '#0a0a0a', color: '#e5e5e5' }}>
-      <aside style={{ width: 240, borderRight: '1px solid #222', padding: 16 }}>
-        <Link to="/" style={{ textDecoration: 'none', color: '#fff' }}>
-          <h1 style={{ margin: '0 0 16px 0' }}>Face Service</h1>
+    <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg-secondary)' }}>
+      <aside style={{ 
+        width: 260, 
+        borderRight: '1px solid var(--border)', 
+        padding: '24px 16px',
+        background: 'var(--bg-primary)',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 32
+      }}>
+        <Link to="/" style={{ textDecoration: 'none', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 12, padding: '0 8px' }}>
+          <img src="/src/assets/logo.png" alt="Logo" style={{ width: 32, height: 32, objectFit: 'contain' }} />
+          <h1 style={{ fontSize: '1.25rem', fontWeight: 700, letterSpacing: '-0.025em' }}>Face Service</h1>
         </Link>
-        <nav style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <nav style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           {nav.map(item => (
             <NavLink
               key={item.to}
               to={item.to}
               end={item.to === '/'}
               style={({ isActive }: { isActive: boolean }): CSSProperties => ({
-                padding: '8px 12px',
-                borderRadius: 8,
-                color: isActive ? '#111' : '#e5e5e5',
-                background: isActive ? '#a3e635' : 'transparent',
+                padding: '10px 14px',
+                borderRadius: 'var(--radius-md)',
+                color: isActive ? 'var(--primary)' : 'var(--text-secondary)',
+                background: isActive ? 'rgba(37, 99, 235, 0.1)' : 'transparent',
                 textDecoration: 'none',
-                fontWeight: 600
+                fontWeight: isActive ? 600 : 500,
+                fontSize: '0.9375rem',
+                transition: 'all 0.2s',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10
               })}
             >
               {item.label}
@@ -38,8 +53,10 @@ export default function AppShell() {
           ))}
         </nav>
       </aside>
-      <main style={{ flex: 1, padding: 24 }}>
-        <Outlet />
+      <main style={{ flex: 1, padding: '40px', overflowY: 'auto' }}>
+        <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
+          <Outlet />
+        </div>
       </main>
     </div>
   );

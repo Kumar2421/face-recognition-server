@@ -376,6 +376,52 @@ Response contains a paginated list of subject images/vectors (includes `image_id
 
 ---
 
+## Quality checks (eligibility filter)
+
+Use this endpoint when you want to know whether an image is **eligible** to be embedded/enrolled under the current quality thresholds.
+
+### `POST /v1/quality/check_upload` (multipart)
+
+Form fields:
+
+- `file` (image)
+
+Response (example):
+
+```json
+{
+  "ok": true,
+  "total_quality": "pass",
+  "quality": {
+    "status": "ok",
+    "reason": null
+  },
+  "det_score": 0.78,
+  "bbox": [57.6, 68.6, 114.7, 139.4],
+  "timing": {
+    "decode_ms": 3,
+    "quality_ms": 12,
+    "total_ms": 18
+  }
+}
+```
+
+Notes:
+
+- `total_quality` is a single overall decision:
+  - `pass` => eligible for embedding/enrollment
+  - `fail` => not eligible under current thresholds
+- When a quality check fails, `quality.status` will be `rejected` and `quality.reason` indicates why (example: `pose_yaw`).
+
+Curl example:
+
+```bash
+curl -sS -X POST "http://localhost:8001/v1/quality/check_upload" \
+  -F "file=@/path/to/image.jpg"
+```
+
+---
+
 ## Recognition events (ingestion + audit)
 
 These endpoints store recognition attempts in the local events DB (SQLite) and save event images/thumbnails.

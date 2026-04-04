@@ -26,6 +26,9 @@ class RecognitionEvent:
     thumb_path: str
     image_saved_at: float | None
     meta: dict[str, Any] | None
+    feedback_label: str | None = None
+    feedback_note: str | None = None
+    feedback_updated_at: float | None = None
 
 
 class EventsStore:
@@ -60,7 +63,10 @@ class EventsStore:
                     image_path TEXT NOT NULL,
                     thumb_path TEXT NOT NULL,
                     image_saved_at REAL,
-                    meta_json TEXT
+                    meta_json TEXT,
+                    feedback_label TEXT,
+                    feedback_note TEXT,
+                    feedback_updated_at REAL
                 )
                 """
             )
@@ -94,6 +100,21 @@ class EventsStore:
                     conn.execute("ALTER TABLE recognition_events ADD COLUMN model_ms INTEGER")
                 except Exception:
                     pass
+            if "feedback_label" not in cols:
+                try:
+                    conn.execute("ALTER TABLE recognition_events ADD COLUMN feedback_label TEXT")
+                except Exception:
+                    pass
+            if "feedback_note" not in cols:
+                try:
+                    conn.execute("ALTER TABLE recognition_events ADD COLUMN feedback_note TEXT")
+                except Exception:
+                    pass
+            if "feedback_updated_at" not in cols:
+                try:
+                    conn.execute("ALTER TABLE recognition_events ADD COLUMN feedback_updated_at REAL")
+                except Exception:
+                    pass
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_ts ON recognition_events (ts DESC)"
             )
@@ -102,6 +123,9 @@ class EventsStore:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_camera ON recognition_events (camera)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recognition_events_feedback_label ON recognition_events (feedback_label)"
             )
 
     def next_counter(self, key: str, start: int = 1) -> int:
@@ -134,7 +158,8 @@ class EventsStore:
                         subject_id, similarity, processing_ms, model_ms, rejected_reason,
                         bbox_json, det_score,
                         image_path, thumb_path, image_saved_at, meta_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        , feedback_label, feedback_note, feedback_updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ev.event_id,
@@ -153,6 +178,9 @@ class EventsStore:
                         str(ev.thumb_path),
                         float(ev.image_saved_at) if ev.image_saved_at is not None else None,
                         json.dumps(ev.meta) if ev.meta is not None else None,
+                        ev.feedback_label,
+                        ev.feedback_note,
+                        float(ev.feedback_updated_at) if ev.feedback_updated_at is not None else None,
                     ),
                 )
 
@@ -195,13 +223,16 @@ class EventsStore:
             where.append("ts <= ?")
             args.append(float(until_ts))
         if cursor_ts is not None:
-            where.append("ts < ?")
+            # Cursor is based on the same sort key as ORDER BY below.
+            where.append("COALESCE(image_saved_at, ts) < ?")
             args.append(float(cursor_ts))
 
-        sql = "SELECT * FROM recognition_events"
+        # Sort primarily by ingestion time (image_saved_at) so newly ingested events
+        # show up first even if the producer sends an old `ts`.
+        sql = "SELECT *, COALESCE(image_saved_at, ts) AS _sort_ts FROM recognition_events"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY ts DESC LIMIT ?"
+        sql += " ORDER BY _sort_ts DESC, ts DESC LIMIT ?"
         args.append(limit)
 
         with self._lock:
@@ -236,11 +267,33 @@ class EventsStore:
                 "thumb_path": r["thumb_path"],
                 "image_saved_at": r["image_saved_at"],
                 "meta": meta,
+                "feedback_label": r["feedback_label"] if "feedback_label" in r.keys() else None,
+                "feedback_note": r["feedback_note"] if "feedback_note" in r.keys() else None,
+                "feedback_updated_at": r["feedback_updated_at"] if "feedback_updated_at" in r.keys() else None,
             }
             items.append(it)
-            next_cursor = float(r["ts"])
+            try:
+                next_cursor = float(r["_sort_ts"])
+            except Exception:
+                next_cursor = float(r["ts"])
 
         return items, next_cursor
+
+    def list_cameras(self, *, limit: int = 5000) -> list[str]:
+        limit = max(1, min(int(limit or 5000), 50000))
+        sql = "SELECT camera FROM recognition_events WHERE camera != '' GROUP BY camera ORDER BY camera ASC LIMIT ?"
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(sql, (int(limit),)).fetchall()
+        out: list[str] = []
+        for r in rows or []:
+            try:
+                c = str(r["camera"] or "").strip()
+            except Exception:
+                c = ""
+            if c:
+                out.append(c)
+        return out
 
     def get_event(self, event_id: str) -> dict[str, Any] | None:
         event_id = str(event_id or "").strip()
@@ -279,4 +332,98 @@ class EventsStore:
             "thumb_path": r["thumb_path"],
             "image_saved_at": r["image_saved_at"],
             "meta": meta,
+            "feedback_label": r["feedback_label"] if "feedback_label" in r.keys() else None,
+            "feedback_note": r["feedback_note"] if "feedback_note" in r.keys() else None,
+            "feedback_updated_at": r["feedback_updated_at"] if "feedback_updated_at" in r.keys() else None,
+        }
+
+    def set_feedback(
+        self,
+        event_id: str,
+        *,
+        label: str | None,
+        note: str | None,
+        updated_at: float,
+    ) -> bool:
+        event_id = str(event_id or "").strip()
+        if not event_id:
+            return False
+        label_v = str(label or "").strip() or None
+        note_v = str(note or "").strip() or None
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE recognition_events SET feedback_label = ?, feedback_note = ?, feedback_updated_at = ? WHERE event_id = ?",
+                    (label_v, note_v, float(updated_at), event_id),
+                )
+                return int(getattr(cur, "rowcount", 0) or 0) > 0
+
+    def feedback_stats(
+        self,
+        *,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+        camera: str | None = None,
+    ) -> dict[str, Any]:
+        where: list[str] = []
+        args: list[Any] = []
+        if camera:
+            where.append("camera = ?")
+            args.append(str(camera))
+        if since_ts is not None:
+            where.append("ts >= ?")
+            args.append(float(since_ts))
+        if until_ts is not None:
+            where.append("ts <= ?")
+            args.append(float(until_ts))
+
+        sql = "SELECT decision, feedback_label, COUNT(*) AS n FROM recognition_events"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " GROUP BY decision, feedback_label"
+
+        counts: dict[str, int] = {}
+        by_decision: dict[str, dict[str, int]] = {}
+        total = 0
+
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(sql, args).fetchall()
+
+        for r in rows or []:
+            d = str(r["decision"] or "").strip() or "unknown"
+            lab = str(r["feedback_label"] or "").strip() or ""
+            n = int(r["n"] or 0)
+            total += n
+            counts[lab] = counts.get(lab, 0) + n
+            by_decision.setdefault(d, {})
+            by_decision[d][lab] = by_decision[d].get(lab, 0) + n
+
+        def _g(lbl: str) -> int:
+            return int(counts.get(lbl, 0) or 0)
+
+        tp = _g("tp")
+        fp = _g("fp")
+        fn = _g("fn")
+        ignore = _g("ignore")
+        labeled = tp + fp + fn + ignore
+        unlabeled = total - labeled
+
+        # FP rate is most meaningful for match decisions: fp / (tp + fp)
+        match_map = by_decision.get("match", {})
+        tp_m = int(match_map.get("tp", 0) or 0)
+        fp_m = int(match_map.get("fp", 0) or 0)
+        denom = tp_m + fp_m
+        fp_rate_match = (float(fp_m) / float(denom)) if denom > 0 else None
+
+        return {
+            "total": int(total),
+            "labeled": int(labeled),
+            "unlabeled": int(unlabeled),
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
+            "ignore": int(ignore),
+            "fp_rate_match": fp_rate_match,
+            "by_decision": by_decision,
         }

@@ -215,6 +215,9 @@ def main() -> None:
     filename_exclude_any = _split_csv(_env("SFTP_FILENAME_EXCLUDE_ANY", "FACE_BACKGROUND"))
 
     api_base = _env("API_BASE_URL", "http://localhost:8000").rstrip("/")
+    api_path = str(_env("SFTP_API_PATH", "/v1/events/recognition") or "/v1/events/recognition").strip() or "/v1/events/recognition"
+    if not api_path.startswith("/"):
+        api_path = "/" + api_path
     top_k = _as_int(_env("SFTP_TOP_K", _env("FACE_SERVICE_TOP_K", "5")), 5)
     min_similarity = _as_float(_env("SFTP_MIN_SIMILARITY", _env("FACE_SERVICE_MIN_SIMILARITY", "0.25")), 0.25)
 
@@ -319,15 +322,21 @@ def main() -> None:
 
                     try:
                         files = {"file": (fn, io.BytesIO(data), "image/jpeg")}
+                        data = {
+                            "camera": cam,
+                            "top_k": str(top_k),
+                            "min_similarity": str(min_similarity),
+                            "process_all_faces": "1",
+                        }
+                        # New webhook expects image_path; legacy endpoint expects source_path.
+                        if api_path == "/webhookSFTPDirect":
+                            data["image_path"] = remote_path
+                        else:
+                            data["source_path"] = fn
+
                         resp = client.post(
-                            f"{api_base}/v1/events/recognition",
-                            data={
-                                "camera": cam,
-                                "source_path": fn,
-                                "top_k": str(top_k),
-                                "min_similarity": str(min_similarity),
-                                "process_all_faces": "1",
-                            },
+                            f"{api_base}{api_path}",
+                            data=data,
                             files=files,
                         )
                         ok = resp.status_code < 300

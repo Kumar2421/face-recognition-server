@@ -7,7 +7,10 @@ export function getApiBase(): string {
 }
 
 export async function apiGet<T = any>(path: string): Promise<T> {
-  const r = await fetch(`${getApiBase()}${path}`);
+  const r = await fetch(`${getApiBase()}${path}`, {
+    cache: 'no-store',
+    headers: { 'Cache-Control': 'no-cache' },
+  });
   if (!r.ok) throw new Error(`GET ${path} failed: ${r.status}`);
   return r.json();
 }
@@ -70,11 +73,21 @@ export async function facesSubjects(): Promise<{ subjects: string[] }> {
 export type SubjectItem = { subject_id: string; embeddings_count: number; embeddings_cap?: number | null; embeddings_capped?: boolean | null };
 export type SubjectsListResponse = { items: SubjectItem[]; cursor?: string | null };
 
-export async function subjects(params: { cursor?: string | null; limit?: number; with_counts?: boolean } = {}): Promise<SubjectsListResponse> {
+export type DateFilter = {
+  day?: string | null;
+  from_day?: string | null;
+  to_day?: string | null;
+};
+
+export async function subjects(params: { cursor?: string | null; limit?: number; with_counts?: boolean; q?: string | null } & DateFilter = {}): Promise<SubjectsListResponse> {
   const q = new URLSearchParams();
   if (params.cursor) q.set('cursor', params.cursor);
   if (params.limit != null) q.set('limit', String(params.limit));
   if (params.with_counts != null) q.set('with_counts', String(params.with_counts));
+  if (params.q) q.set('q', String(params.q));
+  if (params.day) q.set('day', String(params.day));
+  if (params.from_day) q.set('from_day', String(params.from_day));
+  if (params.to_day) q.set('to_day', String(params.to_day));
   const qs = q.toString();
   return apiGet(`/v1/subjects${qs ? `?${qs}` : ''}`);
 }
@@ -86,10 +99,13 @@ export async function getSubject(subjectId: string): Promise<SubjectItem> {
 export type SubjectImageItem = { image_id: string; thumb_path?: string | null; image_path?: string | null; created_at?: string | null; source?: string | null };
 export type SubjectImagesResponse = { items: SubjectImageItem[]; cursor?: string | null };
 
-export async function subjectImages(subjectId: string, params: { cursor?: string | null; limit?: number } = {}): Promise<SubjectImagesResponse> {
+export async function subjectImages(subjectId: string, params: { cursor?: string | null; limit?: number } & DateFilter = {}): Promise<SubjectImagesResponse> {
   const q = new URLSearchParams();
   if (params.cursor) q.set('cursor', params.cursor);
   if (params.limit != null) q.set('limit', String(params.limit));
+  if (params.day) q.set('day', String(params.day));
+  if (params.from_day) q.set('from_day', String(params.from_day));
+  if (params.to_day) q.set('to_day', String(params.to_day));
   const qs = q.toString();
   return apiGet(`/v1/subjects/${encodeURIComponent(subjectId)}/images${qs ? `?${qs}` : ''}`);
 }
@@ -105,18 +121,70 @@ export async function facesAddUpload(subjectId: string, files: File[]): Promise<
   return apiPostForm('/v1/faces/add_upload', form);
 }
 
-export async function facesSearchUpload(file: File, topK: number = 5): Promise<any> {
+export async function facesSearchUpload(file: File, topK: number = 5, filter: DateFilter = {}): Promise<any> {
   const form = new FormData();
   form.append('file', file, file.name || 'query.jpg');
   form.append('top_k', String(topK));
+  if (filter.day) form.append('day', String(filter.day));
+  if (filter.from_day) form.append('from_day', String(filter.from_day));
+  if (filter.to_day) form.append('to_day', String(filter.to_day));
   return apiPostForm('/v1/faces/search_upload', form);
 }
 
-export async function facesRecognizeUpload(file: File, topK: number = 5): Promise<any> {
+export async function facesRecognizeUpload(file: File, topK: number = 5, filter: DateFilter = {}): Promise<any> {
   const form = new FormData();
   form.append('file', file, file.name || 'query.jpg');
   form.append('top_k', String(topK));
+  if (filter.day) form.append('day', String(filter.day));
+  if (filter.from_day) form.append('from_day', String(filter.from_day));
+  if (filter.to_day) form.append('to_day', String(filter.to_day));
   return apiPostForm('/v1/faces/recognize_upload', form);
+}
+
+export async function qualityCheckUpload(file: File): Promise<any> {
+  const form = new FormData();
+  form.append('file', file, file.name || 'query.jpg');
+  return apiPostForm('/v1/quality/check_upload', form);
+}
+
+export async function crossMatch(subjectId: string): Promise<any> {
+  return apiGet(`/v1/faces/cross_match/${encodeURIComponent(subjectId)}`);
+}
+
+export type CrossCheckHit = {
+  employee_subject_id: string;
+  visitor_event_id: string;
+  visitor_subject_id: string;
+  similarity: number;
+  top2_second?: number | null;
+  top2_margin?: number | null;
+  visitor_ts?: number | null;
+  visitor_camera?: string | null;
+  visitor_image_path?: string | null;
+  visitor_thumb_path?: string | null;
+};
+
+export type CrossCheckResponse = { items: CrossCheckHit[] };
+
+export async function crossCheckVisitorsVsEmployees(params: {
+  camera?: string;
+  day?: string | null;
+  from_day?: string | null;
+  to_day?: string | null;
+  since_ts?: number;
+  until_ts?: number;
+  limit?: number;
+} = {}): Promise<CrossCheckResponse> {
+  const q = new URLSearchParams();
+  if (params.camera) q.set('camera', String(params.camera));
+  if (params.day) q.set('day', String(params.day));
+  if (params.from_day) q.set('from_day', String(params.from_day));
+  if (params.to_day) q.set('to_day', String(params.to_day));
+  if (params.since_ts != null) q.set('since_ts', String(params.since_ts));
+  if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
+  if (params.limit != null) q.set('limit', String(params.limit));
+  const qs = q.toString();
+  return apiGet(`/v1/cross_check/visitors_vs_employees${qs ? `?${qs}` : ''}`);
 }
 
 // Recognition events
@@ -129,17 +197,21 @@ export type RecognitionEvent = {
   subject_id?: string | null;
   similarity?: number | null;
   processing_ms?: number | null;
-  model_ms?: number | null;
   rejected_reason?: string | null;
   bbox?: number[] | null;
   det_score?: number | null;
   image_path: string;
-  thumb_path: string;
+  thumb_path?: string | null;
   image_saved_at?: number | null;
   meta?: any;
+  feedback_label?: string | null;
+  feedback_note?: string | null;
+  feedback_updated_at?: number | null;
 };
 
 export type RecognitionEventsListResponse = { items: RecognitionEvent[]; cursor?: number | null };
+
+export type RecognitionCamerasResponse = { items: string[] };
 
 export async function recognitionEvents(params: {
   decision?: string;
@@ -147,17 +219,70 @@ export async function recognitionEvents(params: {
   subject_id?: string;
   min_similarity?: number;
   max_similarity?: number;
+  since_ts?: number;
+  until_ts?: number;
+  day?: string | null;
+  from_day?: string | null;
+  to_day?: string | null;
   limit?: number;
   cursor?: number | null;
 } = {}): Promise<RecognitionEventsListResponse> {
   const q = new URLSearchParams();
+  q.set('_cb', String(Date.now()));
   if (params.decision) q.set('decision', params.decision);
   if (params.camera) q.set('camera', params.camera);
   if (params.subject_id) q.set('subject_id', params.subject_id);
   if (params.min_similarity != null) q.set('min_similarity', String(params.min_similarity));
   if (params.max_similarity != null) q.set('max_similarity', String(params.max_similarity));
+  if (params.since_ts != null) q.set('since_ts', String(params.since_ts));
+  if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
+  if (params.day) q.set('day', params.day);
+  if (params.from_day) q.set('from_day', params.from_day);
+  if (params.to_day) q.set('to_day', params.to_day);
   if (params.limit != null) q.set('limit', String(params.limit));
   if (params.cursor != null) q.set('cursor', String(params.cursor));
   const qs = q.toString();
   return apiGet(`/v1/events/recognition${qs ? `?${qs}` : ''}`);
+}
+
+export async function recognitionCameras(params: { limit?: number } = {}): Promise<RecognitionCamerasResponse> {
+  const q = new URLSearchParams();
+  if (params.limit != null) q.set('limit', String(params.limit));
+  const qs = q.toString();
+  return apiGet(`/v1/events/recognition/cameras${qs ? `?${qs}` : ''}`);
+}
+
+export type EventFeedbackLabel = 'tp' | 'fp' | 'fn' | 'ignore' | '';
+
+export type EventFeedbackResponse = {
+  event_id: string;
+  updated: boolean;
+  feedback_label?: string | null;
+  feedback_note?: string | null;
+  feedback_updated_at?: number | null;
+};
+
+export async function setRecognitionEventFeedback(eventId: string, payload: { label?: EventFeedbackLabel | null; note?: string | null }): Promise<EventFeedbackResponse> {
+  return apiPostJson(`/v1/events/recognition/${encodeURIComponent(eventId)}/feedback`, payload);
+}
+
+export type FeedbackStatsResponse = {
+  total: number;
+  labeled: number;
+  unlabeled: number;
+  tp: number;
+  fp: number;
+  fn: number;
+  ignore: number;
+  fp_rate_match?: number | null;
+  by_decision: Record<string, Record<string, number>>;
+};
+
+export async function recognitionFeedbackStats(params: { since_ts?: number; until_ts?: number; camera?: string } = {}): Promise<FeedbackStatsResponse> {
+  const q = new URLSearchParams();
+  if (params.since_ts != null) q.set('since_ts', String(params.since_ts));
+  if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
+  if (params.camera) q.set('camera', params.camera);
+  const qs = q.toString();
+  return apiGet(`/v1/events/recognition/feedback_stats${qs ? `?${qs}` : ''}`);
 }

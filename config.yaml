@@ -2,6 +2,7 @@ api:
   base_url: "http://face_service:8000"
 
 sftp:
+  api_path: "/webhookSFTPDirect" 
   host: "103.186.221.20"
   port: 2022 
   # list dir tmj 
@@ -13,20 +14,20 @@ sftp:
   # processed_dirname: "processed"
 
 recognition:
-  min_similarity: 0.45
+  min_similarity: 0.52
   top_k: 5
-  min_top2_margin: 0.06
-  top2_high_conf_sim: 0.55
+  min_top2_margin: 0.05
+  top2_high_conf_sim: 0.40
 
 quality:
-  min_blur: 60.0
+  min_blur: 50.0
   min_face_ratio: 0.03
-  min_brightness: 30.0
+  min_brightness: 25.0
   max_brightness: 220.0
   min_landmark_conf: 0.3
   max_abs_yaw: 70
-  max_abs_pitch: 65
-  min_resolution: 64
+  max_abs_pitch: 60
+  min_resolution: 50
 
   
 # POST /v1/events/recognition/forward this is forword api for send no match / match images 

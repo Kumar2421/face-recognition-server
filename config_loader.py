@@ -70,6 +70,7 @@ def apply_env_defaults_from_config(cfg: dict[str, Any]) -> None:
     set_if_missing("SFTP_BASE_PATH", _deep_get(cfg, ["sftp", "base_path"]))
     set_if_missing("SFTP_POLL_INTERVAL_SEC", _deep_get(cfg, ["sftp", "poll_interval_sec"]))
     set_if_missing("SFTP_PROCESSED_DIRNAME", _deep_get(cfg, ["sftp", "processed_dirname"]))
+    set_if_missing("SFTP_API_PATH", _deep_get(cfg, ["sftp", "api_path"]))
 
     # API base used by poller
     set_if_missing("API_BASE_URL", _deep_get(cfg, ["api", "base_url"]))

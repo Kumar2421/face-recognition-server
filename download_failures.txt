@@ -1,0 +1,3 @@
+employee-emerald-e17610,https://cdn.analytics.thefusionapps.com/v1/emerald/employee-emerald-e17610-2.jpg
+employee-emerald-e23594,https://cdn.analytics.thefusionapps.com/v1/emerald/employee-emerald-e23594-0.jpg
+employee-emerald-e09451,https://cdn.analytics.thefusionapps.com/v1/emerald/employee-emerald-e09451-2.jpg

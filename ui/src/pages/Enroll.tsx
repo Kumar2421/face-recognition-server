@@ -90,75 +90,113 @@ export default function Enroll() {
   }
 
   return (
-    <div>
-      <h2>Enroll</h2>
-      <form onSubmit={onSubmit} style={{ display: 'grid', gap: 12, maxWidth: 720 }}>
-        <label style={{ display: 'grid', gap: 6 }}>
-          <span>Subject ID</span>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
+      <header>
+        <h2 style={{ fontSize: '1.875rem', fontWeight: 800, color: 'var(--text-primary)', marginBottom: '4px' }}>Subject Enrollment</h2>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '0.9375rem' }}>Upload images to create or extend face recognition profiles.</p>
+      </header>
+
+      <form onSubmit={onSubmit} className="card" style={{ display: 'grid', gap: '24px', maxWidth: '600px', background: 'var(--bg-primary)' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Subject Unique Identifier</label>
           <input
             value={subjectId}
             onChange={(e) => setSubjectId(e.target.value)}
-            placeholder="e.g. john_doe"
-            style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid #333', background: '#0a0a0a', color: '#e5e5e5' }}
+            placeholder="e.g. john_doe_123"
+            style={{ padding: '12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: '1rem' }}
           />
-        </label>
-        <label style={{ display: 'grid', gap: 6 }}>
-          <span>Images</span>
-          <input type="file" ref={fileRef} multiple accept="image/*" onChange={onFilesChanged} />
-        </label>
-        <div style={{ display: 'flex', gap: 12 }}>
-          <button type="submit" style={{ background: '#22c55e', color: '#111', border: 'none', padding: '8px 12px', borderRadius: 8, cursor: 'pointer', fontWeight: 600 }}>Enroll</button>
-          <button type="button" onClick={() => { setSubjectId(''); setStatus(''); setError(''); setResults([]); revokePreviews(); setPreviews([]); if (fileRef.current) fileRef.current.value = ''; }} style={{ background: '#374151', color: '#fff', border: 'none', padding: '8px 12px', borderRadius: 8, cursor: 'pointer' }}>Reset</button>
+          <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Use a unique string to identify this person across the system.</span>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Face Images</label>
+          <div style={{ 
+            border: '2px dashed var(--border)', 
+            borderRadius: 'var(--radius-lg)', 
+            padding: '40px', 
+            textAlign: 'center',
+            background: 'var(--bg-secondary)',
+            cursor: 'pointer',
+            transition: 'border-color 0.2s'
+          }} onClick={() => fileRef.current?.click()}>
+            <input type="file" ref={fileRef} multiple accept="image/*" onChange={onFilesChanged} style={{ display: 'none' }} />
+            <div style={{ fontSize: '2rem', marginBottom: '8px' }}>📸</div>
+            <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>Click to upload images</div>
+            <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', marginTop: '4px' }}>PNG, JPG or WEBP up to 10MB each</div>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: '12px', marginTop: '8px' }}>
+          <button type="submit" className="primary" style={{ padding: '12px 32px', flex: 1, fontWeight: 700 }}>
+            {loading ? 'Enrolling...' : 'Start Enrollment'}
+          </button>
+          <button 
+            type="button" 
+            onClick={() => { setSubjectId(''); setStatus(''); setError(''); setResults([]); revokePreviews(); setPreviews([]); if (fileRef.current) fileRef.current.value = ''; }}
+            style={{ padding: '12px 24px', fontWeight: 600 }}
+          >
+            Reset Form
+          </button>
         </div>
       </form>
-      {loading && <div style={{ marginTop: 12 }}>Uploading & enrolling...</div>}
-      {status && <div style={{ marginTop: 12, color: '#22c55e' }}>{status}</div>}
-      {error && <div style={{ marginTop: 12, color: '#ef4444' }}>Error: {error}</div>}
 
-      {previews.length > 0 && (
-        <div style={{ marginTop: 16 }}>
-          <h3>Preview</h3>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 }}>
-            {previews.map((p, i) => (
-              <div key={i} style={{ border: '1px solid #222', borderRadius: 8, padding: 8, background: '#0f0f0f' }}>
-                {/* eslint-disable-next-line @typescript-eslint/ban-ts-comment */}
-                {/* @ts-ignore */}
-                <img src={p.url} alt={p.name} style={{ width: '100%', height: 120, objectFit: 'cover', borderRadius: 6, marginBottom: 8 }} />
-                <div style={{ fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name}</div>
-                <div style={{ color: '#9ca3af', fontSize: 12 }}>Size: {p.sizeKB} KB</div>
-                <div style={{ color: '#9ca3af', fontSize: 12 }}>Resolution: {p.w}×{p.h} {Math.min(p.w, p.h) < 128 ? <span style={{ color: '#f59e0b' }}>(low)</span> : null}</div>
-              </div>
-            ))}
-          </div>
+      {status && (
+        <div style={{ padding: '16px', background: 'rgba(16, 185, 129, 0.1)', border: '1px solid var(--success)', borderRadius: 'var(--radius-md)', color: 'var(--success)', fontWeight: 600 }}>
+          ✓ {status}
+        </div>
+      )}
+      
+      {error && (
+        <div style={{ padding: '16px', background: 'rgba(239, 68, 68, 0.1)', border: '1px solid var(--error)', borderRadius: 'var(--radius-md)', color: 'var(--error)', fontWeight: 600 }}>
+          ⚠ Error: {error}
         </div>
       )}
 
-      {results.length > 0 && (
-        <div style={{ marginTop: 16 }}>
-          <h3>Results</h3>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 12 }}>
-            {results.map((r, i) => (
-              <div key={i} style={{ border: '1px solid #222', borderRadius: 8, padding: 8, background: '#0f0f0f' }}>
-                <div style={{ fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name}</div>
-                <div style={{ color: '#9ca3af', fontSize: 12 }}>Hash: {r.hash}</div>
-                <div style={{ marginTop: 6 }}>
-                  <span style={{
-                    display: 'inline-block',
-                    padding: '2px 6px',
-                    borderRadius: 6,
-                    background: r.status === 'enrolled' ? '#14532d' : '#7f1d1d',
-                    color: '#e5e7eb',
-                    fontSize: 12,
-                    fontWeight: 700,
-                  }}>
-                    {r.status === 'enrolled' ? 'ENROLLED' : 'FAILED'}
-                  </span>
-                </div>
-                {r.reason && <div style={{ color: '#9ca3af', fontSize: 12, marginTop: 6 }}>Reason: {r.reason}</div>}
+      {previews.length > 0 && (
+        <section>
+          <h3 style={{ fontSize: '1.25rem', fontWeight: 700, marginBottom: '16px', color: 'var(--text-primary)' }}>Selected Images ({previews.length})</h3>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '20px' }}>
+            {previews.map((p, i) => (
+              <div key={i} className="card" style={{ padding: '8px' }}>
+                <img src={p.url} alt={p.name} style={{ width: '100%', height: '140px', objectFit: 'cover', borderRadius: 'var(--radius-md)', marginBottom: '8px' }} />
+                <div style={{ fontSize: '0.8125rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '2px' }}>{p.sizeKB} KB • {p.w}×{p.h}</div>
               </div>
             ))}
           </div>
-        </div>
+        </section>
+      )}
+
+      {results.length > 0 && (
+        <section>
+          <h3 style={{ fontSize: '1.25rem', fontWeight: 700, marginBottom: '16px', color: 'var(--text-primary)' }}>Enrollment Results</h3>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '20px' }}>
+            {results.map((r, i) => (
+              <div key={i} className="card" style={{ 
+                borderLeft: `4px solid ${r.status === 'enrolled' ? 'var(--success)' : 'var(--error)'}`,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px'
+              }}>
+                <div style={{ fontWeight: 700, fontSize: '0.875rem' }}>{r.name}</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ 
+                    fontSize: '0.625rem', 
+                    fontWeight: 800, 
+                    padding: '2px 8px', 
+                    borderRadius: '4px', 
+                    background: r.status === 'enrolled' ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                    color: r.status === 'enrolled' ? 'var(--success)' : 'var(--error)'
+                  }}>
+                    {r.status.toUpperCase()}
+                  </span>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>ID: {r.hash}</span>
+                </div>
+                {r.reason && <div style={{ fontSize: '0.75rem', color: 'var(--error)', fontStyle: 'italic' }}>{r.reason}</div>}
+              </div>
+            ))}
+          </div>
+        </section>
       )}
     </div>
   );

@@ -28,7 +28,7 @@ services:
       - ./buffalo_l/models:/models:ro
       - ./data/thumbs:/data/thumbs
       - ./data/images:/data/images
-      - ./data/events:/data/events
+      - ./images/events:/data/events
       - ./data/trt_cache:/data/trt_cache
       - ./config.yaml:/app/config.yaml:ro
 
@@ -37,9 +37,12 @@ services:
       - FACE_DIR=/data/facefolder/security
       - CONFIG_PATH=/app/config.yaml
       - QDRANT_URL=http://qdrant:6333
-      - QDRANT_COLLECTION=frigate_faces_v3
+      - QDRANT_COLLECTION=frigate_faces_v10
+      # - QDRANT_COLLECTION=frigate_faces_v3
       # - QDRANT_COLLECTION=frigate_faces_v2
       # - QDRANT_COLLECTION=frigate_faces old emp db
+      - QDRANT_HNSW_EF=64
+      - QDRANT_EXACT=0
       - BUFFALO_MODEL_ROOT=/models
       - BUFFALO_MODEL_NAME=buffalo_l
       - BUFFALO_DET_SIZE=640
@@ -58,13 +61,16 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - AUTO_ADD_EMBEDDING_ENABLE=1
-      - AUTO_ADD_EMBEDDING_MIN_SIM=0.95
+      - AUTO_ADD_EMBEDDING_MIN_SIM=0.80
       - SUBJECT_MAX_EMBEDDINGS=10
       - ENROLL_DUPLICATE_CHECK_ENABLE=1
       - ENROLL_DUPLICATE_MIN_SIM=0.75
       - NO_MATCH_AUTO_ENROLL_ENABLE=1
-      - NO_MATCH_AUTO_ENROLL_PREFIX=customer
-
+      - NO_MATCH_AUTO_ENROLL_PREFIX=visiter
+      - NO_MATCH_AUTO_ENROLL_BLOCK_MIN_SIM=0.70
+      - DATE_WISE_RECOGNITION_FALLBACK_MASTER=0
+      - NO_MATCH_AUTO_ATTACH_MIN_SIM=0.70
+      - NO_MATCH_AUTO_ATTACH_MIN_MARGIN=0.10
     ports:
       - "8001:8000"
 
@@ -88,8 +94,11 @@ services:
     environment:
       - CONFIG_PATH=/app/config.yaml
       - API_BASE_URL=http://face_service:8000
-      - SFTP_BASE_PATH=/TMJ-CBE-Entry
-      - SFTP_CAMERAS_ALLOWLIST=processed
+      - SFTP_API_PATH=/v1/events/recognition
+      - SFTP_BASE_PATH=
+      - SFTP_CAMERAS_ALLOWLIST=EM-DEPT-Entrance,EM-DEPT-EXIT,BR=TMJ-CBE__ZN=Basement__IO=EXIT__CAM=Basement-Lift,BR=TMJ-CBE__ZN=FirstFloor__IO=ENTRY__CAM=FF-Lift-Entry,BR=TMJ-CBE__ZN=FirstFloor__IO=ENTRY__CAM=FirstFloor-Lift,BR=TMJ-CBE__ZN=GF-Billing__IO=BILLING__CAM=GF-Billing-1,BR=TMJ-CBE__ZN=GF-Billing__IO=BILLING__CAM=GF-Billing-2,BR=TMJ-CBE__ZN=GroundFloor__IO=ENTRY__CAM=GroundFloor-Stair,BR=TMJ-CBE__ZN=GroundFloor__IO=ENTRY__CAM=GroundFloor-Lift,BR=TMJ-CBE__ZN=Scheme-Billing__IO=BILLING__CAM=FF-Scheme-Bill
+      # - SFTP_BASE_PATH=/TMJ-CBE-Entry
+      # - SFTP_CAMERAS_ALLOWLIST=processed
       - SFTP_PROCESSED_DIRNAME=
       # - SFTP_FILENAME_INCLUDE_ANY=
       # - SFTP_FILENAME_EXCLUDE_ANY=
@@ -97,8 +106,8 @@ services:
       - SFTP_FILENAME_EXCLUDE_ANY=FACE_BACKGROUND
       - SFTP_MAX_FILES_PER_CAMERA_PER_TICK=500
       - SFTP_TIMEZONE=Asia/Kolkata
-      # - SFTP_SINCE_DATETIME=07-02-2026:09 pm
-      # - SFTP_UNTIL_DATETIME=07-02-2026:10 pm
+      - SFTP_SINCE_DATETIME=07-03-2026:09 pm
+      - SFTP_UNTIL_DATETIME=02-03-2026:10 pm
     volumes:
       - ./config.yaml:/app/config.yaml:ro
 
@@ -113,3 +122,4 @@ services:
 
 volumes:
   qdrant_storage:
+  events_storage:
