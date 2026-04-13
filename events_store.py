@@ -31,6 +31,18 @@ class RecognitionEvent:
     feedback_updated_at: float | None = None
 
 
+@dataclass
+class SearchEvent:
+    event_id: str
+    ts: float
+    query_image_path: str
+    query_thumb_path: str
+    top_subject_id: str | None
+    top_similarity: float | None
+    results: list[dict[str, Any]] | None
+    meta: dict[str, Any] | None
+
+
 class EventsStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = str(db_path)
@@ -67,6 +79,21 @@ class EventsStore:
                     feedback_label TEXT,
                     feedback_note TEXT,
                     feedback_updated_at REAL
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS search_events (
+                    event_id TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    query_image_path TEXT NOT NULL,
+                    query_thumb_path TEXT NOT NULL,
+                    top_subject_id TEXT,
+                    top_similarity REAL,
+                    results_json TEXT,
+                    meta_json TEXT
                 )
                 """
             )
@@ -127,6 +154,9 @@ class EventsStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_feedback_label ON recognition_events (feedback_label)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_search_events_ts ON search_events (ts DESC)"
+            )
 
     def next_counter(self, key: str, start: int = 1) -> int:
         key = str(key or "").strip()
@@ -181,6 +211,30 @@ class EventsStore:
                         ev.feedback_label,
                         ev.feedback_note,
                         float(ev.feedback_updated_at) if ev.feedback_updated_at is not None else None,
+                    ),
+                )
+
+    def insert_search_event(self, ev: SearchEvent) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO search_events (
+                        event_id, ts,
+                        query_image_path, query_thumb_path,
+                        top_subject_id, top_similarity,
+                        results_json, meta_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(ev.event_id),
+                        float(ev.ts),
+                        str(ev.query_image_path),
+                        str(ev.query_thumb_path),
+                        ev.top_subject_id,
+                        float(ev.top_similarity) if ev.top_similarity is not None else None,
+                        json.dumps(ev.results) if ev.results is not None else None,
+                        json.dumps(ev.meta) if ev.meta is not None else None,
                     ),
                 )
 
@@ -276,6 +330,106 @@ class EventsStore:
                 next_cursor = float(r["_sort_ts"])
             except Exception:
                 next_cursor = float(r["ts"])
+
+        return items, next_cursor
+
+    def search_events_stats(
+        self,
+        *,
+        match_threshold: float,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+    ) -> dict[str, int]:
+        thr = float(match_threshold)
+        where: list[str] = []
+        args: list[Any] = [thr]
+        if since_ts is not None:
+            where.append("ts >= ?")
+            args.append(float(since_ts))
+        if until_ts is not None:
+            where.append("ts < ?")
+            args.append(float(until_ts))
+
+        sql = (
+            "SELECT "
+            "SUM(CASE WHEN top_subject_id IS NOT NULL AND top_subject_id != '' AND top_similarity IS NOT NULL AND top_similarity >= ? THEN 1 ELSE 0 END) AS match_count, "
+            "SUM(CASE WHEN top_subject_id IS NOT NULL AND top_subject_id != '' AND top_similarity IS NOT NULL AND top_similarity >= ? THEN 0 ELSE 1 END) AS no_match_count "
+            "FROM search_events"
+        )
+
+        args2 = [thr, thr] + args[1:]
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(sql, args2).fetchone()
+
+        try:
+            mc = int(row["match_count"] or 0) if row is not None else 0
+        except Exception:
+            mc = 0
+        try:
+            nmc = int(row["no_match_count"] or 0) if row is not None else 0
+        except Exception:
+            nmc = 0
+        return {"match": mc, "no_match": nmc, "total": int(mc + nmc)}
+
+    def list_search_events(
+        self,
+        *,
+        limit: int = 100,
+        cursor_ts: float | None = None,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+    ) -> tuple[list[dict[str, Any]], float | None]:
+        limit = max(1, min(int(limit or 100), 5000))
+
+        where: list[str] = []
+        args: list[Any] = []
+        if since_ts is not None:
+            where.append("ts >= ?")
+            args.append(float(since_ts))
+        if until_ts is not None:
+            where.append("ts < ?")
+            args.append(float(until_ts))
+        if cursor_ts is not None:
+            where.append("ts < ?")
+            args.append(float(cursor_ts))
+
+        sql = "SELECT * FROM search_events"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        args.append(limit)
+
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(sql, args).fetchall()
+
+        items: list[dict[str, Any]] = []
+        next_cursor: float | None = None
+        for r in rows or []:
+            try:
+                results = json.loads(r["results_json"]) if r["results_json"] else []
+            except Exception:
+                results = []
+            try:
+                meta = json.loads(r["meta_json"]) if r["meta_json"] else {}
+            except Exception:
+                meta = {}
+            it = {
+                "event_id": r["event_id"],
+                "ts": float(r["ts"]),
+                "query_image_path": r["query_image_path"],
+                "query_thumb_path": r["query_thumb_path"],
+                "top_subject_id": r["top_subject_id"],
+                "top_similarity": r["top_similarity"],
+                "results": results,
+                "meta": meta,
+            }
+            items.append(it)
+            next_cursor = float(r["ts"])
 
         return items, next_cursor
 

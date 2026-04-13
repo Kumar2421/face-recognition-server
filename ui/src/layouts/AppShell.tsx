@@ -6,6 +6,7 @@ const nav = [
   { to: '/enroll', label: 'Enroll' },
   { to: '/search', label: 'Search' },
   { to: '/recognition', label: 'Recognition' },
+  { to: '/events', label: 'Events' },
   { to: '/employees', label: 'Employees' },
   { to: '/rejections', label: 'Rejections' },
   { to: '/subjects', label: 'Subjects' },

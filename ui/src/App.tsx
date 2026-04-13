@@ -9,6 +9,7 @@ import Settings from './pages/Settings';
 import Rejections from './pages/Rejections';
 import Recognition from './pages/Recognition';
 import Employees from './pages/Employees';
+import SearchEvents from './pages/SearchEvents';
 
 function App() {
   return (
@@ -18,6 +19,7 @@ function App() {
         <Route path="/enroll" element={<Enroll />} />
         <Route path="/search" element={<Search />} />
         <Route path="/recognition" element={<Recognition />} />
+        <Route path="/events" element={<SearchEvents />} />
         <Route path="/employees" element={<Employees />} />
         <Route path="/rejections" element={<Rejections />} />
         <Route path="/subjects" element={<Subjects />} />

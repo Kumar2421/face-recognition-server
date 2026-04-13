@@ -14,20 +14,6 @@ function fmtSavedAt(ev: { image_saved_at?: number | null; ts: number }): string 
   return fmtTs(t);
 }
 
-function fmtMs(v: any): string {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return '—';
-  return String(Math.round(n));
-}
-
-function getTiming(ev: any): any {
-  try {
-    return ev?.meta?.timing || null;
-  } catch {
-    return null;
-  }
-}
-
 type DecisionFilter = '' | 'match' | 'no_match' | 'rejected';
 
 export default function Recognition() {
@@ -42,7 +28,7 @@ export default function Recognition() {
   const [minSim, setMinSim] = useState<string>('');
   const [maxSim, setMaxSim] = useState<string>('');
   const [nextCursor, setNextCursor] = useState<number | null>(null);
-  const [pageSize, setPageSize] = useState<number>(200);
+  const pageSize = 200;
   const [matchRefPath, setMatchRefPath] = useState<string | null>(null);
   const [subjectImgById, setSubjectImgById] = useState<Record<string, string>>({});
   const [dateMode, setDateMode] = useState<'all' | 'day' | 'range'>('all');

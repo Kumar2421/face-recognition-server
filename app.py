@@ -226,7 +226,7 @@ class FaceAddResponse(BaseModel):
 
 
 class FaceSearchTopKRequest(BaseModel):
-    image_b64: str = Field(..., validation_alias=AliasChoices("image_b64", "image"))
+    image_b64: str = Field(..., validation_alias=AliasChoices("image_b64", "image", "images_b64"))
     top_k: int = 5
 
 
@@ -293,6 +293,28 @@ class RecognitionEventsListResponse(BaseModel):
     cursor: float | None = None
 
 
+class SearchEventResponse(BaseModel):
+    event_id: str
+    ts: float
+    query_image_path: str
+    query_thumb_path: str
+    top_subject_id: str | None = None
+    top_similarity: float | None = None
+    results: list[FaceSearchTopKItem] = []
+    meta: dict[str, Any] | None = None
+
+
+class SearchEventsListResponse(BaseModel):
+    items: list[SearchEventResponse]
+    cursor: float | None = None
+
+
+class SearchEventsStatsResponse(BaseModel):
+    match: int
+    no_match: int
+    total: int
+
+
 class EventFeedbackRequest(BaseModel):
     label: str | None = None
     note: str | None = None
@@ -353,12 +375,25 @@ def _decode_b64_image(image_b64: str) -> np.ndarray:
     try:
         img = base64.b64decode(image_b64)
     except Exception:
-        raise HTTPException(status_code=400, detail="invalid image_b64")
+        raise HTTPException(status_code=400, detail="invalid base64")
     arr = np.frombuffer(img, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
         raise HTTPException(status_code=400, detail="unable to decode image")
     return bgr
+
+
+def _decode_image_bytes(image_bytes: bytes) -> np.ndarray:
+    try:
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError("unable to decode image")
+        return bgr
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="unable to decode image")
 
 
 def _quality_check_and_embed(bgr: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
@@ -588,7 +623,23 @@ def _save_image(bgr: np.ndarray, images_dir: str, subject_id: str, image_id: str
 
 
 
-def _decode_image_bytes(image_bytes: bytes) -> np.ndarray:
+def _save_search_query_assets(bgr: np.ndarray, image_id: str) -> tuple[str, str]:
+    try:
+        from pathlib import Path as _Path
+        _ensure_dir(app.state.search_events_dir)
+        _ensure_dir(app.state.search_thumbs_dir)
+        
+        # Save main query image
+        img_path = _Path(app.state.search_events_dir) / f"{image_id}.jpg"
+        cv2.imwrite(str(img_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        
+        # Save thumbnail
+        thumb_path = _save_thumb(bgr, app.state.search_thumbs_dir, image_id)
+        
+        return f"/v1/search_history/asset/image/{image_id}", thumb_path
+    except Exception as e:
+        logger.error("failed to save search query assets: %s", str(e))
+        return "", ""
     if not image_bytes:
         raise HTTPException(status_code=400, detail="empty image")
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
@@ -1279,8 +1330,12 @@ def _startup() -> None:
 
     # Initialize thumbs dir and activity counters
     app.state.thumbs_dir = os.environ.get("THUMBS_DIR", "/data/thumbs")
+    app.state.search_events_dir = os.environ.get("SEARCH_EVENTS_DIR", "/data/events/search_query")
+    app.state.search_thumbs_dir = os.environ.get("SEARCH_THUMBS_DIR", "/data/events/search_thumbs")
     try:
         _ensure_dir(app.state.thumbs_dir)
+        _ensure_dir(app.state.search_events_dir)
+        _ensure_dir(app.state.search_thumbs_dir)
     except Exception:
         pass
     app.state.search_events: list[float] = []
@@ -1660,11 +1715,40 @@ def faces_search(req: FaceSearchTopKRequest) -> FaceSearchTopKResponse:
     bgr = _decode_b64_image(req.image_b64)
     emb, _meta = _quality_check_and_embed(bgr)
     results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
+
+    thumb_path = ""
+    try:
+        from events_store import SearchEvent
+
+        store: EventsStore | None = getattr(app.state, "events", None)
+        if store is not None:
+            event_id = str(uuid.uuid4())
+            img_url, thumb_path = _save_search_query_assets(bgr, event_id)
+
+            top_sid = results[0]["subject_id"] if results else None
+            top_sim = results[0]["similarity"] if results else None
+            ev = SearchEvent(
+                event_id=event_id,
+                ts=_t(),
+                query_image_path=img_url,
+                query_thumb_path=thumb_path,
+                top_subject_id=top_sid,
+                top_similarity=top_sim,
+                results=results,
+                meta=_meta,
+            )
+            store.insert_search_event(ev)
+    except Exception as e:
+        try:
+            logger.error("failed to log search event: %s", str(e))
+        except Exception:
+            pass
+
     _record_event(app.state.search_events)
-    query_image_id = f"tmp-{uuid.uuid4()}"
-    query_thumb_path = _save_thumb(bgr, app.state.thumbs_dir, query_image_id)
-    _record_event(app.state.search_events)
-    return FaceSearchTopKResponse(results=[FaceSearchTopKItem(**r) for r in results], query_thumb_path=query_thumb_path or None)
+    return FaceSearchTopKResponse(
+        results=[FaceSearchTopKItem(**r) for r in results],
+        query_thumb_path=(thumb_path or None),
+    )
 
 
 @app.post("/v1/faces/search_upload", response_model=FaceSearchTopKResponse)
@@ -1682,11 +1766,34 @@ async def faces_search_upload(
     bgr = _decode_image_bytes(image_bytes)
     emb, _meta = _quality_check_and_embed(bgr)
     results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
+    
+    # Persistent Logging
+    try:
+        from events_store import SearchEvent
+        event_id = str(uuid.uuid4())
+        img_url, thumb_path = _save_search_query_assets(bgr, event_id)
+        
+        top_sid = results[0]["subject_id"] if results else None
+        top_sim = results[0]["similarity"] if results else None
+        
+        ev = SearchEvent(
+            event_id=event_id,
+            ts=_t(),
+            query_image_path=img_url,
+            query_thumb_path=thumb_path,
+            top_subject_id=top_sid,
+            top_similarity=top_sim,
+            results=results,
+            meta=_meta
+        )
+        if app.state.events:
+            app.state.events.insert_search_event(ev)
+            logger.info("Search Event Logged: %s", event_id)
+    except Exception as e:
+        logger.error("failed to log search event: %s", str(e))
+
     _record_event(app.state.search_events)
-    query_image_id = f"tmp-{uuid.uuid4()}"
-    query_thumb_path = _save_thumb(bgr, app.state.thumbs_dir, query_image_id)
-    _record_event(app.state.search_events)
-    return FaceSearchTopKResponse(results=[FaceSearchTopKItem(**r) for r in results], query_thumb_path=query_thumb_path or None)
+    return FaceSearchTopKResponse(results=[FaceSearchTopKItem(**r) for r in results], query_thumb_path=thumb_path or None)
 
 
 @app.post("/v1/faces/recognize", response_model=FaceRecognizeResponse)
@@ -1704,12 +1811,37 @@ def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
     results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
     items = [FaceSearchTopKItem(**r) for r in results]
 
+    # Persistent Logging
+    try:
+        from events_store import SearchEvent
+        event_id = str(uuid.uuid4())
+        img_url, thumb_path = _save_search_query_assets(bgr, event_id)
+        
+        top_sid = results[0]["subject_id"] if results else None
+        top_sim = results[0]["similarity"] if results else None
+        
+        ev = SearchEvent(
+            event_id=event_id,
+            ts=_t(),
+            query_image_path=img_url,
+            query_thumb_path=thumb_path,
+            top_subject_id=top_sid,
+            top_similarity=top_sim,
+            results=results,
+            meta=meta
+        )
+        if app.state.events:
+            app.state.events.insert_search_event(ev)
+            logger.info("Recognize Event Logged: %s", event_id)
+    except Exception as e:
+        logger.error("failed to log recognize event: %s", str(e))
+
     if not items:
         return FaceRecognizeResponse(matched=False, results=[], meta=meta)
 
     best = items[0]
     if float(best.similarity) >= float(min_sim) and str(best.subject_id).strip():
-        ok, second, margin, req = _passes_top2_margin(results, float(best.similarity))
+        ok, second, margin, req_m = _passes_top2_margin(results, float(best.similarity))
         try:
             meta = dict(meta or {})
             meta["decision"] = {
@@ -1717,7 +1849,7 @@ def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
                 "min_similarity": float(min_sim),
                 "top2_second": second,
                 "top2_margin": margin,
-                "top2_required": req,
+                "top2_required": req_m,
             }
         except Exception:
             pass
@@ -1733,6 +1865,7 @@ def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
         )
 
     return FaceRecognizeResponse(matched=False, results=items, meta=meta)
+    
 
 
 @app.get("/v1/faces/cross_match/{subject_id}", response_model=FaceSearchTopKResponse)
@@ -2518,6 +2651,91 @@ def list_recognition_events(
     )
 
 
+@app.get("/v1/search_history", response_model=SearchEventsListResponse)
+def list_search_events(
+    limit: int = 100,
+    cursor: float | None = None,
+    day: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+) -> SearchEventsListResponse:
+    store: EventsStore | None = getattr(app.state, "events", None)
+    if store is None:
+        raise HTTPException(status_code=500, detail="events store not configured")
+
+    since_ts, until_ts = _date_window_from_params(
+        day=day,
+        from_day=from_day,
+        to_day=to_day,
+        since_ts=since_ts,
+        until_ts=until_ts,
+    )
+
+    items, next_cursor = store.list_search_events(
+        limit=limit,
+        cursor_ts=cursor,
+        since_ts=since_ts,
+        until_ts=until_ts,
+    )
+    res = []
+    for it in items:
+        # Convert results list of dicts to FaceSearchTopKItem
+        results_objs = [FaceSearchTopKItem(**r) for r in it.get("results") or []]
+        it["results"] = results_objs
+        res.append(SearchEventResponse(**it))
+    
+    return SearchEventsListResponse(items=res, cursor=next_cursor)
+
+
+@app.get("/v1/search_history/stats", response_model=SearchEventsStatsResponse)
+def search_events_stats(
+    match_threshold: float = 0.8,
+    day: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+) -> SearchEventsStatsResponse:
+    store: EventsStore | None = getattr(app.state, "events", None)
+    if store is None:
+        raise HTTPException(status_code=500, detail="events store not configured")
+
+    since_ts, until_ts = _date_window_from_params(
+        day=day,
+        from_day=from_day,
+        to_day=to_day,
+        since_ts=since_ts,
+        until_ts=until_ts,
+    )
+
+    out = store.search_events_stats(
+        match_threshold=float(match_threshold),
+        since_ts=since_ts,
+        until_ts=until_ts,
+    )
+    return SearchEventsStatsResponse(**out)
+
+
+@app.get("/v1/search_history/asset/image/{event_id}")
+def get_search_event_image(event_id: str) -> Response:
+    path = os.path.join(app.state.search_events_dir, f"{event_id}.jpg")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="query image not found")
+    with open(path, "rb") as f:
+        return Response(content=f.read(), media_type="image/jpeg")
+
+
+@app.get("/v1/search_history/asset/thumb/{event_id}")
+def get_search_event_thumb(event_id: str) -> Response:
+    path = os.path.join(app.state.search_thumbs_dir, f"{event_id}.jpg")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="query thumbnail not found")
+    with open(path, "rb") as f:
+        return Response(content=f.read(), media_type="image/jpeg")
+
+
 @app.get("/v1/events/recognition/cameras", response_model=list[str])
 def list_recognition_cameras(limit: int = 5000) -> list[str]:
     store: EventsStore | None = getattr(app.state, "events", None)
@@ -2700,6 +2918,32 @@ async def faces_recognize_upload(
     emb, meta = _quality_check_and_embed(bgr)
     results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
     items = [FaceSearchTopKItem(**r) for r in results]
+
+    # Persistent Logging
+    try:
+        from events_store import SearchEvent
+        event_id = str(uuid.uuid4())
+        img_url, thumb_path = _save_search_query_assets(bgr, event_id)
+        
+        top_sid = results[0]["subject_id"] if results else None
+        top_sim = results[0]["similarity"] if results else None
+        
+        ev = SearchEvent(
+            event_id=event_id,
+            ts=_t(),
+            query_image_path=img_url,
+            query_thumb_path=thumb_path,
+            top_subject_id=top_sid,
+            top_similarity=top_sim,
+            results=results,
+            meta=meta
+        )
+        if app.state.events:
+            app.state.events.insert_search_event(ev)
+            logger.info("Recognize Upload Event Logged: %s", event_id)
+    except Exception as e:
+        logger.error("failed to log recognize upload event: %s", str(e))
+
     if not items:
         return FaceRecognizeResponse(matched=False, results=[], meta=meta)
 

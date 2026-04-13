@@ -282,7 +282,74 @@ export async function recognitionFeedbackStats(params: { since_ts?: number; unti
   const q = new URLSearchParams();
   if (params.since_ts != null) q.set('since_ts', String(params.since_ts));
   if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
-  if (params.camera) q.set('camera', params.camera);
+  if (params.camera) q.set('camera', String(params.camera));
   const qs = q.toString();
   return apiGet(`/v1/events/recognition/feedback_stats${qs ? `?${qs}` : ''}`);
+}
+
+// Search events
+export type SearchEventResult = {
+  subject_id: string;
+  similarity: number;
+  point_id?: string | null;
+  thumb_path?: string | null;
+  image_path?: string | null;
+  bbox?: number[] | null;
+  det_score?: number | null;
+  meta?: any;
+};
+
+export type SearchEvent = {
+  event_id: string;
+  ts: number;
+  query_image_path: string;
+  query_thumb_path: string;
+  top_subject_id?: string | null;
+  top_similarity?: number | null;
+  results: SearchEventResult[];
+  meta?: any;
+};
+
+export type SearchEventsListResponse = { items: SearchEvent[]; cursor?: number | null };
+
+export type SearchEventsStatsResponse = { match: number; no_match: number; total: number };
+
+export async function searchEvents(params: {
+  limit?: number;
+  cursor?: number | null;
+  day?: string | null;
+  from_day?: string | null;
+  to_day?: string | null;
+  since_ts?: number;
+  until_ts?: number;
+} = {}): Promise<SearchEventsListResponse> {
+  const q = new URLSearchParams();
+  if (params.limit != null) q.set('limit', String(params.limit));
+  if (params.cursor != null) q.set('cursor', String(params.cursor));
+  if (params.day) q.set('day', String(params.day));
+  if (params.from_day) q.set('from_day', String(params.from_day));
+  if (params.to_day) q.set('to_day', String(params.to_day));
+  if (params.since_ts != null) q.set('since_ts', String(params.since_ts));
+  if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
+  const qs = q.toString();
+  return apiGet(`/v1/search_history${qs ? `?${qs}` : ''}`);
+}
+
+export async function searchEventsStats(params: {
+  match_threshold: number;
+  day?: string | null;
+  from_day?: string | null;
+  to_day?: string | null;
+  since_ts?: number;
+  until_ts?: number;
+}): Promise<SearchEventsStatsResponse> {
+  const q = new URLSearchParams();
+  q.set('match_threshold', String(params.match_threshold));
+  if (params.day) q.set('day', String(params.day));
+  if (params.from_day) q.set('from_day', String(params.from_day));
+  if (params.to_day) q.set('to_day', String(params.to_day));
+  if (params.since_ts != null) q.set('since_ts', String(params.since_ts));
+  if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
+  const qs = q.toString();
+  return apiGet(`/v1/search_history/stats${qs ? `?${qs}` : ''}`);
 }

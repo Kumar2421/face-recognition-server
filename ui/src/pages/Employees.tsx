@@ -24,7 +24,7 @@ export default function Employees() {
   const [branch, setBranch] = useState<string>('');
   const [subjectId, setSubjectId] = useState<string>('');
   const [nextCursor, setNextCursor] = useState<number | null>(null);
-  const [pageSize] = useState<number>(200);
+  const [pageSize] = useState<number>(1000);
   const [subjectImgById, setSubjectImgById] = useState<Record<string, string>>({});
   const [crossHitsByEmployee, setCrossHitsByEmployee] = useState<Record<string, CrossCheckHit[]>>({});
   const [selectedEmployee, setSelectedEmployee] = useState<{ sid: string, events: RecognitionEvent[], hits: CrossCheckHit[] } | null>(null);
@@ -32,6 +32,9 @@ export default function Employees() {
   const [day, setDay] = useState<string>('');
   const [fromDay, setFromDay] = useState<string>('');
   const [toDay, setToDay] = useState<string>('');
+
+  const [employeePage, setEmployeePage] = useState<number>(1);
+  const employeesPerPage = 20;
 
   async function setFeedback(evId: string, label: EventFeedbackLabel) {
     const eventId = String(evId || '').trim();
@@ -157,6 +160,7 @@ export default function Employees() {
 
   useEffect(() => {
     setNextCursor(null);
+    setEmployeePage(1);
     load(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [camera, pageSize, dateMode, day, fromDay, toDay, subjectId]);
@@ -191,6 +195,21 @@ export default function Employees() {
       return [s, sortedEvs] as [string, RecognitionEvent[]];
     });
   }, [filtered, subjectId]);
+
+  useEffect(() => {
+    setEmployeePage(1);
+  }, [branch, subjectId, grouped.length]);
+
+  const totalEmployeePages = useMemo(() => {
+    return Math.max(1, Math.ceil(grouped.length / employeesPerPage));
+  }, [grouped.length]);
+
+  const pagedGrouped = useMemo(() => {
+    const p = Math.min(Math.max(1, employeePage), totalEmployeePages);
+    const start = (p - 1) * employeesPerPage;
+    const end = start + employeesPerPage;
+    return grouped.slice(start, end);
+  }, [grouped, employeePage, totalEmployeePages]);
 
   const branches = useMemo(() => {
     const s = new Set<string>();
@@ -339,7 +358,9 @@ export default function Employees() {
       </div>
 
       <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', fontWeight: 500 }}>
-        {loading ? 'Fetching records...' : `Showing ${grouped.length} employees.`}
+        {loading
+          ? 'Fetching records...'
+          : `Showing ${pagedGrouped.length} of ${grouped.length} employees. Page ${employeePage} / ${totalEmployeePages}.`}
       </div>
 
       {err && (
@@ -350,7 +371,7 @@ export default function Employees() {
 
       {/* Main Modular Grid: 5 columns on desktop */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: '20px' }}>
-        {grouped.map(([sid, events]) => {
+        {pagedGrouped.map(([sid, events]) => {
           const ref = subjectImgById[sid] || '';
           const lastEv = events[0];
           const hits = (crossHitsByEmployee[sid] || []).slice(0, 6);
@@ -465,6 +486,27 @@ export default function Employees() {
             </div>
           );
         })}
+      </div>
+
+      {/* Pagination */}
+      <div style={{ display: 'flex', justifyContent: 'center', gap: '12px', alignItems: 'center' }}>
+        <button
+          onClick={() => setEmployeePage(p => Math.max(1, p - 1))}
+          disabled={employeePage <= 1}
+          style={{ padding: '8px 14px' }}
+        >
+          Prev
+        </button>
+        <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', fontWeight: 600 }}>
+          Page {employeePage} / {totalEmployeePages}
+        </div>
+        <button
+          onClick={() => setEmployeePage(p => Math.min(totalEmployeePages, p + 1))}
+          disabled={employeePage >= totalEmployeePages}
+          style={{ padding: '8px 14px' }}
+        >
+          Next
+        </button>
       </div>
 
       <footer style={{ display: 'flex', justifyContent: 'center', padding: '16px 0' }}>
