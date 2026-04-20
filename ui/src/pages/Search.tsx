@@ -138,7 +138,7 @@ export default function Search() {
       {quality && (
         <section className="card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-            <h3 style={{ fontSize: '1.125rem', fontWeight: 700 }}>Quality Assessment</h3>
+            <h3 style={{ fontSize: '1.125rem', fontWeight: 700 }}>Quality Assessment ({quality.faces?.length || 0} faces)</h3>
             <span style={{ 
               padding: '4px 16px', 
               borderRadius: '99px', 
@@ -150,9 +150,21 @@ export default function Search() {
               {String(quality?.total_quality || (quality?.ok ? 'pass' : 'fail')).toUpperCase()}
             </span>
           </div>
-          <pre style={{ margin: 0, padding: '16px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', fontSize: '0.8125rem', overflowX: 'auto', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}>
-            {JSON.stringify(quality, null, 2)}
-          </pre>
+          
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 300px', gap: '24px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              {quality.annotated_image && (
+                <div style={{ background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', padding: '8px', border: '1px solid var(--border)' }}>
+                  <img src={quality.annotated_image} alt="annotated" style={{ width: '100%', borderRadius: 'var(--radius-sm)' }} />
+                </div>
+              )}
+            </div>
+            <div style={{ overflowY: 'auto', maxHeight: '500px' }}>
+              <pre style={{ margin: 0, padding: '16px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', fontSize: '0.8125rem', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}>
+                {JSON.stringify(quality, null, 2)}
+              </pre>
+            </div>
+          </div>
         </section>
       )}
 

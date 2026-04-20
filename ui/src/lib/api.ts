@@ -213,6 +213,33 @@ export type RecognitionEventsListResponse = { items: RecognitionEvent[]; cursor?
 
 export type RecognitionCamerasResponse = { items: string[] };
 
+export type RecognitionStatsResponse = {
+  total: number;
+  match: number;
+  no_match: number;
+  rejection: number;
+  by_camera: Record<string, Record<string, number>>;
+};
+
+export async function recognitionStats(params: {
+  day?: string | null;
+  from_day?: string | null;
+  to_day?: string | null;
+  since_ts?: number;
+  until_ts?: number;
+  camera?: string;
+} = {}): Promise<RecognitionStatsResponse> {
+  const q = new URLSearchParams();
+  if (params.day) q.set('day', params.day);
+  if (params.from_day) q.set('from_day', params.from_day);
+  if (params.to_day) q.set('to_day', params.to_day);
+  if (params.since_ts != null) q.set('since_ts', String(params.since_ts));
+  if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
+  if (params.camera) q.set('camera', params.camera);
+  const qs = q.toString();
+  return apiGet(`/v1/events/recognition/stats${qs ? `?${qs}` : ''}`);
+}
+
 export async function recognitionEvents(params: {
   decision?: string;
   camera?: string;

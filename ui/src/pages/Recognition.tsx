@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import { getApiBase, recognitionCameras, recognitionEvents, setRecognitionEventFeedback, subjectImages, type EventFeedbackLabel, type RecognitionEvent } from '../lib/api';
+import { getApiBase, recognitionCameras, recognitionEvents, recognitionStats, setRecognitionEventFeedback, subjectImages, type EventFeedbackLabel, type RecognitionEvent, type RecognitionStatsResponse } from '../lib/api';
+import StatCard from '../components/StatCard';
 
 function fmtTs(ts: number): string {
   try {
@@ -18,8 +19,10 @@ type DecisionFilter = '' | 'match' | 'no_match' | 'rejected';
 
 export default function Recognition() {
   const [items, setItems] = useState<RecognitionEvent[]>([]);
+  const [stats, setStats] = useState<RecognitionStatsResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
+  const [loadingStats, setLoadingStats] = useState<boolean>(false);
   const [loadingMore, setLoadingMore] = useState<boolean>(false);
   const [camera, setCamera] = useState<string>('');
   const [cameraOptions, setCameraOptions] = useState<string[]>([]);
@@ -83,9 +86,29 @@ export default function Recognition() {
     return Array.from(s).sort();
   }, [cameraOptions, items]);
 
+  async function loadStats() {
+    setLoadingStats(true);
+    try {
+      const s = await recognitionStats({
+        day: dateMode === 'day' ? (day || null) : null,
+        from_day: dateMode === 'range' ? (fromDay || null) : null,
+        to_day: dateMode === 'range' ? (toDay || null) : null,
+        camera: camera || undefined,
+      });
+      setStats(s);
+    } catch (e) {
+      console.error('Failed to load recognition stats:', e);
+    } finally {
+      setLoadingStats(false);
+    }
+  }
+
   async function load(reset: boolean = true) {
     setLoading(true);
     setErr(null);
+    if (reset) {
+      loadStats();
+    }
     try {
       const cur = reset ? null : nextCursor;
       const resp = await recognitionEvents({
@@ -286,6 +309,34 @@ export default function Recognition() {
           </button>
         </div>
       </header>
+
+      <section>
+        <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '20px' }}>
+          <StatCard
+            title="Total Events"
+            value={loadingStats ? '…' : (stats?.total.toLocaleString() || '0')}
+            hint="All detected faces"
+          />
+          <StatCard
+            title="Total Match"
+            value={loadingStats ? '…' : (stats?.match.toLocaleString() || '0')}
+            tone="good"
+            hint="Successfully recognized"
+          />
+          <StatCard
+            title="Total No Match"
+            value={loadingStats ? '…' : (stats?.no_match.toLocaleString() || '0')}
+            tone="warn"
+            hint="Unknown subjects"
+          />
+          <StatCard
+            title="Total Rejections"
+            value={loadingStats ? '…' : (stats?.rejection.toLocaleString() || '0')}
+            tone="bad"
+            hint="Failed quality check"
+          />
+        </div>
+      </section>
 
       <div className="card" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '20px', background: 'var(--bg-primary)' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>

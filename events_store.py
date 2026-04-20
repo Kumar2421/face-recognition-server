@@ -449,6 +449,70 @@ class EventsStore:
                 out.append(c)
         return out
 
+    def recognition_stats(
+        self,
+        *,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+        camera: str | None = None,
+    ) -> dict[str, Any]:
+        where: list[str] = []
+        args: list[Any] = []
+        if camera:
+            where.append("camera = ?")
+            args.append(str(camera))
+        if since_ts is not None:
+            where.append("ts >= ?")
+            args.append(float(since_ts))
+        if until_ts is not None:
+            where.append("ts <= ?")
+            args.append(float(until_ts))
+
+        sql = "SELECT decision, camera, COUNT(*) AS n FROM recognition_events"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " GROUP BY decision, camera"
+
+        total = 0
+        match = 0
+        no_match = 0
+        rejection = 0
+        by_camera: dict[str, dict[str, int]] = {}
+
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(sql, args).fetchall()
+
+        for r in rows:
+            d = str(r["decision"] or "").strip().lower()
+            cam = str(r["camera"] or "").strip() or "unknown"
+            n = int(r["n"] or 0)
+            
+            total += n
+            if d == "match":
+                match += n
+            elif d == "no_match":
+                no_match += n
+            elif d in ("rejection", "rejected"):
+                rejection += n
+                
+            by_camera.setdefault(cam, {"match": 0, "no_match": 0, "rejection": 0, "total": 0})
+            if d == "match":
+                by_camera[cam]["match"] += n
+            elif d == "no_match":
+                by_camera[cam]["no_match"] += n
+            elif d in ("rejection", "rejected"):
+                by_camera[cam]["rejection"] += n
+            by_camera[cam]["total"] += n
+
+        return {
+            "total": total,
+            "match": match,
+            "no_match": no_match,
+            "rejection": rejection,
+            "by_camera": by_camera
+        }
+
     def get_event(self, event_id: str) -> dict[str, Any] | None:
         event_id = str(event_id or "").strip()
         if not event_id:

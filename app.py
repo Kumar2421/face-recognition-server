@@ -257,12 +257,17 @@ class FaceRecognizeResponse(BaseModel):
     meta: dict[str, Any] | None = None
 
 
-class QualityCheckResponse(BaseModel):
+class FaceQualityResult(BaseModel):
     ok: bool
-    total_quality: str | None = None
     quality: dict[str, Any] | None = None
     det_score: float | None = None
     bbox: list[float] | None = None
+
+class QualityCheckResponse(BaseModel):
+    ok: bool
+    total_quality: str | None = None
+    faces: list[FaceQualityResult] = []
+    annotated_image: str | None = None
     timing: dict[str, Any] | None = None
 
 
@@ -313,6 +318,14 @@ class SearchEventsStatsResponse(BaseModel):
     match: int
     no_match: int
     total: int
+
+
+class RecognitionStatsResponse(BaseModel):
+    total: int
+    match: int
+    no_match: int
+    rejection: int
+    by_camera: dict[str, dict[str, int]]
 
 
 class EventFeedbackRequest(BaseModel):
@@ -464,7 +477,7 @@ def _quality_check_and_embed(bgr: np.ndarray) -> tuple[np.ndarray, dict[str, Any
     return emb, meta
 
 
-def _quality_check_only(bgr: np.ndarray) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+def _quality_check_all(bgr: np.ndarray) -> tuple[list[dict[str, Any]], dict[str, Any], np.ndarray]:
     try:
         evaluator = getattr(app.state, "quality", None)
     except Exception:
@@ -477,30 +490,46 @@ def _quality_check_only(bgr: np.ndarray) -> tuple[dict[str, Any] | None, dict[st
 
     t0 = _t()
     try:
-        face = embedder.detect_best(bgr)
-        det_score = float(getattr(face, "det_score", 0.0) or 0.0)
-        bbox_arr = np.asarray(getattr(face, "bbox", None), dtype=np.float32).reshape(-1)
-        bbox = [float(x) for x in bbox_arr.tolist()] if bbox_arr.size == 4 else None
+        # Use detect_all to get all faces
+        faces = embedder.detect_all(bgr)
+        results = []
+        
+        annotated = bgr.copy()
+        
+        for i, face in enumerate(faces):
+            det_score = float(getattr(face, "det_score", 0.0) or 0.0)
+            bbox_arr = np.asarray(getattr(face, "bbox", None), dtype=np.float32).reshape(-1)
+            bbox = [float(x) for x in bbox_arr.tolist()] if bbox_arr.size == 4 else None
 
-        q = None
-        if evaluator is not None:
-            try:
-                q = evaluator.evaluate(bgr, face)
-            except RuntimeError:
-                raise HTTPException(status_code=500, detail="quality evaluator failure")
-            except Exception:
-                raise HTTPException(status_code=500, detail="quality evaluator failure")
+            q = None
+            face_ok = True
+            if evaluator is not None and face is not None:
+                try:
+                    q = evaluator.evaluate(bgr, face)
+                    if isinstance(q, dict) and q.get("status") == "rejected":
+                        face_ok = False
+                except Exception:
+                    pass
+
+            results.append({
+                "ok": face_ok,
+                "quality": q,
+                "det_score": det_score,
+                "bbox": bbox
+            })
+            
+            # Annotate image
+            if bbox:
+                x1, y1, x2, y2 = [int(x) for x in bbox]
+                color = (0, 255, 0) if face_ok else (0, 0, 255)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                label = f"#{i} {'PASS' if face_ok else 'FAIL'}"
+                cv2.putText(annotated, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         timing = {"detect_ms": int(max(0.0, (_t() - t0)) * 1000.0)}
-        return q, {"det_score": det_score, "bbox": bbox, "timing": timing}
-    except ValueError as e:
-        msg = str(e)
-        if "no face" in msg.lower():
-            raise HTTPException(status_code=404, detail=msg)
-        raise HTTPException(status_code=422, detail=msg)
-    except HTTPException:
-        raise
-    except Exception:
+        return results, {"timing": timing}, annotated
+    except Exception as e:
+        logger.error(f"detect failure: {str(e)}")
         raise HTTPException(status_code=500, detail="detect failure")
 
 
@@ -2856,6 +2885,30 @@ def recognition_feedback_stats(
     return FeedbackStatsResponse(**st)
 
 
+@app.get("/v1/events/recognition/stats", response_model=RecognitionStatsResponse)
+def recognition_stats(
+    day: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+    camera: str | None = None,
+) -> RecognitionStatsResponse:
+    s0, e0 = _date_window_from_params(
+        day=day,
+        from_day=from_day,
+        to_day=to_day,
+        since_ts=since_ts,
+        until_ts=until_ts,
+    )
+    res = app.state.events.recognition_stats(
+        since_ts=s0,
+        until_ts=e0,
+        camera=camera,
+    )
+    return RecognitionStatsResponse(**res)
+
+
 @app.get("/v1/events/recognition/{event_id}", response_model=RecognitionEventResponse)
 def get_recognition_event(event_id: str) -> RecognitionEventResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
@@ -2968,25 +3021,25 @@ async def quality_check_upload(file: UploadFile = File(...)) -> QualityCheckResp
     decode_ms = int(max(0.0, (_pc() - decode_t0)) * 1000.0)
 
     q_t0 = _pc()
-    q, meta = _quality_check_only(bgr)
+    results, meta, annotated = _quality_check_all(bgr)
     quality_ms = int(max(0.0, (_pc() - q_t0)) * 1000.0)
 
-    ok = True
-    if isinstance(q, dict) and q.get("status") == "rejected":
-        ok = False
+    # Convert annotated image to base64
+    _, buffer = cv2.imencode('.jpg', annotated)
+    annotated_b64 = base64.b64encode(buffer).decode('utf-8')
 
-    total_quality = "pass" if ok else "fail"
+    total_ok = all(r["ok"] for r in results) if results else False
+    total_quality = "pass" if total_ok else "fail"
 
     total_ms = int(max(0.0, (_pc() - t0)) * 1000.0)
     timing = dict(meta.get("timing") or {})
     timing.update({"decode_ms": int(decode_ms), "quality_ms": int(quality_ms), "total_ms": int(total_ms)})
 
     return QualityCheckResponse(
-        ok=bool(ok),
+        ok=bool(total_ok),
         total_quality=str(total_quality),
-        quality=q if isinstance(q, dict) else None,
-        det_score=meta.get("det_score"),
-        bbox=meta.get("bbox"),
+        faces=[FaceQualityResult(**r) for r in results],
+        annotated_image=f"data:image/jpeg;base64,{annotated_b64}",
         timing=timing,
     )
 
