@@ -9,6 +9,26 @@ function fmtTs(ts: number): string {
   }
 }
 
+function fmtTime(ts: number): string {
+  try {
+    return new Date(ts * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true });
+  } catch { return '--'; }
+}
+
+function fmtDate(ts: number): string {
+  try {
+    return new Date(ts * 1000).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+  } catch { return '--'; }
+}
+
+function fmtDuration(seconds: number): string {
+  if (seconds <= 0) return '0m';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
 function fmtSavedAt(ev: { image_saved_at?: number | null; ts: number }): string {
   const t = ev.image_saved_at != null ? Number(ev.image_saved_at) : Number(ev.ts);
   return fmtTs(t);
@@ -369,119 +389,132 @@ export default function Employees() {
         </div>
       )}
 
-      {/* Main Modular Grid: 5 columns on desktop */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: '20px' }}>
-        {pagedGrouped.map(([sid, events]) => {
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '40px 1.2fr 180px 1fr 1fr 150px 150px 80px 60px',
+        gap: '12px',
+        padding: '12px 20px',
+        background: 'var(--bg-secondary)',
+        borderRadius: 'var(--radius-md)',
+        fontWeight: 700,
+        fontSize: '0.75rem',
+        color: 'var(--text-muted)',
+        textTransform: 'uppercase',
+        border: '1px solid var(--border)',
+        alignItems: 'center'
+      }}>
+        <span>#</span>
+        <span>Employee ID</span>
+        <span>Customer Images</span>
+        <span>Branch Name</span>
+        <span>Camera Name</span>
+        <span>Entry Time</span>
+        <span>Exit Time</span>
+        <span>Duration</span>
+        <span style={{ textAlign: 'center' }}>View</span>
+      </div>
+
+      {/* Main List */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {pagedGrouped.map(([sid, events], idx) => {
           const ref = subjectImgById[sid] || '';
           const lastEv = events[0];
-          const hits = (crossHitsByEmployee[sid] || []).slice(0, 6);
+          const firstEv = events[events.length - 1];
+          const duration = lastEv.ts - firstEv.ts;
+          const globalIdx = (employeePage - 1) * employeesPerPage + idx + 1;
 
           return (
-            <div key={sid} className="card" style={{ display: 'flex', flexDirection: 'column', gap: '12px', padding: '12px', position: 'relative', minHeight: '340px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                <div style={{ maxWidth: '140px' }}>
-                  <h3 style={{ fontSize: '0.875rem', fontWeight: 800, color: 'var(--text-primary)', wordBreak: 'break-all', lineHeight: 1.2 }}>{sid}</h3>
-                  <div style={{ fontSize: '0.625rem', color: 'var(--text-muted)', textTransform: 'uppercase', fontWeight: 700, marginTop: '2px' }}>
-                    Branch: {getBranchFromSid(sid)}
+            <div
+              key={sid}
+              className="card"
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '40px 1.2fr 180px 1fr 1fr 150px 150px 80px 60px',
+                gap: '12px',
+                padding: '12px 20px',
+                alignItems: 'center',
+                transition: 'transform 0.2s, box-shadow 0.2s',
+                cursor: 'default'
+              }}
+            >
+              {/* # Index */}
+              <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', fontWeight: 600 }}>{globalIdx}</div>
+
+              {/* Employee ID */}
+              <div style={{ fontWeight: 700, fontSize: '0.875rem', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {sid}
+              </div>
+
+              {/* Customer Images */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <div style={{ display: 'flex', gap: '4px', height: '60px' }}>
+                  <div style={{ flex: 1, borderRadius: '4px', overflow: 'hidden', border: '1px solid var(--border)', background: 'var(--bg-secondary)', position: 'relative' }}>
+                    {ref ? (
+                      <img src={`${getApiBase()}${ref}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    ) : (
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem' }}>REF</div>
+                    )}
+                    <div style={{ position: 'absolute', top: 2, right: 2, width: '12px', height: '12px', background: 'var(--primary)', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white', fontSize: '8px' }}>👤</div>
+                  </div>
+                  <div style={{ flex: 1, borderRadius: '4px', overflow: 'hidden', border: '1px solid var(--border)', background: 'var(--bg-secondary)', position: 'relative' }}>
+                    {lastEv.image_path ? (
+                      <img src={`${getApiBase()}${lastEv.image_path}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    ) : (
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem' }}>LIVE</div>
+                    )}
+                    <div style={{ position: 'absolute', top: 2, right: 2, width: '12px', height: '12px', background: 'var(--primary)', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white', fontSize: '8px' }}>👤</div>
                   </div>
                 </div>
-                <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                {/* Similarity Bar */}
+                <div style={{ height: '14px', background: 'var(--bg-secondary)', borderRadius: '2px', overflow: 'hidden', border: '1px solid var(--border)', position: 'relative' }}>
                   <div style={{
-                    padding: '2px 8px',
-                    background: 'rgba(37, 99, 235, 0.1)',
-                    color: 'var(--primary)',
-                    borderRadius: '4px',
-                    fontSize: '0.625rem',
-                    fontWeight: 700,
-                    border: '1px solid rgba(37, 99, 235, 0.2)'
-                  }}>
-                    {events.length} SIGHTINGS
+                    width: `${(lastEv.similarity || 0) * 100}%`,
+                    height: '100%',
+                    background: 'var(--success)',
+                    opacity: 0.8
+                  }} />
+                  <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '9px', fontWeight: 800, color: (lastEv.similarity || 0) > 0.5 ? 'white' : 'var(--text-primary)' }}>
+                    {((lastEv.similarity || 0) * 100).toFixed(0)}%
                   </div>
-                  <button
-                    onClick={() => setSelectedEmployee({ sid, events, hits: crossHitsByEmployee[sid] || [] })}
-                    style={{ padding: '6px', minWidth: 'auto', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '6px', cursor: 'pointer' }}
-                    title="Expand View"
-                  >
-                    <span style={{ fontSize: '0.875rem' }}>⛶</span>
-                  </button>
                 </div>
               </div>
 
-              <div style={{ height: '150px', display: 'flex', gap: '4px', borderRadius: 'var(--radius-md)', overflow: 'hidden', border: '1px solid var(--border)' }}>
-                <div style={{ flex: 1, position: 'relative', background: 'var(--bg-secondary)' }}>
-                  {ref ? (
-                    <img src={`${getApiBase()}${ref}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                  ) : (
-                    <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.625rem', color: 'var(--text-muted)' }}>No Ref</div>
-                  )}
-                  <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '4px', background: 'rgba(0,0,0,0.5)', color: 'white', fontSize: '0.5625rem', textAlign: 'center', fontWeight: 700 }}>DATABASE</div>
-                </div>
-                <div style={{ flex: 1, position: 'relative', background: 'var(--bg-secondary)', borderLeft: '1px solid var(--border)' }}>
-                  {lastEv.image_path ? (
-                    <img src={`${getApiBase()}${lastEv.image_path}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                  ) : (
-                    <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.625rem', color: 'var(--text-muted)' }}>No Live</div>
-                  )}
-                  <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '4px', background: 'var(--success)', color: 'white', fontSize: '0.5625rem', textAlign: 'center', fontWeight: 700 }}>LIVE MATCH</div>
-                </div>
+              {/* Branch Name */}
+              <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', fontWeight: 500 }}>
+                {getBranchFromSid(sid)}
               </div>
 
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.75rem' }}>
-                  <div style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Cross-Check Status</div>
-                  <div style={{
-                    fontWeight: 700,
-                    color: lastEv.similarity && lastEv.similarity > 0.9 ? 'var(--success)' : 'var(--warning)',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '4px'
-                  }}>
-                    {lastEv.similarity && lastEv.similarity > 0.9 ? '✓ Verified' : '⚠ Caution'}
-                    <span style={{ fontSize: '0.6875rem', opacity: 0.8 }}>({lastEv.similarity ? (lastEv.similarity * 100).toFixed(1) : '--'}%)</span>
-                  </div>
-                </div>
+              {/* Camera Name */}
+              <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', fontWeight: 500 }}>
+                {lastEv.camera}
+              </div>
 
-                <div style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', marginBottom: '4px' }}>
-                  Latest: {lastEv.camera} ({fmtSavedAt(lastEv).split(',')[1]})
-                  <div style={{ fontSize: '0.625rem', opacity: 0.8, marginTop: '2px', fontFamily: 'monospace' }}>
-                    {`id:${lastEv.event_id.slice(0, 8)}...`}
-                  </div>
-                </div>
+              {/* Entry Time */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                <div style={{ fontSize: '0.8125rem', fontWeight: 600 }}>{fmtDate(firstEv.ts)}</div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{fmtTime(firstEv.ts)}</div>
+              </div>
 
-                <div style={{ display: 'flex', gap: '4px', overflowX: 'auto', paddingBottom: '4px' }}>
-                  {hits.map(h => {
-                    const img = String(h.visitor_image_path || h.visitor_thumb_path || '').trim();
-                    const vid = String(h.visitor_subject_id || '').trim();
-                    return (
-                      <div key={h.visitor_event_id} style={{
-                        width: '40px',
-                        height: '40px',
-                        borderRadius: '4px',
-                        overflow: 'hidden',
-                        flexShrink: 0,
-                        border: '2px solid var(--warning)',
-                        position: 'relative'
-                      }}>
-                        {img ? (
-                          <img src={`${getApiBase()}${img}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} title={`${vid} sim=${Number(h.similarity).toFixed(4)}`} />
-                        ) : (
-                          <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.625rem', color: 'var(--text-muted)' }}>No Img</div>
-                        )}
-                        {vid && (
-                          <div style={{ position: 'absolute', top: 0, right: 0, background: 'var(--warning)', color: 'black', fontSize: '8px', padding: '0 2px', fontWeight: 900, borderRadius: '0 0 0 4px' }}>V</div>
-                        )}
-                      </div>
-                    );
-                  })}
-                  {hits.length > 6 && (
-                    <div
-                      onClick={() => setSelectedEmployee({ sid, events, hits: crossHitsByEmployee[sid] || [] })}
-                      style={{ width: '40px', height: '40px', borderRadius: '4px', background: 'var(--bg-secondary)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.625rem', fontWeight: 800, color: 'var(--text-muted)', cursor: 'pointer' }}
-                    >
-                      +{hits.length - 6}
-                    </div>
-                  )}
-                </div>
+              {/* Exit Time */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                <div style={{ fontSize: '0.8125rem', fontWeight: 600 }}>{fmtDate(lastEv.ts)}</div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{fmtTime(lastEv.ts)}</div>
+              </div>
+
+              {/* Duration */}
+              <div style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--text-primary)' }}>
+                {fmtDuration(duration)}
+              </div>
+
+              {/* Action */}
+              <div style={{ display: 'flex', justifyContent: 'center' }}>
+                <button
+                  onClick={() => setSelectedEmployee({ sid, events, hits: crossHitsByEmployee[sid] || [] })}
+                  style={{ padding: '6px', minWidth: 'auto', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '6px', cursor: 'pointer' }}
+                  title="Expand View"
+                >
+                  <span style={{ fontSize: '1rem' }}>⛶</span>
+                </button>
               </div>
             </div>
           );
@@ -489,7 +522,7 @@ export default function Employees() {
       </div>
 
       {/* Pagination */}
-      <div style={{ display: 'flex', justifyContent: 'center', gap: '12px', alignItems: 'center' }}>
+      <div style={{ display: 'flex', justifyContent: 'center', gap: '12px', alignItems: 'center', marginTop: '16px' }}>
         <button
           onClick={() => setEmployeePage(p => Math.max(1, p - 1))}
           disabled={employeePage <= 1}

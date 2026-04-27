@@ -13,10 +13,16 @@ sftp:
   poll_interval_sec: 60
   # processed_dirname: "processed"
 
+external_api:
+  enabled: true
+  base_url: "https://live.thefusionapps.com"
+  jwt_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyRGF0YSI6eyJpZCI6MTAsInVzZXJOYW1lIjoiRnVzaW9uIFN1cHBvcnQiLCJ0ZW5hbnRJZCI6MTAsInJvbGUiOiJ0ZW5hbnQiLCJzbHVnIjoiYW5hbHl0aWNzIn0sImJyYW5jaERhdGEiOnsiaWQiOjUyLCJicmFuY2hJZCI6IlRNSi1DQkUifSwiaWF0IjoxNzc3MjYyNzgyLCJleHAiOjE3NzczNDkxODJ9.GhfNjjwVnj87SZx2CxisyxiyCuubxD9JfS0X6eQeRo8"
+  poll_interval_sec: 300
+
 recognition:
-  min_similarity: 0.52
-  top_k: 5
-  min_top2_margin: 0.05
+  min_similarity: 0.55
+  top_k: 6
+  min_top2_margin: 0.08
   top2_high_conf_sim: 0.40
 
 quality:

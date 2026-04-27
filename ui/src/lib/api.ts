@@ -218,6 +218,7 @@ export type RecognitionStatsResponse = {
   match: number;
   no_match: number;
   rejection: number;
+  unique_matches: number;
   by_camera: Record<string, Record<string, number>>;
 };
 

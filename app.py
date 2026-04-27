@@ -7,6 +7,8 @@ import ipaddress
 import socket
 import time
 import uuid
+import asyncio
+import collections
 from dataclasses import dataclass
 from typing import Any
 from datetime import datetime, timezone, date, timedelta
@@ -49,6 +51,27 @@ def _as_float(v: Any, default: float) -> float:
     except Exception:
         return default
 
+
+# In-memory cache for recently enrolled embeddings to prevent race conditions
+# Stores (embedding_hash, subject_id, timestamp)
+_RECENT_ENROLLMENTS = collections.deque(maxlen=100)
+_RECENT_ENROLL_LOCK = asyncio.Lock()
+
+def _get_recent_enrollment_match(emb: np.ndarray, threshold: float) -> str | None:
+    now = time.time()
+    # Clean up old entries (older than 5 seconds)
+    while _RECENT_ENROLLMENTS and (now - _RECENT_ENROLLMENTS[0][2] > 5.0):
+        _RECENT_ENROLLMENTS.popleft()
+    
+    for cached_emb, sid, ts in _RECENT_ENROLLMENTS:
+        # Simple cosine similarity (embeddings are already normalized)
+        sim = float(np.dot(emb, cached_emb))
+        if sim >= threshold:
+            return sid
+    return None
+
+def _add_recent_enrollment(emb: np.ndarray, sid: str):
+    _RECENT_ENROLLMENTS.append((emb.copy(), sid, time.time()))
 
 def _tz() -> Any:
     name = str(os.environ.get("FACE_SERVICE_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata").strip() or "Asia/Kolkata"
@@ -325,6 +348,7 @@ class RecognitionStatsResponse(BaseModel):
     match: int
     no_match: int
     rejection: int
+    unique_matches: int = 0
     by_camera: dict[str, dict[str, int]]
 
 
@@ -872,8 +896,22 @@ def _qdrant_search(client, collection: str, emb: np.ndarray, top_k: int) -> list
             indexed_only_raw = str(os.environ.get("QDRANT_INDEXED_ONLY", "") or "").strip().lower()
             indexed_only = indexed_only_raw in ("1", "true", "yes") if indexed_only_raw else None
 
+            rescore_raw = str(os.environ.get("QDRANT_QUANTIZATION_RESCORE", "1")).strip().lower()
+            rescore = rescore_raw in ("1", "true", "yes")
+
             try:
-                search_params = SearchParams(hnsw_ef=ef, exact=exact, indexed_only=indexed_only)
+                from qdrant_client.http.models import QuantizationSearchParams
+                quant_params = QuantizationSearchParams(rescore=rescore)
+            except Exception:
+                quant_params = None
+
+            try:
+                search_params = SearchParams(
+                    hnsw_ef=ef, 
+                    exact=exact, 
+                    indexed_only=indexed_only,
+                    quantization=quant_params
+                )
             except Exception:
                 search_params = None
 
@@ -1064,16 +1102,14 @@ app = FastAPI()
 app.include_router(cross_check_router)
 
 # CORS for UI and external clients
-cors_origins_env = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
-cors_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-if cors_origins_env:
-    for o in cors_origins_env.split(","):
-        o = o.strip()
-        if o:
-            cors_origins.append(o)
+cors_origins_raw = os.environ.get("CORS_ALLOW_ORIGINS", "*")
+if cors_origins_raw == "*" or not cors_origins_raw.strip():
+    cors_origins = ["*"]
+else:
+    # Explicitly include common variants and ensure the provided origins are present
+    cors_origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
+    if "https://face.service.tools.thefusionapps.com" not in cors_origins:
+        cors_origins.append("https://face.service.tools.thefusionapps.com")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1081,7 +1117,21 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+@app.middleware("http")
+async def add_cors_headers(request, call_next):
+    origin = request.headers.get("origin")
+    response = await call_next(request)
+    if origin:
+        # If origin matches our list or we allow all
+        if "*" in cors_origins or origin in cors_origins:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Methods"] = "*"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 # Static thumbnails: ensure directory exists before mounting
 _thumbs_dir_mount = os.environ.get("THUMBS_DIR", "/data/thumbs")
@@ -1358,6 +1408,7 @@ def _startup() -> None:
             logger.error("failed to ensure qdrant collection: %s", str(e))
 
     # Initialize thumbs dir and activity counters
+    app.state.enroll_lock = asyncio.Lock()
     app.state.thumbs_dir = os.environ.get("THUMBS_DIR", "/data/thumbs")
     app.state.search_events_dir = os.environ.get("SEARCH_EVENTS_DIR", "/data/events/search_query")
     app.state.search_thumbs_dir = os.environ.get("SEARCH_THUMBS_DIR", "/data/events/search_thumbs")
@@ -2020,6 +2071,47 @@ async def ingest_recognition_event(
             return None
         return _l2_normalize(np.asarray(emb, dtype=np.float32))
 
+    def _crop_face(bgr0: np.ndarray, face: Any) -> np.ndarray:
+        try:
+            bb = np.asarray(getattr(face, "bbox", None), dtype=np.float32).reshape(-1)
+            if bb.size < 4:
+                return bgr0
+            x1, y1, x2, y2 = float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])
+            ih, iw = bgr0.shape[:2]
+            x1i = max(0, min(int(x1), int(iw - 1)))
+            y1i = max(0, min(int(y1), int(ih - 1)))
+            x2i = max(0, min(int(x2), int(iw)))
+            y2i = max(0, min(int(y2), int(ih)))
+            if x2i <= x1i or y2i <= y1i:
+                return bgr0
+            return bgr0[y1i:y2i, x1i:x2i].copy()
+        except Exception:
+            return bgr0
+
+    def _pick_best_face_by_area(faces0: list[Any]) -> Any:
+        best = None
+        best_score = -1.0
+        for f in faces0 or []:
+            if f is None:
+                continue
+            try:
+                bb = np.asarray(getattr(f, "bbox", None), dtype=np.float32).reshape(-1)
+                if bb.size >= 4:
+                    area = max(0.0, float(bb[2] - bb[0])) * max(0.0, float(bb[3] - bb[1]))
+                else:
+                    area = 0.0
+            except Exception:
+                area = 0.0
+            try:
+                ds = float(getattr(f, "det_score", 0.0) or 0.0)
+            except Exception:
+                ds = 0.0
+            score = float(area) * (0.5 + float(ds))
+            if score > best_score:
+                best_score = score
+                best = f
+        return best
+
     # detect faces
     t_model0 = _t()
     t_detect0 = _pc()
@@ -2034,12 +2126,32 @@ async def ingest_recognition_event(
             else:
                 faces = list(infer.detect_all(bgr))
         else:
-            if hasattr(infer, "detect_best_timed"):
-                face0, tinfo = infer.detect_best_timed(bgr)
-                faces = [face0]
-                infer_timing = dict(tinfo or {})
+            use_largest = str(os.environ.get("FACE_SERVICE_USE_LARGEST_FACE", "0") or "0").strip() in (
+                "1",
+                "true",
+                "True",
+                "yes",
+                "YES",
+            )
+            if use_largest:
+                if hasattr(infer, "detect_all_timed"):
+                    faces_all, tinfo = infer.detect_all_timed(bgr)
+                    infer_timing = dict(tinfo or {})
+                    face0 = _pick_best_face_by_area(list(faces_all or []))
+                    faces = [face0]
+                else:
+                    faces = [
+                        _pick_best_face_by_area(list(infer.detect_all(bgr)))
+                        if hasattr(infer, "detect_all")
+                        else infer.detect_best(bgr)
+                    ]
             else:
-                faces = [infer.detect_best(bgr)]
+                if hasattr(infer, "detect_best_timed"):
+                    face0, tinfo = infer.detect_best_timed(bgr)
+                    faces = [face0]
+                    infer_timing = dict(tinfo or {})
+                else:
+                    faces = [infer.detect_best(bgr)]
         faces_total = len(faces)
     except ValueError:
         if primary_resp is None:
@@ -2145,7 +2257,17 @@ async def ingest_recognition_event(
         if evaluator is not None:
             try:
                 t_e0 = _pc()
-                emb, quality_meta = _quality_check_and_embed(bgr)
+                emb = _embed_from_face(face)
+                if emb is not None:
+                    try:
+                        quality_meta = evaluator.evaluate(bgr, face)
+                    except Exception:
+                        quality_meta = None
+                    if isinstance(quality_meta, dict) and quality_meta.get("status") == "rejected":
+                        raise ValueError(f"quality_reject:{str(quality_meta.get('reason') or 'unknown')}")
+                else:
+                    bgr_face = _crop_face(bgr, face)
+                    emb, quality_meta = _quality_check_and_embed(bgr_face)
                 quality_ms = int(max(0.0, (_pc() - t_e0)) * 1000.0)
 
                 try:
@@ -2314,6 +2436,14 @@ async def ingest_recognition_event(
 
         t_qs0 = _pc()
         results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
+        
+        # Check in-memory cache if no database match
+        if not results or results[0]["similarity"] < float(min_sim):
+            cached_sid = _get_recent_enrollment_match(emb, float(min_sim))
+            if cached_sid:
+                # Synthesize a result from cache
+                results = [{"subject_id": cached_sid, "similarity": 0.99, "id": "cached"}] + (results or [])
+
         qdrant_ms = int(max(0.0, (_pc() - t_qs0)) * 1000.0)
         matched = False
         subject_id: str | None = None
@@ -2356,133 +2486,162 @@ async def ingest_recognition_event(
         no_match_auto_enroll: dict[str, Any] | None = None
         if (not matched) and _no_match_auto_enroll_enabled():
             try:
-                try:
-                    block_thr = float(_no_match_auto_enroll_block_min_similarity())
-                except Exception:
-                    block_thr = 0.80
-
-                try:
-                    attach_thr = float(_no_match_auto_attach_min_similarity())
-                except Exception:
-                    attach_thr = 0.70
-                try:
-                    attach_margin_thr = float(_no_match_auto_attach_min_margin())
-                except Exception:
-                    attach_margin_thr = 0.10
-
-                try:
-                    best_sid = str((results[0].get("subject_id") if results else "") or "").strip()
-                    best_sim = float((results[0].get("similarity") if results else 0.0) or 0.0)
-                except Exception:
-                    best_sid = ""
-                    best_sim = 0.0
-
-                second_sim: float | None = None
-                try:
-                    if results and len(results) >= 2:
-                        second_sim = float(results[1].get("similarity") or 0.0)
-                except Exception:
-                    second_sim = None
-
-                if best_sid:
+                async with app.state.enroll_lock:
+                    # Re-check match after acquiring lock to handle race conditions
                     try:
-                        prefix = _no_match_auto_enroll_prefix()
-                    except Exception:
-                        prefix = "unknown"
-
-                    if prefix and best_sid.startswith(f"{prefix}-") and best_sim >= float(attach_thr):
-                        margin_ok = True
-                        if second_sim is not None:
-                            try:
-                                margin_ok = (float(best_sim) - float(second_sim)) >= float(attach_margin_thr)
-                            except Exception:
-                                margin_ok = False
-                        if margin_ok:
+                        # 1. Check in-memory cache first (fastest)
+                        # Use ENROLL_DUPLICATE_MIN_SIM for re-check if available
+                        recheck_thr = float(os.environ.get("ENROLL_DUPLICATE_MIN_SIM", app.state.min_similarity))
+                        cached_sid = _get_recent_enrollment_match(emb, recheck_thr)
+                        if cached_sid:
+                            logger.info("race_condition_prevented: matched %s via cache (thr=%.2f)", cached_sid, recheck_thr)
                             matched = True
-                            subject_id = best_sid
-                            similarity = float(best_sim)
+                            subject_id = cached_sid
+                            similarity = 0.99
                             decision = "match"
+                        
+                        # 2. Re-check Qdrant if still no match
+                        if not matched:
+                            q = getattr(app.state, "qdrant", None)
+                            if q:
+                                results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=5)
+                                if results and results[0]["similarity"] >= recheck_thr:
+                                    logger.info("race_condition_prevented: matched %s via DB re-check (thr=%.2f)", results[0]["subject_id"], recheck_thr)
+                                    matched = True
+                                    subject_id = results[0]["subject_id"]
+                                    similarity = results[0]["similarity"]
+                                    decision = "match"
+                                # Fall through to the rest of the logic which will now see 'matched=True'
+                    except Exception:
+                        pass
+
+                    if not matched:
+                        try:
+                            try:
+                                block_thr = float(_no_match_auto_enroll_block_min_similarity())
+                            except Exception:
+                                block_thr = 0.80
+
+                            try:
+                                attach_thr = float(_no_match_auto_attach_min_similarity())
+                            except Exception:
+                                attach_thr = 0.70
+                            try:
+                                attach_margin_thr = float(_no_match_auto_attach_min_margin())
+                            except Exception:
+                                attach_margin_thr = 0.10
+
+                            try:
+                                best_sid = str((results[0].get("subject_id") if results else "") or "").strip()
+                                best_sim = float((results[0].get("similarity") if results else 0.0) or 0.0)
+                            except Exception:
+                                best_sid = ""
+                                best_sim = 0.0
+
+                            second_sim: float | None = None
+                            try:
+                                if results and len(results) >= 2:
+                                    second_sim = float(results[1].get("similarity") or 0.0)
+                            except Exception:
+                                second_sim = None
+
+                            if best_sid:
+                                try:
+                                    prefix = _no_match_auto_enroll_prefix()
+                                except Exception:
+                                    prefix = "unknown"
+
+                                if prefix and best_sid.startswith(f"{prefix}-") and best_sim >= float(attach_thr):
+                                    margin_ok = True
+                                    if second_sim is not None:
+                                        try:
+                                            margin_ok = (float(best_sim) - float(second_sim)) >= float(attach_margin_thr)
+                                        except Exception:
+                                            margin_ok = False
+                                    if margin_ok:
+                                        matched = True
+                                        subject_id = best_sid
+                                        similarity = float(best_sim)
+                                        decision = "match"
+                                        no_match_auto_enroll = {
+                                            "enabled": True,
+                                            "enrolled": False,
+                                            "reason": "attached_existing_visitor",
+                                            "subject_id": str(best_sid),
+                                            "similarity": float(best_sim),
+                                            "threshold": float(attach_thr),
+                                            "second_similarity": float(second_sim) if second_sim is not None else None,
+                                            "margin_threshold": float(attach_margin_thr),
+                                        }
+                                        raise RuntimeError("skip_auto_enroll_attached_existing")
+
+                            if best_sid and best_sim >= block_thr:
+                                no_match_auto_enroll = {
+                                    "enabled": True,
+                                    "enrolled": False,
+                                    "reason": "possible_match",
+                                    "matched_subject_id": best_sid,
+                                    "similarity": float(best_sim),
+                                    "threshold": float(block_thr),
+                                }
+                                raise RuntimeError("skip_auto_enroll_possible_match")
+
+                            prefix = _no_match_auto_enroll_prefix()
+                            try:
+                                seq = store.next_counter(f"no_match_auto_enroll:{prefix}", start=1)
+                            except Exception:
+                                seq = int(_now_ts())
+                            new_subject_id = f"{prefix}-{int(seq)}"
+                            try:
+                                from qdrant_client.http.models import PointStruct
+                            except Exception as e:
+                                raise HTTPException(status_code=500, detail=f"qdrant client error: {str(e)}")
+
+                            nm_image_id = f"nm-{ev_id}"
+                            nm_point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{new_subject_id}:{ev_id}"))
+                            try:
+                                q.upsert(
+                                    collection_name=app.state.qdrant_collection,
+                                    points=[
+                                        PointStruct(
+                                            id=nm_point_id,
+                                            vector=np.asarray(emb, dtype=np.float32).reshape(-1).tolist(),
+                                            payload={
+                                                "subject_id": str(new_subject_id),
+                                                "image_id": str(nm_image_id),
+                                                "created_at": _iso_now(),
+                                                "thumb_path": thumb_path,
+                                                "image_path": img_path,
+                                                "source": "no_match_auto_enroll",
+                                                "event_id": str(ev_id),
+                                            },
+                                        )
+                                    ],
+                                    wait=True,
+                                )
+                                _add_recent_enrollment(emb, new_subject_id)
+                            except Exception as e:
+                                logger.error("auto-enroll upsert failed: %s", str(e))
+                                raise
+
+                            no_match_auto_enroll = {
+                                "enabled": True,
+                                "enrolled": True,
+                                "subject_id": new_subject_id,
+                            }
+                        except RuntimeError as e:
+                            if str(e) not in ("skip_auto_enroll_attached_existing", "skip_auto_enroll_possible_match"):
+                                logger.error("auto-enroll error: %s", str(e))
+                        except Exception as e:
+                            logger.error("auto-enroll error: %s", str(e))
                             no_match_auto_enroll = {
                                 "enabled": True,
                                 "enrolled": False,
-                                "reason": "attached_existing_visitor",
-                                "subject_id": str(best_sid),
-                                "similarity": float(best_sim),
-                                "threshold": float(attach_thr),
-                                "second_similarity": float(second_sim) if second_sim is not None else None,
-                                "margin_threshold": float(attach_margin_thr),
+                                "error": str(e),
                             }
-                            raise RuntimeError("skip_auto_enroll_attached_existing")
-
-                if best_sid and best_sim >= block_thr:
-                    no_match_auto_enroll = {
-                        "enabled": True,
-                        "enrolled": False,
-                        "reason": "possible_match",
-                        "matched_subject_id": best_sid,
-                        "similarity": float(best_sim),
-                        "threshold": float(block_thr),
-                    }
-                    raise RuntimeError("skip_auto_enroll_possible_match")
-
-                prefix = _no_match_auto_enroll_prefix()
-                try:
-                    seq = store.next_counter(f"no_match_auto_enroll:{prefix}", start=1)
-                except Exception:
-                    seq = int(_now_ts())
-                new_subject_id = f"{prefix}-{int(seq)}"
-                try:
-                    from qdrant_client.http.models import PointStruct
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"qdrant client error: {str(e)}")
-
-                nm_image_id = f"nm-{ev_id}"
-                nm_point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{new_subject_id}:{ev_id}"))
-                t0_up = _t()
-                try:
-                    q.upsert(
-                        collection_name=app.state.qdrant_collection,
-                        points=[
-                            PointStruct(
-                                id=nm_point_id,
-                                vector=np.asarray(emb, dtype=np.float32).reshape(-1).tolist(),
-                                payload={
-                                    "subject_id": str(new_subject_id),
-                                    "image_id": str(nm_image_id),
-                                    "created_at": _iso_now(),
-                                    "thumb_path": thumb_path,
-                                    "image_path": img_path,
-                                    "source": "no_match_auto_enroll",
-                                    "event_id": str(ev_id),
-                                    "camera": str(camera),
-                                },
-                            )
-                        ],
-                    )
-                    no_match_auto_enroll = {
-                        "enabled": True,
-                        "enrolled": True,
-                        "subject_id": str(new_subject_id),
-                        "point_id": str(nm_point_id),
-                    }
-                except Exception as e:
-                    _QDRANT_ERR.inc()
-                    no_match_auto_enroll = {
-                        "enabled": True,
-                        "enrolled": False,
-                        "error": str(e),
-                    }
-                finally:
-                    try:
-                        _QDRANT_UPSERT_LAT.observe(max(0.0, _t() - t0_up))
-                    except Exception:
-                        pass
             except Exception as e:
-                if str(e) == "skip_auto_enroll_possible_match":
-                    pass
-                elif str(e) == "skip_auto_enroll_attached_existing":
-                    pass
-                else:
+                logger.error("Lock-protected auto-enroll failed: %s", str(e))
+                if str(e) not in ("skip_auto_enroll_possible_match", "skip_auto_enroll_attached_existing"):
                     no_match_auto_enroll = {
                         "enabled": True,
                         "enrolled": False,
@@ -2641,6 +2800,7 @@ async def ingest_recognition_event(
 def list_recognition_events(
     camera: str | None = None,
     subject_id: str | None = None,
+    source_path: str | None = None,
     decision: str | None = None,
     min_similarity: float | None = None,
     max_similarity: float | None = None,
@@ -2666,6 +2826,7 @@ def list_recognition_events(
     items, next_cur = store.list_events(
         camera=camera,
         subject_id=subject_id,
+        source_path=source_path,
         decision=decision,
         min_similarity=min_similarity,
         max_similarity=max_similarity,
@@ -3126,7 +3287,6 @@ def stats() -> dict[str, Any]:
         app.state.enroll_events = [t for t in app.state.enroll_events if t >= cutoff]
     except Exception:
         app.state.enroll_events = []
-
     return {
         "subjects_total": subjects_total,
         "embeddings_total": embeddings_total,
@@ -3173,14 +3333,13 @@ def list_subjects(
     client = getattr(app.state, "qdrant", None)
     if client is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
-    limit = max(1, min(int(limit or 50), 500))
+    limit = max(1, min(int(limit or 50), 10000))
 
     qstr = str(q or "").strip().lower()
     want_filter = bool(qstr)
 
     try:
-        scan_limit = 5000 if want_filter else int(limit)
-        scan_limit = max(int(limit), min(int(scan_limit), 5000))
+        scan_limit = 10000
 
         points: list[Any] = []
         next_cur: Any = cursor
@@ -3219,8 +3378,6 @@ def list_subjects(
             if len(uniq) >= int(limit):
                 break
             if not next_cur:
-                break
-            if want_filter and scanned >= 20000:
                 break
 
         points = []

@@ -4,15 +4,50 @@ import StatCard from '../components/StatCard';
 
 function fmtTs(ts: number): string {
   try {
-    return new Date(ts * 1000).toLocaleString();
+    return new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    }).format(new Date(ts * 1000));
   } catch {
     return String(ts);
   }
 }
 
-function fmtSavedAt(ev: { image_saved_at?: number | null; ts: number }): string {
-  const t = ev.image_saved_at != null ? Number(ev.image_saved_at) : Number(ev.ts);
-  return fmtTs(t);
+function fmtTime(ts: number): string {
+  try {
+    return new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    }).format(new Date(ts * 1000));
+  } catch { return '--'; }
+}
+
+function fmtDate(ts: number): string {
+  try {
+    return new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric'
+    }).format(new Date(ts * 1000));
+  } catch { return '--'; }
+}
+
+function fmtDuration(seconds: number): string {
+  if (seconds <= 0) return '0m';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
 }
 
 type DecisionFilter = '' | 'match' | 'no_match' | 'rejected';
@@ -31,13 +66,38 @@ export default function Recognition() {
   const [minSim, setMinSim] = useState<string>('');
   const [maxSim, setMaxSim] = useState<string>('');
   const [nextCursor, setNextCursor] = useState<number | null>(null);
-  const pageSize = 200;
+  const pageSize = 100;
+
+  const [uniqueCount, setUniqueCount] = useState<number | null>(null);
+  const [uniqueCountLoading, setUniqueCountLoading] = useState<boolean>(false);
+  const [selectedEvent, setSelectedEvent] = useState<{ sid: string, events: RecognitionEvent[] } | null>(null);
   const [matchRefPath, setMatchRefPath] = useState<string | null>(null);
   const [subjectImgById, setSubjectImgById] = useState<Record<string, string>>({});
   const [dateMode, setDateMode] = useState<'all' | 'day' | 'range'>('all');
-  const [day, setDay] = useState<string>('');
-  const [fromDay, setFromDay] = useState<string>('');
-  const [toDay, setToDay] = useState<string>('');
+  const [day, setDay] = useState<string>(new Date().toLocaleDateString('en-CA'));
+  const [fromDay, setFromDay] = useState<string>(new Date().toLocaleDateString('en-CA'));
+  const [toDay, setToDay] = useState<string>(new Date().toLocaleDateString('en-CA'));
+
+  useEffect(() => {
+    // Attempt to find the most recent date from items if dateMode is 'all'
+    if (dateMode === 'all' && items.length > 0) {
+      // Use IST for date extraction to match the display
+      const validTss = items.map(it => Number(it.ts || 0)).filter(t => t > 0);
+      if (validTss.length > 0) {
+        const latestTs = Math.max(...validTss);
+        const latestDate = new Intl.DateTimeFormat('en-CA', {
+          timeZone: 'Asia/Kolkata',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit'
+        }).format(new Date(latestTs * 1000));
+
+        setDay(latestDate);
+        setFromDay(latestDate);
+        setToDay(latestDate);
+      }
+    }
+  }, [items, dateMode]);
 
   async function setFeedback(evId: string, label: EventFeedbackLabel) {
     const eventId = String(evId || '').trim();
@@ -86,6 +146,31 @@ export default function Recognition() {
     return Array.from(s).sort();
   }, [cameraOptions, items]);
 
+  useEffect(() => {
+    let cancelled = false;
+    async function loadUniqueCount() {
+      setUniqueCountLoading(true);
+      try {
+        const resp = await recognitionStats({
+          day: dateMode === 'day' ? (day || null) : null,
+          from_day: dateMode === 'range' ? (fromDay || null) : null,
+          to_day: dateMode === 'range' ? (toDay || null) : null,
+          camera: camera || undefined
+        });
+        if (cancelled) return;
+        setUniqueCount(resp.unique_matches ?? resp.match ?? 0);
+      } catch (e) {
+        console.error('Failed to load unique count', e);
+      } finally {
+        if (!cancelled) setUniqueCountLoading(false);
+      }
+    }
+    loadUniqueCount();
+    return () => {
+      cancelled = true;
+    };
+  }, [day, fromDay, toDay, dateMode, camera]);
+
   async function loadStats() {
     setLoadingStats(true);
     try {
@@ -106,9 +191,6 @@ export default function Recognition() {
   async function load(reset: boolean = true) {
     setLoading(true);
     setErr(null);
-    if (reset) {
-      loadStats();
-    }
     try {
       const cur = reset ? null : nextCursor;
       const resp = await recognitionEvents({
@@ -186,7 +268,12 @@ export default function Recognition() {
     setNextCursor(null);
     load(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [decision, camera, subjectId, pageSize, dateMode, day, fromDay, toDay]);
+  }, [decision, camera, subjectId, dateMode, day, fromDay, toDay]);
+
+  useEffect(() => {
+    loadStats();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [camera, dateMode, day, fromDay, toDay]);
 
   useEffect(() => {
     setNextCursor(null);
@@ -201,6 +288,57 @@ export default function Recognition() {
     if (subjectId) out = out.filter(i => String(i.subject_id || '') === subjectId);
     return out;
   }, [items, decision, camera, subjectId]);
+
+  const displayRows = useMemo(() => {
+    const groupMatches = decision === '' || decision === 'match';
+    if (groupMatches) {
+      const map = new Map<string, RecognitionEvent[]>();
+      const singles: { type: 'single', key: string, event: RecognitionEvent }[] = [];
+
+      for (const it of filtered) {
+        const d = String(it.decision || '').trim();
+        if (d !== 'match') {
+          singles.push({ type: 'single', key: it.event_id, event: it });
+          continue;
+        }
+
+        const sid = String(it.subject_id || '').trim();
+        if (!sid) {
+          singles.push({ type: 'single', key: it.event_id, event: it });
+          continue;
+        }
+
+        const dateKey = new Date(Number(it.ts || 0) * 1000).toLocaleDateString('en-CA');
+        const key = `${sid}:${dateKey}`;
+        const arr = map.get(key) || [];
+        arr.push(it);
+        map.set(key, arr);
+      }
+
+      const groups = Array.from(map.entries()).map(([key, evs]) => {
+        const sorted = evs.sort((e1, e2) => e1.ts - e2.ts); // Chronological order
+        const sid = key.split(':')[0];
+        const duration = sorted[sorted.length - 1].ts - sorted[0].ts;
+        return { type: 'grouped' as const, key, sid, events: sorted, duration };
+      });
+
+      const all = [...groups, ...singles.map(s => ({ ...s, duration: 0 }))];
+      all.sort((a, b) => {
+        // Primary sort: Duration (highest first)
+        const durA = (a as any).duration || 0;
+        const durB = (b as any).duration || 0;
+        if (durB !== durA) return durB - durA;
+
+        // Secondary sort: Timestamp (newest first)
+        const ta = a.type === 'grouped' ? (a.events?.[0]?.ts ?? 0) : (a.event?.ts ?? 0);
+        const tb = b.type === 'grouped' ? (b.events?.[0]?.ts ?? 0) : (b.event?.ts ?? 0);
+        return Number(tb) - Number(ta);
+      });
+      return all;
+    } else {
+      return filtered.map(ev => ({ type: 'single' as const, key: ev.event_id, event: ev }));
+    }
+  }, [filtered, decision]);
 
   const matchRefSubjectId = useMemo(() => {
     if (decision !== 'match') return null;
@@ -288,9 +426,16 @@ export default function Recognition() {
             Explore full recognition history with advanced filters.
           </div>
         </div>
-        <div style={{ display: 'flex', gap: '8px' }}>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <div className="card" style={{ padding: '8px 16px', display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: '140px', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)' }}>
+            <span style={{ fontSize: '0.65rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Unique Count</span>
+            <span style={{ fontSize: '1.25rem', fontWeight: 800, color: 'var(--primary)' }}>
+              {uniqueCountLoading ? '...' : (uniqueCount ?? 0)}
+            </span>
+          </div>
           <button
             onClick={() => {
+              const today = new Date().toLocaleDateString('en-CA');
               setNextCursor(null);
               setCamera('');
               setDecision('');
@@ -298,6 +443,9 @@ export default function Recognition() {
               setMinSim('');
               setMaxSim('');
               setDateMode('all');
+              setDay(today);
+              setFromDay(today);
+              setToDay(today);
               load(true);
             }}
             style={{ fontWeight: 600 }}
@@ -430,89 +578,149 @@ export default function Recognition() {
         </div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: '20px' }}>
-        {items.map(ev => (
-          <div key={ev.event_id} className="card" style={{ display: 'flex', flexDirection: 'column', gap: '10px', padding: '10px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-              <div style={{ overflow: 'hidden' }}>
-                <h4 style={{ fontWeight: 700, fontSize: '0.875rem', color: 'var(--text-primary)', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{ev.camera || 'Unknown'}</h4>
-                <div style={{ fontSize: '0.6875rem', color: 'var(--text-muted)', fontWeight: 500 }}>{fmtSavedAt(ev)}</div>
-              </div>
+      {/* Table Header */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '40px 100px 1.2fr 180px 1fr 150px 150px 80px 60px',
+        gap: '12px',
+        padding: '12px 20px',
+        background: 'var(--bg-secondary)',
+        borderRadius: 'var(--radius-md)',
+        fontWeight: 700,
+        fontSize: '0.75rem',
+        color: 'var(--text-muted)',
+        textTransform: 'uppercase',
+        border: '1px solid var(--border)',
+        alignItems: 'center'
+      }}>
+        <span>#</span>
+        <span>Status</span>
+        <span>Subject ID</span>
+        <span>Customer Images</span>
+        <span>Camera Name</span>
+        <span>Entry Time</span>
+        <span>Exit Time</span>
+        <span>Duration</span>
+        <span style={{ textAlign: 'center' }}>View</span>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {displayRows.map((row, idx) => {
+          const isGrouped = row.type === 'grouped';
+          const events = isGrouped ? row.events : [row.event];
+          const firstEv = events[0];
+          const lastEv = events[events.length - 1];
+          const sid = isGrouped ? row.sid : (lastEv.subject_id || '—');
+          const ref = subjectImgById[sid] || '';
+          const duration = lastEv.ts - firstEv.ts;
+
+          const cameras = Array.from(new Set(events.map(e => e.camera))).join(', ');
+
+          return (
+            <div
+              key={row.key}
+              className="card"
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '40px 100px 1.2fr 180px 1fr 150px 150px 80px 60px',
+                gap: '12px',
+                padding: '12px 20px',
+                alignItems: 'center',
+                transition: 'transform 0.2s, box-shadow 0.2s',
+                cursor: 'default'
+              }}
+            >
+              <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', fontWeight: 600 }}>{idx + 1}</div>
+
+              {/* Status */}
               <div style={{
                 padding: '1px 8px',
-                borderRadius: '99px',
+                borderRadius: '4px',
                 fontSize: '0.625rem',
                 fontWeight: 700,
                 textTransform: 'uppercase',
-                background: ev.decision === 'match' ? 'rgba(16, 185, 129, 0.1)' : ev.decision === 'no_match' ? 'rgba(107, 114, 128, 0.1)' : 'rgba(239, 68, 68, 0.1)',
-                color: ev.decision === 'match' ? 'var(--success)' : ev.decision === 'no_match' ? 'var(--text-secondary)' : 'var(--error)',
-                border: `1px solid ${ev.decision === 'match' ? 'rgba(16, 185, 129, 0.2)' : ev.decision === 'no_match' ? 'var(--border)' : 'rgba(239, 68, 68, 0.2)'}`
+                textAlign: 'center',
+                background: lastEv.decision === 'match' ? 'rgba(16, 185, 129, 0.1)' : lastEv.decision === 'no_match' ? 'rgba(107, 114, 128, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                color: lastEv.decision === 'match' ? 'var(--success)' : lastEv.decision === 'no_match' ? 'var(--text-secondary)' : 'var(--error)',
+                border: `1px solid ${lastEv.decision === 'match' ? 'rgba(16, 185, 129, 0.2)' : lastEv.decision === 'no_match' ? 'var(--border)' : 'rgba(239, 68, 68, 0.2)'}`
               }}>
-                {ev.decision}
+                {lastEv.decision}
+              </div>
+
+              {/* Subject ID */}
+              <div style={{ fontWeight: 700, fontSize: '0.875rem', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {sid}
+              </div>
+
+              {/* Customer Images */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                <div style={{ display: 'flex', gap: '4px', height: '60px' }}>
+                  <div style={{ flex: 1, borderRadius: '4px', overflow: 'hidden', border: '1px solid var(--border)', background: 'var(--bg-secondary)', position: 'relative' }}>
+                    {ref ? (
+                      <img src={`${getApiBase()}${ref}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    ) : (
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem' }}>REF</div>
+                    )}
+                  </div>
+                  <div style={{ flex: 1, borderRadius: '4px', overflow: 'hidden', border: '1px solid var(--border)', background: 'var(--bg-secondary)', position: 'relative' }}>
+                    {lastEv.image_path ? (
+                      <img src={`${getApiBase()}${lastEv.image_path}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    ) : (
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem' }}>LIVE</div>
+                    )}
+                  </div>
+                </div>
+                {/* Similarity Bar */}
+                {lastEv.decision === 'match' && (
+                  <div style={{ height: '14px', background: 'var(--bg-secondary)', borderRadius: '2px', overflow: 'hidden', border: '1px solid var(--border)', position: 'relative' }}>
+                    <div style={{
+                      width: `${(lastEv.similarity || 0) * 100}%`,
+                      height: '100%',
+                      background: 'var(--success)',
+                      opacity: 0.8
+                    }} />
+                    <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '9px', fontWeight: 800, color: (lastEv.similarity || 0) > 0.5 ? 'white' : 'var(--text-primary)' }}>
+                      {((lastEv.similarity || 0) * 100).toFixed(0)}%
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Camera Name */}
+              <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={cameras}>
+                {cameras}
+              </div>
+
+              {/* Entry Time */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                <div style={{ fontSize: '0.8125rem', fontWeight: 600 }}>{fmtDate(firstEv.ts)}</div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{fmtTime(firstEv.ts)}</div>
+              </div>
+
+              {/* Exit Time */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                <div style={{ fontSize: '0.8125rem', fontWeight: 600 }}>{fmtDate(lastEv.ts)}</div>
+                <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{fmtTime(lastEv.ts)}</div>
+              </div>
+
+              {/* Duration */}
+              <div style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--text-primary)' }}>
+                {lastEv.decision === 'match' ? fmtDuration(duration) : '—'}
+              </div>
+
+              {/* Action */}
+              <div style={{ display: 'flex', justifyContent: 'center' }}>
+                <button
+                  onClick={() => setSelectedEvent({ sid, events })}
+                  style={{ padding: '6px', minWidth: 'auto', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '6px', cursor: 'pointer' }}
+                  title="Expand View"
+                >
+                  <span style={{ fontSize: '1rem' }}>⛶</span>
+                </button>
               </div>
             </div>
-
-            <div style={{ height: '150px', borderRadius: 'var(--radius-md)', overflow: 'hidden', background: 'var(--bg-secondary)', display: 'flex', gap: '2px' }}>
-              {(() => {
-                const group = String(subjectId || '').trim();
-                const isMatch = String(ev.decision || '') === 'match';
-                const sid = String(ev.subject_id || '').trim();
-                const ref = !group && isMatch && sid ? (subjectImgById[sid] || '') : '';
-
-                if (ref) {
-                  return (
-                    <>
-                      <div style={{ flex: 1, position: 'relative' }}>
-                        <img src={`${getApiBase()}${ref}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                        <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '4px', background: 'rgba(0,0,0,0.5)', color: 'white', fontSize: '0.625rem', textAlign: 'center' }}>REF</div>
-                      </div>
-                      <div style={{ flex: 1, position: 'relative' }}>
-                        {ev.image_path ? (
-                          <img src={`${getApiBase()}${ev.image_path}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                        ) : (
-                          <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.75rem', color: 'var(--text-muted)' }}>NO IMG</div>
-                        )}
-                        <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '4px', background: 'rgba(0,0,0,0.5)', color: 'white', fontSize: '0.625rem', textAlign: 'center' }}>LIVE</div>
-                      </div>
-                    </>
-                  );
-                }
-                return ev.image_path ? (
-                  <img src={`${getApiBase()}${ev.image_path}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                ) : (
-                  <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: '0.875rem' }}>No Image</div>
-                );
-              })()}
-            </div>
-
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', paddingBottom: '8px', borderBottom: '1px solid var(--border)' }}>
-              <button
-                onClick={() => setFeedback(ev.event_id, 'tp')}
-                style={{ flex: 1, fontSize: '0.625rem', padding: '2px', background: String(ev.feedback_label || '') === 'tp' ? 'var(--success)' : 'transparent', color: String(ev.feedback_label || '') === 'tp' ? 'white' : 'var(--text-secondary)' }}
-              >TP</button>
-              <button
-                onClick={() => setFeedback(ev.event_id, 'fp')}
-                style={{ flex: 1, fontSize: '0.625rem', padding: '2px', background: String(ev.feedback_label || '') === 'fp' ? 'var(--error)' : 'transparent', color: String(ev.feedback_label || '') === 'fp' ? 'white' : 'var(--text-secondary)' }}
-              >FP</button>
-              <button onClick={() => setFeedback(ev.event_id, '')} style={{ flex: 0.4, fontSize: '0.625rem', padding: '2px' }}>✕</button>
-            </div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr', gap: '4px', fontSize: '0.75rem' }}>
-              <span style={{ color: 'var(--text-muted)', fontWeight: 500 }}>Subject</span>
-              <span style={{ fontWeight: 600, color: 'var(--text-primary)', wordBreak: 'break-all', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={ev.subject_id || undefined}>{ev.subject_id || '—'}</span>
-
-              <span style={{ color: 'var(--text-muted)', fontWeight: 500 }}>Sim</span>
-              <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{ev.similarity != null ? ev.similarity.toFixed(4) : '—'}</span>
-            </div>
-
-            <details style={{ cursor: 'pointer' }}>
-              <summary style={{ fontSize: '0.625rem', color: 'var(--primary)', fontWeight: 600 }}>Performance Info</summary>
-              <div style={{ marginTop: '4px', padding: '6px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-sm)', fontSize: '0.625rem', color: 'var(--text-secondary)' }}>
-                Processing: {ev.processing_ms || '—'}ms
-              </div>
-            </details>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       <footer style={{ display: 'flex', justifyContent: 'center', padding: '16px' }}>
@@ -525,6 +733,56 @@ export default function Recognition() {
           {loadingMore ? 'Loading...' : (nextCursor == null ? 'No More Records' : 'Load More Results')}
         </button>
       </footer>
+
+      {/* Full View Modal */}
+      {selectedEvent && (
+        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '40px' }}>
+          <div className="card" style={{ width: '100%', maxWidth: '1000px', maxHeight: '90vh', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '24px', padding: '32px', position: 'relative' }}>
+            <button
+              onClick={() => setSelectedEvent(null)}
+              style={{ position: 'absolute', top: 16, right: 16, border: 'none', background: 'transparent', cursor: 'pointer', fontSize: '1.5rem', color: 'var(--text-muted)' }}
+            >
+              ✕
+            </button>
+
+            <div style={{ display: 'flex', gap: '24px', alignItems: 'center' }}>
+              <div style={{ width: '120px', height: '120px', borderRadius: 'var(--radius-md)', overflow: 'hidden', border: '2px solid var(--primary)', background: 'var(--bg-secondary)' }}>
+                {subjectImgById[selectedEvent.sid] && <img src={`${getApiBase()}${subjectImgById[selectedEvent.sid]}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
+              </div>
+              <div>
+                <h2 style={{ fontSize: '1.5rem', fontWeight: 800 }}>{selectedEvent.sid}</h2>
+                <div style={{ marginTop: '8px', fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
+                  Showing {selectedEvent.events.length} records.
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '20px' }}>
+              {selectedEvent.events.map(ev => (
+                <div key={ev.event_id} style={{ borderRadius: 'var(--radius-md)', overflow: 'hidden', background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}>
+                  <div style={{ height: '160px', position: 'relative' }}>
+                    <img src={`${getApiBase()}${ev.image_path}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    <div style={{ position: 'absolute', top: 8, right: 8, padding: '4px 8px', background: 'rgba(0,0,0,0.6)', color: 'white', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 700 }}>
+                      {ev.similarity != null ? (ev.similarity * 100).toFixed(1) : '--'}%
+                    </div>
+                  </div>
+                  <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    <div style={{ fontSize: '0.8125rem', fontWeight: 700 }}>{ev.camera}</div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{fmtTs(ev.ts)}</div>
+                    <div style={{ fontSize: '0.625rem', color: 'var(--text-muted)', fontFamily: 'monospace', opacity: 0.8, marginTop: '2px' }}>
+                      ID: {ev.event_id}
+                    </div>
+                    <div style={{ display: 'flex', gap: '4px', marginTop: '8px' }}>
+                      <button onClick={() => setFeedback(ev.event_id, 'tp')} style={{ flex: 1, padding: '4px', fontSize: '0.625rem', background: ev.feedback_label === 'tp' ? 'var(--success)' : 'transparent', color: ev.feedback_label === 'tp' ? 'white' : 'inherit' }}>TP</button>
+                      <button onClick={() => setFeedback(ev.event_id, 'fp')} style={{ flex: 1, padding: '4px', fontSize: '0.625rem', background: ev.feedback_label === 'fp' ? 'var(--error)' : 'transparent', color: ev.feedback_label === 'fp' ? 'white' : 'inherit' }}>FP</button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -37,7 +37,8 @@ services:
       - FACE_DIR=/data/facefolder/security
       - CONFIG_PATH=/app/config.yaml
       - QDRANT_URL=http://qdrant:6333
-      - QDRANT_COLLECTION=frigate_faces_v10
+      - QDRANT_COLLECTION=frigate_faces_v20
+      # - QDRANT_COLLECTION=frigate_faces_v10
       # - QDRANT_COLLECTION=frigate_faces_v3
       # - QDRANT_COLLECTION=frigate_faces_v2
       # - QDRANT_COLLECTION=frigate_faces old emp db
@@ -57,20 +58,25 @@ services:
       - GPU_INFERENCE_MANAGER=1
       - GPU_QUEUE_MAX=256
       - GPU_BATCH_WINDOW_MS=0
+      - FACE_SERVICE_MAX_FACES_PER_IMAGE=1
+      - FACE_SERVICE_FORCE_SINGLE_FACE=1
+      - FACE_MIN_RESOLUTION=40
+      - FACE_QUALITY_FACE_RATIO_MIN=0.01
+      - FACE_QUALITY_BLUR_MIN=35
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://face.service.tools.thefusionapps.com}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - AUTO_ADD_EMBEDDING_ENABLE=1
-      - AUTO_ADD_EMBEDDING_MIN_SIM=0.80
+      - AUTO_ADD_EMBEDDING_MIN_SIM=0.75
       - SUBJECT_MAX_EMBEDDINGS=10
       - ENROLL_DUPLICATE_CHECK_ENABLE=1
-      - ENROLL_DUPLICATE_MIN_SIM=0.75
+      - ENROLL_DUPLICATE_MIN_SIM=0.55
       - NO_MATCH_AUTO_ENROLL_ENABLE=1
       - NO_MATCH_AUTO_ENROLL_PREFIX=visiter
       - NO_MATCH_AUTO_ENROLL_BLOCK_MIN_SIM=0.70
       - DATE_WISE_RECOGNITION_FALLBACK_MASTER=0
-      - NO_MATCH_AUTO_ATTACH_MIN_SIM=0.70
-      - NO_MATCH_AUTO_ATTACH_MIN_MARGIN=0.10
+      - NO_MATCH_AUTO_ATTACH_MIN_SIM=0.55
+      - NO_MATCH_AUTO_ATTACH_MIN_MARGIN=0.08
     ports:
       - "8001:8000"
 
@@ -82,34 +88,50 @@ services:
               count: 1
               capabilities: [gpu]
 
-  sftp_poller:
-    container_name: sftp_poller
+  # sftp_poller:
+  #   container_name: sftp_poller
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - face_service
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   command: ["python3.11", "sftp_poller.py"]
+  #   environment:
+  #     - CONFIG_PATH=/app/config.yaml
+  #     - API_BASE_URL=http://face_service:8000
+  #     - SFTP_API_PATH=/v1/events/recognition
+  #     - SFTP_BASE_PATH=
+  #     - SFTP_CAMERAS_ALLOWLIST=EM-DEPT-Entrance,EM-DEPT-EXIT,BR=TMJ-CBE__ZN=Basement__IO=EXIT__CAM=Basement-Lift,BR=TMJ-CBE__ZN=FirstFloor__IO=ENTRY__CAM=FF-Lift-Entry,BR=TMJ-CBE__ZN=FirstFloor__IO=ENTRY__CAM=FirstFloor-Lift,BR=TMJ-CBE__ZN=GF-Billing__IO=BILLING__CAM=GF-Billing-1,BR=TMJ-CBE__ZN=GF-Billing__IO=BILLING__CAM=GF-Billing-2,BR=TMJ-CBE__ZN=GroundFloor__IO=ENTRY__CAM=GroundFloor-Stair,BR=TMJ-CBE__ZN=GroundFloor__IO=ENTRY__CAM=GroundFloor-Lift,BR=TMJ-CBE__ZN=Scheme-Billing__IO=BILLING__CAM=FF-Scheme-Bill
+  #     # - SFTP_BASE_PATH=/TMJ-CBE-Entry
+  #     # - SFTP_CAMERAS_ALLOWLIST=processed
+  #     - SFTP_PROCESSED_DIRNAME=
+  #     # - SFTP_FILENAME_INCLUDE_ANY=
+  #     # - SFTP_FILENAME_EXCLUDE_ANY=
+  #     - SFTP_FILENAME_INCLUDE_ANY=FACE_SNAP
+  #     - SFTP_FILENAME_EXCLUDE_ANY=FACE_BACKGROUND
+
+  external_api_poller:
+    container_name: external_api_poller
     restart: unless-stopped
     depends_on:
       - face_service
     build:
       context: .
       dockerfile: Dockerfile
-    command: ["python3.11", "sftp_poller.py"]
+    command: ["python3.11", "external_api_poller.py"]
     environment:
       - CONFIG_PATH=/app/config.yaml
       - API_BASE_URL=http://face_service:8000
-      - SFTP_API_PATH=/v1/events/recognition
-      - SFTP_BASE_PATH=
-      - SFTP_CAMERAS_ALLOWLIST=EM-DEPT-Entrance,EM-DEPT-EXIT,BR=TMJ-CBE__ZN=Basement__IO=EXIT__CAM=Basement-Lift,BR=TMJ-CBE__ZN=FirstFloor__IO=ENTRY__CAM=FF-Lift-Entry,BR=TMJ-CBE__ZN=FirstFloor__IO=ENTRY__CAM=FirstFloor-Lift,BR=TMJ-CBE__ZN=GF-Billing__IO=BILLING__CAM=GF-Billing-1,BR=TMJ-CBE__ZN=GF-Billing__IO=BILLING__CAM=GF-Billing-2,BR=TMJ-CBE__ZN=GroundFloor__IO=ENTRY__CAM=GroundFloor-Stair,BR=TMJ-CBE__ZN=GroundFloor__IO=ENTRY__CAM=GroundFloor-Lift,BR=TMJ-CBE__ZN=Scheme-Billing__IO=BILLING__CAM=FF-Scheme-Bill
-      # - SFTP_BASE_PATH=/TMJ-CBE-Entry
-      # - SFTP_CAMERAS_ALLOWLIST=processed
-      - SFTP_PROCESSED_DIRNAME=
-      # - SFTP_FILENAME_INCLUDE_ANY=
-      # - SFTP_FILENAME_EXCLUDE_ANY=
-      - SFTP_FILENAME_INCLUDE_ANY=FACE_SNAP
-      - SFTP_FILENAME_EXCLUDE_ANY=FACE_BACKGROUND
+      - SYNC_DATE=${SYNC_DATE:-2026-04-19}
+
       - SFTP_MAX_FILES_PER_CAMERA_PER_TICK=500
       - SFTP_TIMEZONE=Asia/Kolkata
-      - SFTP_SINCE_DATETIME=07-03-2026:09 pm
-      - SFTP_UNTIL_DATETIME=02-03-2026:10 pm
+      - SFTP_SINCE_DATETIME=19-04-2026:12 am
+      - SFTP_UNTIL_DATETIME=20-04-2026:1 am
     volumes:
       - ./config.yaml:/app/config.yaml:ro
+      - ./external_api_poller.py:/app/external_api_poller.py:ro
 
   qdrant:
     image: qdrant/qdrant:latest

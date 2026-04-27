@@ -146,13 +146,22 @@ class EventsStore:
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_ts ON recognition_events (ts DESC)"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recognition_events_sort_ts ON recognition_events (COALESCE(image_saved_at, ts) DESC)"
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_subject ON recognition_events (subject_id)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_camera ON recognition_events (camera)"
             )
             conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recognition_events_combined ON recognition_events (camera, decision, ts DESC)"
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_feedback_label ON recognition_events (feedback_label)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recognition_events_decision ON recognition_events (decision)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_search_events_ts ON search_events (ts DESC)"
@@ -243,6 +252,7 @@ class EventsStore:
         *,
         camera: str | None = None,
         subject_id: str | None = None,
+        source_path: str | None = None,
         decision: str | None = None,
         min_similarity: float | None = None,
         max_similarity: float | None = None,
@@ -261,6 +271,9 @@ class EventsStore:
         if subject_id:
             where.append("subject_id = ?")
             args.append(str(subject_id))
+        if source_path:
+            where.append("source_path = ?")
+            args.append(str(source_path))
         if decision:
             where.append("decision = ?")
             args.append(str(decision))
@@ -473,15 +486,25 @@ class EventsStore:
             sql += " WHERE " + " AND ".join(where)
         sql += " GROUP BY decision, camera"
 
+        # Unique Match Count (Distinct Subject IDs)
+        sql_unique = "SELECT COUNT(DISTINCT subject_id) as unique_matches FROM recognition_events"
+        where_match = where + ["decision = 'match'", "subject_id IS NOT NULL"]
+        if where_match:
+            sql_unique += " WHERE " + " AND ".join(where_match)
+
         total = 0
         match = 0
         no_match = 0
         rejection = 0
+        unique_matches = 0
         by_camera: dict[str, dict[str, int]] = {}
 
         with self._lock:
             with self._connect() as conn:
                 rows = conn.execute(sql, args).fetchall()
+                row_unique = conn.execute(sql_unique, args).fetchone()
+                if row_unique:
+                    unique_matches = int(row_unique["unique_matches"] or 0)
 
         for r in rows:
             d = str(r["decision"] or "").strip().lower()
@@ -510,6 +533,7 @@ class EventsStore:
             "match": match,
             "no_match": no_match,
             "rejection": rejection,
+            "unique_matches": unique_matches,
             "by_camera": by_camera
         }
 

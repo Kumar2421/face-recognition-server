@@ -143,8 +143,8 @@ def _get_employee_mean_embeddings(request: Request) -> tuple[list[str], np.ndarr
     counts: dict[str, int] = {}
     next_cur: Any = None
     scanned = 0
-    max_scan = int(os.environ.get("CROSSCHECK_QDRANT_MAX_SCAN", "20000") or "20000")
-    batch_limit = int(os.environ.get("CROSSCHECK_QDRANT_BATCH", "256") or "256")
+    max_scan = int(os.environ.get("CROSSCHECK_QDRANT_MAX_SCAN", "100000") or "100000")
+    batch_limit = int(os.environ.get("CROSSCHECK_QDRANT_BATCH", "512") or "512")
 
     while scanned < max_scan:
         kwargs: dict[str, Any] = {
