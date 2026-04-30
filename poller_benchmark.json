@@ -1,0 +1,16 @@
+{
+    "date": "2026-04-19",
+    "start_time": "2026-04-30T10:10:21.185180",
+    "total_api_events": 167674,
+    "processed_count": 891,
+    "success_count": 891,
+    "failure_count": 0,
+    "skipped_count": 3359,
+    "pages_processed": 20,
+    "last_id_seen": "12416262",
+    "avg_model_ms": 63.951739618406286,
+    "avg_processing_ms": 21.455667789001122,
+    "total_model_ms": 56981.0,
+    "total_processing_ms": 19117.0,
+    "end_time": "2026-04-30T10:16:48.432621"
+}

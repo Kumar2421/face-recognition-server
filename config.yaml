@@ -13,27 +13,28 @@ sftp:
   poll_interval_sec: 60
   # processed_dirname: "processed"
 
+
 external_api:
   enabled: true
   base_url: "https://live.thefusionapps.com"
-  jwt_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyRGF0YSI6eyJpZCI6MTAsInVzZXJOYW1lIjoiRnVzaW9uIFN1cHBvcnQiLCJ0ZW5hbnRJZCI6MTAsInJvbGUiOiJ0ZW5hbnQiLCJzbHVnIjoiYW5hbHl0aWNzIn0sImJyYW5jaERhdGEiOnsiaWQiOjUyLCJicmFuY2hJZCI6IlRNSi1DQkUifSwiaWF0IjoxNzc3MjYyNzgyLCJleHAiOjE3NzczNDkxODJ9.GhfNjjwVnj87SZx2CxisyxiyCuubxD9JfS0X6eQeRo8"
-  poll_interval_sec: 300
-
+  jwt_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyRGF0YSI6eyJpZCI6MTAsInVzZXJOYW1lIjoiRnVzaW9uIFN1cHBvcnQiLCJ0ZW5hbnRJZCI6MTAsInJvbGUiOiJ0ZW5hbnQiLCJzbHVnIjoiYW5hbHl0aWNzIn0sImJyYW5jaERhdGEiOnsiaWQiOjUyLCJicmFuY2hJZCI6IlRNSi1DQkUifSwiaWF0IjoxNzc3NTI5MzgxLCJleHAiOjE3Nzc2MTU3ODF9.7INaT-cuBlPLFO6qi1a7SZJTY4PkSPErLjvsIx0Pk_c"
+ 
 recognition:
-  min_similarity: 0.55
+  min_similarity: 0.60
   top_k: 6
-  min_top2_margin: 0.08
+  min_top2_margin: 0.12
   top2_high_conf_sim: 0.40
+
 
 quality:
   min_blur: 50.0
-  min_face_ratio: 0.03
-  min_brightness: 25.0
+  min_face_ratio: 0.05
+  min_brightness: 28.0
   max_brightness: 220.0
-  min_landmark_conf: 0.3
+  min_landmark_conf: 0.5
   max_abs_yaw: 70
   max_abs_pitch: 60
-  min_resolution: 50
+  min_resolution: 60
 
   
 # POST /v1/events/recognition/forward this is forword api for send no match / match images 

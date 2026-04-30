@@ -37,7 +37,7 @@ services:
       - FACE_DIR=/data/facefolder/security
       - CONFIG_PATH=/app/config.yaml
       - QDRANT_URL=http://qdrant:6333
-      - QDRANT_COLLECTION=frigate_faces_v20
+      - QDRANT_COLLECTION=frigate_faces_v24
       # - QDRANT_COLLECTION=frigate_faces_v10
       # - QDRANT_COLLECTION=frigate_faces_v3
       # - QDRANT_COLLECTION=frigate_faces_v2
@@ -67,10 +67,10 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - AUTO_ADD_EMBEDDING_ENABLE=1
-      - AUTO_ADD_EMBEDDING_MIN_SIM=0.75
+      - AUTO_ADD_EMBEDDING_MIN_SIM=0.80
       - SUBJECT_MAX_EMBEDDINGS=10
       - ENROLL_DUPLICATE_CHECK_ENABLE=1
-      - ENROLL_DUPLICATE_MIN_SIM=0.55
+      - ENROLL_DUPLICATE_MIN_SIM=0.80
       - NO_MATCH_AUTO_ENROLL_ENABLE=1
       - NO_MATCH_AUTO_ENROLL_PREFIX=visiter
       - NO_MATCH_AUTO_ENROLL_BLOCK_MIN_SIM=0.70
@@ -123,15 +123,14 @@ services:
     environment:
       - CONFIG_PATH=/app/config.yaml
       - API_BASE_URL=http://face_service:8000
-      - SYNC_DATE=${SYNC_DATE:-2026-04-19}
+      - SYNC_DATE=${SYNC_DATE:-2026-04-18}
 
       - SFTP_MAX_FILES_PER_CAMERA_PER_TICK=500
       - SFTP_TIMEZONE=Asia/Kolkata
       - SFTP_SINCE_DATETIME=19-04-2026:12 am
       - SFTP_UNTIL_DATETIME=20-04-2026:1 am
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
-      - ./external_api_poller.py:/app/external_api_poller.py:ro
+      - .:/app:rw
 
   qdrant:
     image: qdrant/qdrant:latest
