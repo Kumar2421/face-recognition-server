@@ -6,10 +6,21 @@ export function getApiBase(): string {
   return (import.meta.env.VITE_API_BASE as string) || 'http://localhost:8001';
 }
 
+export function getApiKey(): string {
+  try {
+    const saved = localStorage.getItem('api_key');
+    if (saved && saved.trim()) return saved.trim();
+  } catch { }
+  return (import.meta.env.VITE_API_KEY as string) || '';
+}
+
 export async function apiGet<T = any>(path: string): Promise<T> {
   const r = await fetch(`${getApiBase()}${path}`, {
     cache: 'no-store',
-    headers: { 'Cache-Control': 'no-cache' },
+    headers: { 
+      'Cache-Control': 'no-cache',
+      'x-api-key': getApiKey()
+    },
   });
   if (!r.ok) throw new Error(`GET ${path} failed: ${r.status}`);
   return r.json();
@@ -18,7 +29,11 @@ export async function apiGet<T = any>(path: string): Promise<T> {
 export async function apiPostJson<T = any>(path: string, body: any, headers: Record<string, string> = {}): Promise<T> {
   const r = await fetch(`${getApiBase()}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { 
+      'Content-Type': 'application/json', 
+      'x-api-key': getApiKey(),
+      ...headers 
+    },
     body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(`POST ${path} failed: ${r.status}`);
@@ -28,6 +43,9 @@ export async function apiPostJson<T = any>(path: string, body: any, headers: Rec
 export async function apiPostForm<T = any>(path: string, form: FormData): Promise<T> {
   const r = await fetch(`${getApiBase()}${path}`, {
     method: 'POST',
+    headers: {
+      'x-api-key': getApiKey(),
+    },
     body: form,
   });
   if (!r.ok) {
@@ -42,7 +60,12 @@ export async function apiPostForm<T = any>(path: string, form: FormData): Promis
 }
 
 export async function apiDelete<T = any>(path: string): Promise<T> {
-  const r = await fetch(`${getApiBase()}${path}`, { method: 'DELETE' });
+  const r = await fetch(`${getApiBase()}${path}`, { 
+    method: 'DELETE',
+    headers: {
+      'x-api-key': getApiKey()
+    }
+  });
   if (!r.ok) throw new Error(`DELETE ${path} failed: ${r.status}`);
   return r.json();
 }

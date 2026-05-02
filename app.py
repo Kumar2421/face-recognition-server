@@ -16,7 +16,8 @@ from urllib.parse import urlparse
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, Depends, Security
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -43,6 +44,26 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 logger = logging.getLogger("uvicorn.error")
+
+# NOTE: Do NOT capture API_KEY at module load time.
+# config.yaml is applied via apply_env_defaults_from_config() inside @app.on_event("startup"),
+# which runs AFTER this module is imported. Reading the key here would always get the
+# fallback 'your-secret-key' even when config.yaml has a proper key set.
+API_KEY_NAME = "x-api-key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+def _get_api_key() -> str:
+    """Read the expected API key at request time so config.yaml-sourced values are honoured."""
+    return os.environ.get("FACE_SERVICE_API_KEY", "your-secret-key")
+
+async def get_api_key(header_value: str = Security(api_key_header)):
+    expected = _get_api_key()
+    if not header_value:
+        raise HTTPException(status_code=403, detail="API Key missing")
+    if str(header_value).strip() != str(expected).strip():
+        logger.warning(f"AUTH FAIL: '{header_value}' != '{expected}'")
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    return header_value
 
 
 def _as_float(v: Any, default: float) -> float:
@@ -1450,7 +1471,7 @@ def _shutdown() -> None:
             pass
 
 
-@app.post("/v1/face/search", response_model=FaceSearchResponse)
+@app.post("/v1/face/search", response_model=FaceSearchResponse, dependencies=[Depends(get_api_key)])
 def face_search(req: FaceSearchRequest) -> FaceSearchResponse:
     if _debug_enabled():
         try:
@@ -1538,7 +1559,7 @@ def face_search(req: FaceSearchRequest) -> FaceSearchResponse:
     return FaceSearchResponse(subject_id=str(idx.subject_ids[best_i]), similarity=float(best_sim), meta=meta)
 
 
-@app.post("/v1/faces/add", response_model=FaceAddResponse)
+@app.post("/v1/faces/add", response_model=FaceAddResponse, dependencies=[Depends(get_api_key)])
 def faces_add(req: FaceAddRequest) -> FaceAddResponse:
     if not req.subject_id or not str(req.subject_id).strip():
         raise HTTPException(status_code=400, detail="subject_id is required")
@@ -1659,7 +1680,7 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
     )
 
 
-@app.post("/v1/faces/add_upload", response_model=FaceAddResponse)
+@app.post("/v1/faces/add_upload", response_model=FaceAddResponse, dependencies=[Depends(get_api_key)])
 async def faces_add_upload(
     subject_id: str = Form(...),
     files: list[UploadFile] = File(...),
@@ -1783,7 +1804,7 @@ async def faces_add_upload(
     )
 
 
-@app.post("/v1/faces/search", response_model=FaceSearchTopKResponse)
+@app.post("/v1/faces/search", response_model=FaceSearchTopKResponse, dependencies=[Depends(get_api_key)])
 def faces_search(req: FaceSearchTopKRequest) -> FaceSearchTopKResponse:
     top_k = int(req.top_k or 5)
     top_k = max(1, min(top_k, 50))
@@ -1831,7 +1852,7 @@ def faces_search(req: FaceSearchTopKRequest) -> FaceSearchTopKResponse:
     )
 
 
-@app.post("/v1/faces/search_upload", response_model=FaceSearchTopKResponse)
+@app.post("/v1/faces/search_upload", response_model=FaceSearchTopKResponse, dependencies=[Depends(get_api_key)])
 async def faces_search_upload(
     file: UploadFile = File(...),
     top_k: int = Form(5),
@@ -1876,7 +1897,7 @@ async def faces_search_upload(
     return FaceSearchTopKResponse(results=[FaceSearchTopKItem(**r) for r in results], query_thumb_path=thumb_path or None)
 
 
-@app.post("/v1/faces/recognize", response_model=FaceRecognizeResponse)
+@app.post("/v1/faces/recognize", response_model=FaceRecognizeResponse, dependencies=[Depends(get_api_key)])
 def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
     top_k = int(req.top_k or 5)
     top_k = max(1, min(top_k, 50))
@@ -3113,7 +3134,7 @@ def set_recognition_event_feedback(event_id: str, req: EventFeedbackRequest) -> 
     )
 
 
-@app.post("/v1/faces/recognize_upload", response_model=FaceRecognizeResponse)
+@app.post("/v1/faces/recognize_upload", response_model=FaceRecognizeResponse, dependencies=[Depends(get_api_key)])
 async def faces_recognize_upload(
     file: UploadFile = File(...),
     top_k: int = Form(5),
@@ -3205,7 +3226,7 @@ async def quality_check_upload(file: UploadFile = File(...)) -> QualityCheckResp
     )
 
 
-@app.post("/v1/face/search_upload", response_model=FaceSearchResponse)
+@app.post("/v1/face/search_upload", response_model=FaceSearchResponse, dependencies=[Depends(get_api_key)])
 async def face_search_upload(file: UploadFile = File(...)) -> FaceSearchResponse:
     image_bytes = await file.read()
     bgr = _decode_image_bytes(image_bytes)

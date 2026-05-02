@@ -1,0 +1,520 @@
+{
+	"info": {
+		"_postman_id": "face-service-api-collection",
+		"name": "Face Service API",
+		"description": "API collection for Face embedding, enrollment, and similarity search using InsightFace (Buffalo-L) + Qdrant.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "General",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/health",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"health"
+							]
+						},
+						"description": "Returns service health and Qdrant status."
+					},
+					"response": []
+				},
+				{
+					"name": "Global Stats",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/v1/stats",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"stats"
+							]
+						},
+						"description": "Returns global counters and Qdrant status."
+					},
+					"response": []
+				},
+				{
+					"name": "Prometheus Metrics",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/metrics",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"metrics"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Debug Providers",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/debug/providers",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"debug",
+								"providers"
+							]
+						},
+						"description": "Shows ONNXRuntime providers and what providers InsightFace sessions were created with."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Enrollment",
+			"item": [
+				{
+					"name": "Add Faces (JSON)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"subject_id\": \"alice\",\n  \"images_b64\": [\"<base64_string_here>\"]\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/faces/add",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"faces",
+								"add"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Add Faces (Upload)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "subject_id",
+									"value": "alice",
+									"type": "text"
+								},
+								{
+									"key": "files",
+									"type": "file",
+									"src": []
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/faces/add_upload",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"faces",
+								"add_upload"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Search & Recognition",
+			"item": [
+				{
+					"name": "Search (Top-K JSON)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"image_b64\": \"<base64_string_here>\",\n  \"top_k\": 5\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/faces/search",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"faces",
+								"search"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Search (Top-K Upload)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "top_k",
+									"value": "5",
+									"type": "text"
+								},
+								{
+									"key": "file",
+									"type": "file",
+									"src": []
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/faces/search_upload",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"faces",
+								"search_upload"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Recognize (JSON)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"image_b64\": \"<base64_string_here>\",\n  \"top_k\": 5,\n  \"min_similarity\": 0.75\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/faces/recognize",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"faces",
+								"recognize"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Recognize (Upload)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "top_k",
+									"value": "5",
+									"type": "text"
+								},
+								{
+									"key": "min_similarity",
+									"value": "0.75",
+									"type": "text"
+								},
+								{
+									"key": "file",
+									"type": "file",
+									"src": []
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/faces/recognize_upload",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"faces",
+								"recognize_upload"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Frigate Search (JSON)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"image_b64\": \"<base64_string_here>\",\n  \"camera\": \"front-door\",\n  \"reid_id\": \"123\",\n  \"frame_time\": 0.0\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/face/search",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"face",
+								"search"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Subject Management",
+			"item": [
+				{
+					"name": "List Subjects",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/v1/faces/subjects",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"faces",
+								"subjects"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Delete Subject",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/v1/faces/subjects/alice",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"faces",
+								"subjects",
+								"alice"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Browse Subjects (Paginated)",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/v1/subjects?limit=50&with_counts=true",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"subjects"
+							],
+							"query": [
+								{
+									"key": "limit",
+									"value": "50"
+								},
+								{
+									"key": "with_counts",
+									"value": "true"
+								}
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Subject Images",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/v1/subjects/alice/images?limit=50",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"subjects",
+								"alice",
+								"images"
+							],
+							"query": [
+								{
+									"key": "limit",
+									"value": "50"
+								}
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Quality & Events",
+			"item": [
+				{
+					"name": "Quality Check",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "file",
+									"type": "file",
+									"src": []
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/quality/check_upload",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"quality",
+								"check_upload"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Ingest Recognition Event",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "file",
+									"type": "file",
+									"src": []
+								},
+								{
+									"key": "camera",
+									"value": "lobby",
+									"type": "text"
+								},
+								{
+									"key": "top_k",
+									"value": "5",
+									"type": "text"
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/events/recognition",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"events",
+								"recognition"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "List Events",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/v1/events/recognition?limit=100",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"v1",
+								"events",
+								"recognition"
+							],
+							"query": [
+								{
+									"key": "limit",
+									"value": "100"
+								}
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		}
+	],
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "https://face.service.tools.thefusionapps.com/api",
+			"type": "string"
+		}
+	]
+}

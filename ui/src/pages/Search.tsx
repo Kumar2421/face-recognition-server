@@ -12,9 +12,11 @@ export default function Search() {
   const [error, setError] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
   const [dateMode, setDateMode] = useState<'all' | 'day' | 'range'>('all');
+  const [jsonResponse, setJsonResponse] = useState<any>(null);
   const [day, setDay] = useState<string>('');
   const [fromDay, setFromDay] = useState<string>('');
   const [toDay, setToDay] = useState<string>('');
+  const [showJson, setShowJson] = useState<boolean>(false);
 
   async function runSearch(kind: 'search' | 'recognize') {
     setError('');
@@ -27,6 +29,7 @@ export default function Search() {
     }
     try {
       setLoading(true);
+      setJsonResponse(null);
       const filter = {
         day: dateMode === 'day' ? (day || null) : null,
         from_day: dateMode === 'range' ? (fromDay || null) : null,
@@ -36,6 +39,7 @@ export default function Search() {
         kind === 'search'
           ? await facesSearchUpload(f, topK, filter)
           : await facesRecognizeUpload(f, topK, filter);
+      setJsonResponse(r);
       const items = (r?.results || []) as Item[];
       setQueryThumb(r?.query_thumb_path ? `${getApiBase()}${r.query_thumb_path}` : null);
       setResults(items);
@@ -57,7 +61,9 @@ export default function Search() {
     }
     try {
       setLoading(true);
+      setJsonResponse(null);
       const r = await qualityCheckUpload(f);
+      setJsonResponse(r);
       setQuality(r);
     } catch (e: any) {
       setError(String(e));
@@ -74,6 +80,21 @@ export default function Search() {
       </header>
 
       <div className="card" style={{ display: 'grid', gap: '24px', maxWidth: '800px', background: 'var(--bg-primary)' }}>
+        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+          <button 
+            onClick={() => setShowJson(!showJson)} 
+            style={{ 
+              fontSize: '0.75rem', 
+              padding: '4px 8px', 
+              background: showJson ? 'var(--primary)' : 'var(--bg-secondary)',
+              color: showJson ? 'white' : 'var(--text-secondary)',
+              border: '1px solid var(--border)',
+              borderRadius: '4px'
+            }}
+          >
+            {showJson ? 'Hide JSON' : 'Show JSON'}
+          </button>
+        </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 120px', gap: '20px' }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Query Image</label>
@@ -215,6 +236,25 @@ export default function Search() {
             </div>
           </section>
         </div>
+      )}
+
+      {jsonResponse && showJson && (
+        <section className="card" style={{ marginTop: '24px' }}>
+          <h3 style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '16px' }}>JSON Response</h3>
+          <pre style={{ 
+            margin: 0, 
+            padding: '16px', 
+            background: 'var(--bg-secondary)', 
+            borderRadius: 'var(--radius-md)', 
+            fontSize: '0.8125rem', 
+            border: '1px solid var(--border)', 
+            color: 'var(--text-secondary)',
+            overflowX: 'auto',
+            maxHeight: '400px'
+          }}>
+            {JSON.stringify(jsonResponse, null, 2)}
+          </pre>
+        </section>
       )}
     </div>
   );

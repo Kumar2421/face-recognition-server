@@ -4,14 +4,9 @@ This service provides face embedding, enrollment, and similarity search using **
 
 ## Interactive docs
 
-FastAPI automatically serves Swagger UI:
+The built-in web UI is:
 
-- `http://localhost:8001/docs` (Swagger UI)
-- `http://localhost:8001/redoc` (ReDoc)
-
-The built-in demo web UI is:
-
-- `http://localhost:8001/ui`
+- `https://face.service.tools.thefusionapps.com`
 
 ## Configuration
 
@@ -26,6 +21,8 @@ Environment variables (Docker Compose sets most of these):
 - `BUFFALO_DET_SIZE` (default: `640`)
 - `BUFFALO_MIN_DET_SCORE` (default: `0.5`) minimum detector score for accepting a face
 - `BUFFALO_PROVIDERS` (example: `CUDAExecutionProvider,CPUExecutionProvider`)
+
+- `FACE_SERVICE_API_KEY` (default: `your-secret-key`) security key for POST endpoints
 
 GPU / performance:
 
@@ -42,11 +39,13 @@ Storage:
 
 Notes:
 
+- All POST endpoints require an `x-api-key` header matching the `FACE_SERVICE_API_KEY`.
 - Qdrant point IDs must be **UUID** or **integer**. This service uses deterministic UUIDs derived from `subject_id` and `image_id`.
 - Detection robustness:
   - If detection fails, the service retries with rotated and downscaled variants.
 - Thumbnails are served at `/thumbs/{image_id}.jpg` (root configurable via `THUMBS_DIR`).
 
+here is the reference for the api: fs_9f2b8a71c4d04e5e9b3d8a7c6b5a4f3e
 ## Data model
 
 ### Face embedding
@@ -158,7 +157,8 @@ Response:
 
 Curl:
 ```bash
-curl -s -X POST "http://localhost:8001/v1/faces/add" \
+curl -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/faces/add" \
+  -H "x-api-key: your-secret-key" \
   -H "Content-Type: application/json" \
   -d '{"subject_id":"alice","images_b64":["...base64..."]}'
 ```
@@ -172,7 +172,8 @@ Form fields:
 
 Curl (Windows `curl.exe`):
 ```powershell
-curl.exe -s -X POST "http://localhost:8001/v1/faces/add_upload" `
+curl.exe -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/faces/add_upload" `
+  -H "x-api-key: your-secret-key" `
   -F "subject_id=alice" `
   -F "files=@D:\\path\\to\\img1.jpg;type=image/jpeg" `
   -F "files=@D:\\path\\to\\img2.png;type=image/png"
@@ -211,7 +212,8 @@ Form fields:
 
 Curl:
 ```powershell
-curl.exe -s -X POST "http://localhost:8001/v1/faces/search_upload" `
+curl.exe -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/faces/search_upload" `
+  -H "x-api-key: your-secret-key" `
   -F "top_k=5" `
   -F "file=@D:\\path\\to\\query.jpg;type=image/jpeg"
 ```
@@ -263,7 +265,8 @@ Form fields:
 
 Curl:
 ```powershell
-curl.exe -s -X POST "http://localhost:8001/v1/faces/recognize_upload" `
+curl.exe -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/faces/recognize_upload" `
+  -H "x-api-key: your-secret-key" `
   -F "top_k=5" `
   -F "min_similarity=0.75" `
   -F "file=@D:\\path\\to\\query.jpg;type=image/jpeg"
@@ -309,7 +312,7 @@ Form fields:
 
 Curl:
 ```powershell
-curl.exe -s -X POST "http://localhost:8001/v1/face/search_upload" `
+curl.exe -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/face/search_upload" `
   -F "file=@D:\\path\\to\\query.png;type=image/png"
 ```
 
@@ -416,7 +419,7 @@ Notes:
 Curl example:
 
 ```bash
-curl -sS -X POST "http://localhost:8001/v1/quality/check_upload" \
+curl -sS -X POST "https://face.service.tools.thefusionapps.com/api/v1/quality/check_upload" \
   -F "file=@/path/to/image.jpg"
 ```
 

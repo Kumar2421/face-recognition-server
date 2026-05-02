@@ -1,17 +1,20 @@
 import { useEffect, useState } from 'react';
-import { getApiBase } from '../lib/api';
+import { getApiBase, getApiKey } from '../lib/api';
 
 export default function Settings() {
   const [apiBase, setApiBase] = useState<string>('');
+  const [apiKey, setApiKey] = useState<string>('');
   const [saved, setSaved] = useState<string>('');
 
   useEffect(() => {
     setApiBase(getApiBase());
+    setApiKey(getApiKey());
   }, []);
 
   function save() {
     try {
       localStorage.setItem('api_base', apiBase.trim());
+      localStorage.setItem('api_key', apiKey.trim());
       setSaved('Saved. Reloading...');
       setTimeout(() => window.location.reload(), 600);
     } catch (e) {
@@ -22,7 +25,8 @@ export default function Settings() {
   function clearOverride() {
     try {
       localStorage.removeItem('api_base');
-      setSaved('Cleared override. Reloading...');
+      localStorage.removeItem('api_key');
+      setSaved('Cleared overrides. Reloading...');
       setTimeout(() => window.location.reload(), 600);
     } catch (e) {
       setSaved(String(e));
@@ -46,6 +50,18 @@ export default function Settings() {
             style={{ padding: '12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: '1rem' }}
           />
           <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>The URL where the Face Service API is hosted. Usually http://localhost:8001 during development.</span>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>API Key (x-api-key)</label>
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder="fs_..."
+            style={{ padding: '12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: '1rem' }}
+          />
+          <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Required for security enabled environments. Matches FACE_SERVICE_API_KEY.</span>
         </div>
 
         <div style={{ display: 'flex', gap: '12px', borderTop: '1px solid var(--border)', paddingTop: '20px' }}>
@@ -73,8 +89,10 @@ export default function Settings() {
         <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', display: 'grid', gridTemplateColumns: '120px 1fr', gap: '8px' }}>
           <span>Current Base:</span>
           <code style={{ color: 'var(--text-primary)' }}>{getApiBase()}</code>
+          <span>API Key:</span>
+          <span>{getApiKey() ? '******** (Set)' : 'Not Set'}</span>
           <span>Storage:</span>
-          <span>{localStorage.getItem('api_base') ? 'Local Storage (Overridden)' : 'Default (.env)'}</span>
+          <span>{localStorage.getItem('api_base') || localStorage.getItem('api_key') ? 'Local Storage (Overridden)' : 'Default (.env)'}</span>
         </div>
       </section>
     </div>

@@ -1,5 +1,6 @@
 api:
   base_url: "http://face_service:8000"
+  api_key: "fs_9f2b8a71c4d04e5e9b3d8a7c6b5a4f3e" # Suggested secure key
 
 sftp:
   api_path: "/webhookSFTPDirect" 
@@ -15,7 +16,7 @@ sftp:
 
 
 external_api:
-  enabled: true
+  enabled: false
   base_url: "https://live.thefusionapps.com"
   jwt_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyRGF0YSI6eyJpZCI6MTAsInVzZXJOYW1lIjoiRnVzaW9uIFN1cHBvcnQiLCJ0ZW5hbnRJZCI6MTAsInJvbGUiOiJ0ZW5hbnQiLCJzbHVnIjoiYW5hbHl0aWNzIn0sImJyYW5jaERhdGEiOnsiaWQiOjUyLCJicmFuY2hJZCI6IlRNSi1DQkUifSwiaWF0IjoxNzc3NTI5MzgxLCJleHAiOjE3Nzc2MTU3ODF9.7INaT-cuBlPLFO6qi1a7SZJTY4PkSPErLjvsIx0Pk_c"
  
