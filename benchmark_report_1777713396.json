@@ -1,0 +1,79 @@
+{
+  "timestamp": "2026-05-02T09:16:36.205411+00:00",
+  "api_performance": {
+    "/health": {
+      "description": "Health Check",
+      "status": 200,
+      "latency_ms": 629.0582150104456,
+      "ok": true
+    },
+    "/v1/stats": {
+      "description": "Dashboard Stats",
+      "status": 200,
+      "latency_ms": 126.5692820015829,
+      "ok": true
+    },
+    "/v1/faces/subjects": {
+      "description": "Subject Names Only",
+      "status": 200,
+      "latency_ms": 97.1779259853065,
+      "ok": true
+    },
+    "/v1/subjects?limit=50": {
+      "description": "List Subjects (Paginated)",
+      "status": 200,
+      "latency_ms": 2977.2130389756057,
+      "ok": true
+    },
+    "/v1/events/recognition?limit=50": {
+      "description": "Recognition Events",
+      "status": 200,
+      "latency_ms": 12.928214011481032,
+      "ok": true
+    },
+    "/v1/events/recognition/cameras": {
+      "description": "List Cameras",
+      "status": 200,
+      "latency_ms": 331.23002501088195,
+      "ok": true
+    },
+    "/v1/events/recognition/feedback_stats": {
+      "description": "Feedback Stats",
+      "status": 200,
+      "latency_ms": 457.87623900105245,
+      "ok": true
+    },
+    "/v1/search_history?limit=50": {
+      "description": "Search History",
+      "status": 200,
+      "latency_ms": 14.156472985632718,
+      "ok": true
+    },
+    "/v1/search_history/stats?match_threshold=0.8": {
+      "description": "Search Stats",
+      "status": 200,
+      "latency_ms": 4.583282978273928,
+      "ok": true
+    },
+    "/v1/cross_check/visitors_vs_employees?limit=50": {
+      "description": "Cross-Check Report",
+      "status": 200,
+      "latency_ms": 5803.826638992177,
+      "ok": true
+    },
+    "/metrics": {
+      "description": "Prometheus Metrics",
+      "status": 200,
+      "latency_ms": 19.943544000852853,
+      "ok": true
+    }
+  },
+  "qdrant_performance": {
+    "collection": "frigate_faces_v10",
+    "points_count": 245638,
+    "status": "green",
+    "indexed_vectors": 245001,
+    "search_latency_ms": 1220.3070149989799,
+    "ok": true
+  }
+}

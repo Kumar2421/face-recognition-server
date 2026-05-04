@@ -1,0 +1,49 @@
+{
+  "summary": {
+    "total_requests": 500,
+    "successful_requests": 498,
+    "failed_requests": 2,
+    "total_time_sec": 20.74,
+    "throughput_rps": 24.11,
+    "concurrency": 50,
+    "target_rps": 100
+  },
+  "potential_performance": {
+    "core_engine_rps": 115.69,
+    "time_for_500_images_sec": 4.32,
+    "note": "This excludes network and decoding overhead"
+  },
+  "latency_ms": {
+    "min": 240.36,
+    "max": 3704.69,
+    "mean": 2013.81,
+    "median": 2061.96,
+    "p95": 2393.8
+  },
+  "model_performance_ms": {
+    "mean_model_ms": 34.57,
+    "median_model_ms": 33.0
+  },
+  "resource_usage": {
+    "initial": {
+      "memory_rss_mb": 3398.9453125,
+      "memory_vms_mb": 20658.96484375,
+      "cpu_percent": 0.0,
+      "threads": 101,
+      "gc_objects": 195677
+    },
+    "final": {
+      "memory_rss_mb": 3405.3046875,
+      "memory_vms_mb": 20940.7109375,
+      "cpu_percent": 0.0,
+      "threads": 140,
+      "gc_objects": 198818
+    },
+    "gpu_status": {
+      "queue_size": 0,
+      "max_queue": 2048,
+      "workers": 4,
+      "batch_window_s": 0.01
+    }
+  }
+}

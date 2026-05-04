@@ -9,31 +9,50 @@ import time
 import uuid
 import asyncio
 import collections
+import gc
+import psutil
+import concurrent.futures
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, List, Optional
 from datetime import datetime, timezone, date, timedelta
 from urllib.parse import urlparse
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, Depends, Security
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, Depends, Security, BackgroundTasks
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, AliasChoices
+
+from src.models.schemas import (
+    FaceIndex, FaceSearchRequest, FaceSearchResponse, FaceAddRequest,
+    GroupCreateRequest, GroupResponse, GroupListResponse, FaceAddResponse,
+    FaceSearchTopKRequest, FaceSearchTopKItem, FaceSearchTopKResponse,
+    FaceRecognizeRequest, FaceRecognizeResponse, FaceQualityResult,
+    QualityCheckResponse, RecognitionEventResponse, RecognitionEventsListResponse,
+    SearchEventResponse, SearchEventsListResponse, SearchEventsStatsResponse,
+    RecognitionStatsResponse, EventFeedbackRequest, EventFeedbackResponse,
+    FeedbackStatsResponse, RecognitionFetchRequest, FaceSubjectsResponse,
+    FaceDeleteSubjectResponse
+)
+from src.utils.helpers import (
+    _sha1_hex, _sha1_bytes_hex, _uuid5_from_name, _decode_b64_image,
+    _decode_image_bytes, _t, _now_ts, _iso_now, _ensure_dir, _save_thumb
+)
+from src.services.inference_manager import GPUInferenceManager
+from src.services.events_store import EventsStore, RecognitionEvent
+from src.core.config_loader import apply_env_defaults_from_config, load_config
+
 from quality import FaceQualityEvaluator
 from embedders.buffalo_l import (
     BuffaloLEmbedder,
     _l2_normalize,
     _quality_check_and_embed as _embed_quality_check_and_embed,
 )
-from inference_manager import GPUInferenceManager
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from ui_page import ui_html
-from events_store import EventsStore, RecognitionEvent
-from config_loader import apply_env_defaults_from_config, load_config
-
 from cross_check import cross_check_router
 
 import httpx
@@ -236,222 +255,106 @@ def _debug(msg: str) -> None:
         except Exception:
             pass
 
-
-@dataclass
-class FaceIndex:
-    subject_ids: list[str]
-    mean_embeddings: np.ndarray  # shape: (N, D)
-
-
-class FaceSearchRequest(BaseModel):
-    image_b64: str
-    camera: str | None = None
-    reid_id: str | None = None
-    frame_time: float | None = None
-
-
-class FaceSearchResponse(BaseModel):
-    subject_id: str
-    similarity: float
-    meta: dict[str, Any] | None = None
-
-
-class FaceAddRequest(BaseModel):
-    subject_id: str
-    images_b64: list[str]
-
-
-class FaceAddResponse(BaseModel):
-    subject_id: str
-    num_images: int
-    num_embedded: int
-    embedding_dim: int | None = None
-    meta: dict[str, Any] | None = None
-
-
-class FaceSearchTopKRequest(BaseModel):
-    image_b64: str = Field(..., validation_alias=AliasChoices("image_b64", "image", "images_b64"))
-    top_k: int = 5
-
-
-class FaceSearchTopKItem(BaseModel):
-    subject_id: str
-    similarity: float
-    point_id: str
-    image_id: str | None = None
-    thumb_path: str | None = None
-
-
-class FaceSearchTopKResponse(BaseModel):
-    results: list[FaceSearchTopKItem]
-    query_thumb_path: str | None = None
-
-
-class FaceRecognizeRequest(BaseModel):
-    image_b64: str
-    top_k: int = 5
-    min_similarity: float | None = None
-
-
-class FaceRecognizeResponse(BaseModel):
-    matched: bool
-    subject_id: str | None = None
-    similarity: float | None = None
-    results: list[FaceSearchTopKItem] = []
-    meta: dict[str, Any] | None = None
-
-
-class FaceQualityResult(BaseModel):
-    ok: bool
-    quality: dict[str, Any] | None = None
-    det_score: float | None = None
-    bbox: list[float] | None = None
-
-class QualityCheckResponse(BaseModel):
-    ok: bool
-    total_quality: str | None = None
-    faces: list[FaceQualityResult] = []
-    annotated_image: str | None = None
-    timing: dict[str, Any] | None = None
-
-
-class RecognitionEventResponse(BaseModel):
-    event_id: str
-    ts: float
-    camera: str
-    source_path: str
-    decision: str
-    subject_id: str | None = None
-    similarity: float | None = None
-    processing_ms: int | None = None
-    model_ms: int | None = None
-    rejected_reason: str | None = None
-    bbox: list[float] | None = None
-    det_score: float | None = None
-    image_path: str
-    thumb_path: str
-    image_saved_at: float | None = None
-    meta: dict[str, Any] | None = None
-    feedback_label: str | None = None
-    feedback_note: str | None = None
-    feedback_updated_at: float | None = None
-
-
-class RecognitionEventsListResponse(BaseModel):
-    items: list[RecognitionEventResponse]
-    cursor: float | None = None
-
-
-class SearchEventResponse(BaseModel):
-    event_id: str
-    ts: float
-    query_image_path: str
-    query_thumb_path: str
-    top_subject_id: str | None = None
-    top_similarity: float | None = None
-    results: list[FaceSearchTopKItem] = []
-    meta: dict[str, Any] | None = None
-
-
-class SearchEventsListResponse(BaseModel):
-    items: list[SearchEventResponse]
-    cursor: float | None = None
-
-
-class SearchEventsStatsResponse(BaseModel):
-    match: int
-    no_match: int
-    total: int
-
-
-class RecognitionStatsResponse(BaseModel):
-    total: int
-    match: int
-    no_match: int
-    rejection: int
-    unique_matches: int = 0
-    by_camera: dict[str, dict[str, int]]
-
-
-class EventFeedbackRequest(BaseModel):
-    label: str | None = None
-    note: str | None = None
-
-
-class EventFeedbackResponse(BaseModel):
-    event_id: str
-    updated: bool
-    feedback_label: str | None = None
-    feedback_note: str | None = None
-    feedback_updated_at: float | None = None
-
-
-class FeedbackStatsResponse(BaseModel):
-    total: int
-    labeled: int
-    unlabeled: int
-    tp: int
-    fp: int
-    fn: int
-    ignore: int
-    fp_rate_match: float | None = None
-    by_decision: dict[str, dict[str, int]]
-
-
-class RecognitionFetchRequest(BaseModel):
-    url: str
-    camera: str
-    source_path: str | None = None
-    ts: float | None = None
-    top_k: int = 5
-    min_similarity: float | None = None
-    process_all_faces: bool = False
-
-
-class FaceSubjectsResponse(BaseModel):
-    subjects: list[str]
-
-
-class FaceDeleteSubjectResponse(BaseModel):
-    subject_id: str
-    deleted: bool
-
-
-def _sha1_hex(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
-
-
-def _sha1_bytes_hex(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest()
-
-
-def _uuid5_from_name(name: str) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_OID, name))
-
-
-def _decode_b64_image(image_b64: str) -> np.ndarray:
+def _record_event(buf: list[float]) -> None:
     try:
-        img = base64.b64decode(image_b64)
+        buf.append(_now_ts())
+        cutoff = _now_ts() - 24 * 3600.0
+        k = 0
+        for t in buf:
+            if t >= cutoff:
+                break
+            k += 1
+        if k > 0:
+            del buf[:k]
     except Exception:
-        raise HTTPException(status_code=400, detail="invalid base64")
-    arr = np.frombuffer(img, dtype=np.uint8)
+        pass
+
+def _quarantine_enroll_possible_match(
+    bgr: np.ndarray,
+    subject_id: str,
+    image_id: str,
+    reason: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        events_dir = os.environ.get("EVENTS_DIR", "/data/events")
+        rel = f"no_match/enroll/{str(subject_id).strip()}/{str(image_id).strip()}.jpg"
+        img_path = _save_event_image(bgr, events_dir, rel)
+        thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"enroll-{image_id}")
+    except Exception:
+        img_path = ""
+        thumb_path = ""
+
+    out: dict[str, Any] = {
+        "status": "no_match",
+        "reason": str(reason),
+        "subject_id": str(subject_id),
+        "image_id": str(image_id),
+        "image_path": img_path,
+        "thumb_path": thumb_path,
+    }
+    if extra:
+        try:
+            out.update(extra)
+        except Exception:
+            pass
+    return out
+
+
+def _save_event_image(bgr: np.ndarray, events_dir: str, rel_path: str) -> str:
+    try:
+        abs_path = os.path.join(str(events_dir), str(rel_path).lstrip("/"))
+        _ensure_dir(os.path.dirname(abs_path))
+        cv2.imwrite(str(abs_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return "/events/" + str(rel_path).lstrip("/")
+    except Exception:
+        return ""
+
+
+def _save_image(bgr: np.ndarray, images_dir: str, subject_id: str, image_id: str) -> str:
+    try:
+        from pathlib import Path as _Path
+        _ensure_dir(images_dir)
+        subdir = _Path(images_dir) / str(subject_id)
+        subdir.mkdir(parents=True, exist_ok=True)
+        abs_path = subdir / f"{image_id}.jpg"
+        cv2.imwrite(str(abs_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return f"/images/{subject_id}/{image_id}.jpg"
+    except Exception:
+        return ""
+
+
+def _save_search_query_assets(bgr: np.ndarray, image_id: str) -> tuple[str, str]:
+    try:
+        from pathlib import Path as _Path
+        _ensure_dir(app.state.search_events_dir)
+        _ensure_dir(app.state.search_thumbs_dir)
+        
+        # Save main query image
+        img_path = _Path(app.state.search_events_dir) / f"{image_id}.jpg"
+        cv2.imwrite(str(img_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        
+        # Save thumbnail
+        thumb_path = _save_thumb(bgr, app.state.search_thumbs_dir, image_id)
+        
+        return f"/v1/search_history/asset/image/{image_id}", thumb_path
+    except Exception as e:
+        logger.error("failed to save search query assets: %s", str(e))
+        return "", ""
+
+
+def _decode_b64_bytes(image_b64: str) -> bytes:
+    try:
+        return base64.b64decode(image_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid image_b64")
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="empty image")
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
         raise HTTPException(status_code=400, detail="unable to decode image")
     return bgr
-
-
-def _decode_image_bytes(image_bytes: bytes) -> np.ndarray:
-    try:
-        arr = np.frombuffer(image_bytes, dtype=np.uint8)
-        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise ValueError("unable to decode image")
-        return bgr
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=400, detail="unable to decode image")
 
 
 def _quality_check_and_embed(bgr: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
@@ -576,152 +479,6 @@ def _quality_check_all(bgr: np.ndarray) -> tuple[list[dict[str, Any]], dict[str,
     except Exception as e:
         logger.error(f"detect failure: {str(e)}")
         raise HTTPException(status_code=500, detail="detect failure")
-
-
-
-def _decode_b64_bytes(image_b64: str) -> bytes:
-    try:
-        return base64.b64decode(image_b64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid image_b64")
-
-
-def _now_ts() -> float:
-    try:
-        return time.time()
-    except Exception:
-        return float(datetime.now(tz=timezone.utc).timestamp())
-
-
-def _iso_now() -> str:
-    try:
-        return datetime.now(tz=timezone.utc).isoformat()
-    except Exception:
-        return str(int(_now_ts()))
-
-
-def _record_event(buf: list[float]) -> None:
-    try:
-        buf.append(_now_ts())
-        cutoff = _now_ts() - 24 * 3600.0
-        k = 0
-        for t in buf:
-            if t >= cutoff:
-                break
-            k += 1
-        if k > 0:
-            del buf[:k]
-    except Exception:
-        pass
-
-
-def _ensure_dir(p: str) -> None:
-    try:
-        os.makedirs(p, exist_ok=True)
-    except Exception:
-        pass
-
-
-def _save_thumb(bgr: np.ndarray, thumbs_dir: str, image_id: str) -> str:
-    try:
-        h, w = bgr.shape[:2]
-        scale = 256.0 / float(max(h, w)) if max(h, w) > 0 else 1.0
-        if scale < 1.0:
-            nh = max(2, int(round(h * scale)))
-            nw = max(2, int(round(w * scale)))
-            thumb = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA)
-        else:
-            thumb = bgr
-        rel = f"{image_id}.jpg"
-        _ensure_dir(thumbs_dir)
-        abs_path = os.path.join(thumbs_dir, rel)
-        cv2.imwrite(abs_path, thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        return "/thumbs/" + rel
-    except Exception:
-        return ""
-
-
-def _quarantine_enroll_possible_match(
-    bgr: np.ndarray,
-    subject_id: str,
-    image_id: str,
-    reason: str,
-    extra: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    try:
-        events_dir = os.environ.get("EVENTS_DIR", "/data/events")
-        rel = f"no_match/enroll/{str(subject_id).strip()}/{str(image_id).strip()}.jpg"
-        img_path = _save_event_image(bgr, events_dir, rel)
-        thumb_path = _save_thumb(bgr, app.state.thumbs_dir, f"enroll-{image_id}")
-    except Exception:
-        img_path = ""
-        thumb_path = ""
-
-    out: dict[str, Any] = {
-        "status": "no_match",
-        "reason": str(reason),
-        "subject_id": str(subject_id),
-        "image_id": str(image_id),
-        "image_path": img_path,
-        "thumb_path": thumb_path,
-    }
-    if extra:
-        try:
-            out.update(extra)
-        except Exception:
-            pass
-    return out
-
-
-def _save_event_image(bgr: np.ndarray, events_dir: str, rel_path: str) -> str:
-    try:
-        abs_path = os.path.join(str(events_dir), str(rel_path).lstrip("/"))
-        _ensure_dir(os.path.dirname(abs_path))
-        cv2.imwrite(str(abs_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        return "/events/" + str(rel_path).lstrip("/")
-    except Exception:
-        return ""
-
-
-def _save_image(bgr: np.ndarray, images_dir: str, subject_id: str, image_id: str) -> str:
-    try:
-        from pathlib import Path as _Path
-        _ensure_dir(images_dir)
-        subdir = _Path(images_dir) / str(subject_id)
-        subdir.mkdir(parents=True, exist_ok=True)
-        abs_path = subdir / f"{image_id}.jpg"
-        cv2.imwrite(str(abs_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        return f"/images/{subject_id}/{image_id}.jpg"
-    except Exception:
-        return ""
-
-
-
-def _save_search_query_assets(bgr: np.ndarray, image_id: str) -> tuple[str, str]:
-    try:
-        from pathlib import Path as _Path
-        _ensure_dir(app.state.search_events_dir)
-        _ensure_dir(app.state.search_thumbs_dir)
-        
-        # Save main query image
-        img_path = _Path(app.state.search_events_dir) / f"{image_id}.jpg"
-        cv2.imwrite(str(img_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        
-        # Save thumbnail
-        thumb_path = _save_thumb(bgr, app.state.search_thumbs_dir, image_id)
-        
-        return f"/v1/search_history/asset/image/{image_id}", thumb_path
-    except Exception as e:
-        logger.error("failed to save search query assets: %s", str(e))
-        return "", ""
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="empty image")
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise HTTPException(status_code=400, detail="unable to decode image")
-    return bgr
-
 
 def _qdrant_enabled() -> bool:
     return bool(os.environ.get("QDRANT_URL"))
@@ -895,7 +652,7 @@ def _no_match_auto_attach_min_margin() -> float:
         return 0.10
 
 
-def _qdrant_search(client, collection: str, emb: np.ndarray, top_k: int) -> list[dict[str, Any]]:
+def _qdrant_search(client, collection: str, emb: np.ndarray, top_k: int, group_id: str | None = None) -> list[dict[str, Any]]:
     t0 = _t()
     try:
         search_params = None
@@ -936,11 +693,20 @@ def _qdrant_search(client, collection: str, emb: np.ndarray, top_k: int) -> list
             except Exception:
                 search_params = None
 
+        search_filter = None
+        if group_id:
+            try:
+                from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+                search_filter = Filter(must=[FieldCondition(key="group_id", match=MatchValue(value=group_id))])
+            except Exception:
+                pass
+
         kwargs = dict(
             collection_name=collection,
             query_vector=emb.astype(np.float32).reshape(-1).tolist(),
             limit=int(top_k),
-            with_payload=["subject_id", "image_id", "thumb_path"],
+            with_payload=["subject_id", "image_id", "thumb_path", "group_id"],
+            query_filter=search_filter
         )
         if search_params is not None:
             kwargs["search_params"] = search_params
@@ -1353,13 +1119,20 @@ def _startup() -> None:
         except Exception:
             max_q = 256
         try:
-            batch_ms = int(os.environ.get("GPU_BATCH_WINDOW_MS", "0") or "0")
+            batch_ms = int(os.environ.get("GPU_BATCH_WINDOW_MS", "10") or "10")
         except Exception:
-            batch_ms = 0
+            batch_ms = 10
+
+        try:
+            num_workers = int(os.environ.get("GPU_NUM_WORKERS", "4") or "4")
+        except Exception:
+            num_workers = 4
+
         app.state.gpu = GPUInferenceManager(
             embedder=app.state.embedder,
             max_queue=max_q,
             batch_window_ms=batch_ms,
+            num_workers=num_workers,
         )
     else:
         app.state.gpu = None
@@ -1373,6 +1146,9 @@ def _startup() -> None:
         except Exception as e:
             logger.error("failed to init qdrant client: %s", str(e))
             app.state.qdrant = None
+
+    # CPU-bound task offloading (e.g., image decoding)
+    app.state.executor = concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count() or 4)
 
     embeddings_index = os.environ.get("FACE_EMBEDDINGS_INDEX")
     try:
@@ -1459,16 +1235,12 @@ def _startup() -> None:
 
 
 @app.on_event("shutdown")
-def _shutdown() -> None:
-    try:
-        mgr = getattr(app.state, "gpu", None)
-    except Exception:
-        mgr = None
-    if mgr is not None:
-        try:
-            mgr.close()
-        except Exception:
-            pass
+def shutdown_event():
+    if hasattr(app.state, "gpu") and app.state.gpu:
+        app.state.gpu.close()
+    if hasattr(app.state, "executor") and app.state.executor:
+        app.state.executor.shutdown(wait=True)
+        
 
 
 @app.post("/v1/face/search", response_model=FaceSearchResponse, dependencies=[Depends(get_api_key)])
@@ -1559,6 +1331,86 @@ def face_search(req: FaceSearchRequest) -> FaceSearchResponse:
     return FaceSearchResponse(subject_id=str(idx.subject_ids[best_i]), similarity=float(best_sim), meta=meta)
 
 
+@app.post("/v1/groups", response_model=GroupResponse, dependencies=[Depends(get_api_key)])
+async def create_group(req: GroupCreateRequest) -> GroupResponse:
+    q = getattr(app.state, "qdrant", None)
+    if q is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+    
+    group_collection = os.environ.get("QDRANT_GROUPS_COLLECTION", "face_groups")
+    try:
+        from qdrant_client.http.models import Distance, VectorParams
+        if not q.collection_exists(group_collection):
+            q.create_collection(
+                collection_name=group_collection,
+                vectors_config=VectorParams(size=1, distance=Distance.COSINE), # Dummy vector
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to ensure groups collection: {str(e)}")
+
+    try:
+        from qdrant_client.http.models import PointStruct
+        q.upsert(
+            collection_name=group_collection,
+            points=[
+                PointStruct(
+                    id=_uuid5_from_name(req.group_id),
+                    vector=[0.0],
+                    payload={
+                        "group_id": req.group_id,
+                        "name": req.name or req.group_id,
+                        "meta": req.meta or {},
+                        "created_at": _iso_now()
+                    }
+                )
+            ]
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to create group: {str(e)}")
+
+    return GroupResponse(group_id=req.group_id, name=req.name, meta=req.meta)
+
+@app.get("/v1/groups", response_model=GroupListResponse, dependencies=[Depends(get_api_key)])
+async def list_groups() -> GroupListResponse:
+    q = getattr(app.state, "qdrant", None)
+    if q is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+    
+    group_collection = os.environ.get("QDRANT_GROUPS_COLLECTION", "face_groups")
+    try:
+        if not q.collection_exists(group_collection):
+            return GroupListResponse(groups=[])
+        
+        points, _ = q.scroll(collection_name=group_collection, limit=100, with_payload=True)
+        groups = []
+        for p in points:
+            payload = p.payload or {}
+            groups.append(GroupResponse(
+                group_id=payload.get("group_id", ""),
+                name=payload.get("name"),
+                meta=payload.get("meta")
+            ))
+        return GroupListResponse(groups=groups)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to list groups: {str(e)}")
+
+@app.delete("/v1/groups/{group_id}", dependencies=[Depends(get_api_key)])
+async def delete_group(group_id: str) -> dict[str, Any]:
+    q = getattr(app.state, "qdrant", None)
+    if q is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+    
+    group_collection = os.environ.get("QDRANT_GROUPS_COLLECTION", "face_groups")
+    try:
+        q.delete(
+            collection_name=group_collection,
+            points_selector=[_uuid5_from_name(group_id)]
+        )
+        return {"deleted": True, "group_id": group_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to delete group: {str(e)}")
+
+
 @app.post("/v1/faces/add", response_model=FaceAddResponse, dependencies=[Depends(get_api_key)])
 def faces_add(req: FaceAddRequest) -> FaceAddResponse:
     if not req.subject_id or not str(req.subject_id).strip():
@@ -1645,6 +1497,7 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
                         vector=emb.astype(np.float32).reshape(-1).tolist(),
                         payload={
                             "subject_id": subject_id,
+                            "group_id": req.group_id,
                             "image_id": image_id,
                             "created_at": _iso_now(),
                             "thumb_path": thumb_path,
@@ -1683,6 +1536,7 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
 @app.post("/v1/faces/add_upload", response_model=FaceAddResponse, dependencies=[Depends(get_api_key)])
 async def faces_add_upload(
     subject_id: str = Form(...),
+    group_id: str | None = Form(None),
     files: list[UploadFile] = File(...),
 ) -> FaceAddResponse:
     subject_id = str(subject_id or "").strip()
@@ -1769,6 +1623,7 @@ async def faces_add_upload(
                         vector=emb.astype(np.float32).reshape(-1).tolist(),
                         payload={
                             "subject_id": subject_id,
+                            "group_id": group_id,
                             "image_id": image_id,
                             "created_at": _iso_now(),
                             "thumb_path": thumb_path,
@@ -1815,7 +1670,7 @@ def faces_search(req: FaceSearchTopKRequest) -> FaceSearchTopKResponse:
 
     bgr = _decode_b64_image(req.image_b64)
     emb, _meta = _quality_check_and_embed(bgr)
-    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
+    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, group_id=req.group_id)
 
     thumb_path = ""
     try:
@@ -1866,7 +1721,7 @@ async def faces_search_upload(
     image_bytes = await file.read()
     bgr = _decode_image_bytes(image_bytes)
     emb, _meta = _quality_check_and_embed(bgr)
-    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
+    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, group_id=group_id)
     
     # Persistent Logging
     try:
@@ -1909,7 +1764,7 @@ def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
 
     bgr = _decode_b64_image(req.image_b64)
     emb, meta = _quality_check_and_embed(bgr)
-    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
+    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, group_id=req.group_id)
     items = [FaceSearchTopKItem(**r) for r in results]
 
     # Persistent Logging
@@ -2033,6 +1888,7 @@ async def ingest_recognition_event(
     top_k: int = Form(5),
     min_similarity: float | None = Form(None),
     process_all_faces: bool = Form(False),
+    group_id: str | None = Form(None),
 ) -> RecognitionEventResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
@@ -2456,7 +2312,7 @@ async def ingest_recognition_event(
             raise HTTPException(status_code=500, detail=f"qdrant init failed: {str(e)}")
 
         t_qs0 = _pc()
-        results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
+        results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, group_id=group_id)
         
         # Check in-memory cache if no database match
         if not results or results[0]["similarity"] < float(min_sim):
@@ -3134,34 +2990,26 @@ def set_recognition_event_feedback(event_id: str, req: EventFeedbackRequest) -> 
     )
 
 
-@app.post("/v1/faces/recognize_upload", response_model=FaceRecognizeResponse, dependencies=[Depends(get_api_key)])
-async def faces_recognize_upload(
-    file: UploadFile = File(...),
-    top_k: int = Form(5),
-    min_similarity: float | None = Form(None),
-) -> FaceRecognizeResponse:
-    q = getattr(app.state, "qdrant", None)
-    if q is None:
-        raise HTTPException(status_code=501, detail="qdrant not configured")
+def _log_recognition_event_background(
+    bgr: np.ndarray,
+    results: list[dict[str, Any]],
+    meta: dict[str, Any],
+    subject_id: str | None,
+    similarity: float | None,
+    items: list[Any],
+    events_store: Any,
+    thumbs_dir: str
+):
+    if os.environ.get("RECOGNITION_LOGGING_ENABLED", "1") == "0":
+        return
 
-    top_k = int(top_k or 5)
-    top_k = max(1, min(top_k, 50))
-    min_sim = float(min_similarity) if min_similarity is not None else float(app.state.min_similarity)
-
-    image_bytes = await file.read()
-    bgr = _decode_image_bytes(image_bytes)
-    emb, meta = _quality_check_and_embed(bgr)
-    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k)
-    items = [FaceSearchTopKItem(**r) for r in results]
-
-    # Persistent Logging
     try:
-        from events_store import SearchEvent
+        from src.services.events_store import SearchEvent
         event_id = str(uuid.uuid4())
         img_url, thumb_path = _save_search_query_assets(bgr, event_id)
         
-        top_sid = results[0]["subject_id"] if results else None
-        top_sim = results[0]["similarity"] if results else None
+        top_sid = subject_id
+        top_sim = similarity
         
         ev = SearchEvent(
             event_id=event_id,
@@ -3173,14 +3021,83 @@ async def faces_recognize_upload(
             results=results,
             meta=meta
         )
-        if app.state.events:
-            app.state.events.insert_search_event(ev)
-            logger.info("Recognize Upload Event Logged: %s", event_id)
+        if events_store:
+            events_store.insert_search_event(ev)
     except Exception as e:
-        logger.error("failed to log recognize upload event: %s", str(e))
+        logger.error("failed to log recognize upload event in background: %s", str(e))
+
+
+@app.post("/v1/faces/recognize_upload", response_model=FaceRecognizeResponse, dependencies=[Depends(get_api_key)])
+async def faces_recognize_upload(
+    file: UploadFile = File(...),
+    top_k: int = Form(5),
+    min_similarity: float | None = Form(None),
+    group_id: str | None = Form(None),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+) -> FaceRecognizeResponse:
+    t_start = _pc()
+    q = getattr(app.state, "qdrant", None)
+    if q is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+
+    top_k = int(top_k or 5)
+    top_k = max(1, min(top_k, 50))
+    min_sim = float(min_similarity) if min_similarity is not None else float(app.state.min_similarity)
+
+    image_bytes = await file.read()
+    
+    t_decode_start = _pc()
+    loop = asyncio.get_event_loop()
+    bgr = await loop.run_in_executor(app.state.executor, _decode_image_bytes, image_bytes)
+    if bgr is None:
+        raise HTTPException(status_code=400, detail="unable to decode image")
+    decode_ms = int((_pc() - t_decode_start) * 1000.0)
+    
+    t_embed_start = _pc()
+    emb, meta = _quality_check_and_embed(bgr)
+    embed_ms = int((_pc() - t_embed_start) * 1000.0)
+    
+    t_search_start = _pc()
+    # Execute Qdrant search in executor to avoid blocking the event loop
+    results = await loop.run_in_executor(
+        None, 
+        _qdrant_search, 
+        q, 
+        app.state.qdrant_collection, 
+        emb, 
+        top_k, 
+        group_id
+    )
+    search_ms = int((_pc() - t_search_start) * 1000.0)
+    
+    items = [FaceSearchTopKItem(**r) for r in results]
+
+    # Enhanced timing metadata
+    full_meta = (meta or {}).copy()
+    timing = full_meta.get("timing", {})
+    timing.update({
+        "decode_ms": decode_ms,
+        "model_ms": embed_ms, 
+        "search_ms": search_ms,
+        "total_ms": int((_pc() - t_start) * 1000.0)
+    })
+    full_meta["timing"] = timing
+
+    # Offload logging to background task
+    background_tasks.add_task(
+        _log_recognition_event_background,
+        bgr,
+        results,
+        meta,
+        results[0]["subject_id"] if results else None,
+        results[0]["similarity"] if results else None,
+        items,
+        app.state.events,
+        app.state.search_thumbs_dir
+    )
 
     if not items:
-        return FaceRecognizeResponse(matched=False, results=[], meta=meta)
+        return FaceRecognizeResponse(matched=False, results=[], meta=full_meta)
 
     best = items[0]
     if float(best.similarity) >= float(min_sim) and str(best.subject_id).strip():
@@ -3189,9 +3106,9 @@ async def faces_recognize_upload(
             subject_id=best.subject_id,
             similarity=float(best.similarity),
             results=items,
-            meta=meta,
+            meta=full_meta,
         )
-    return FaceRecognizeResponse(matched=False, results=items, meta=meta)
+    return FaceRecognizeResponse(matched=False, results=items, meta=full_meta)
 
 
 @app.post("/v1/quality/check_upload", response_model=QualityCheckResponse)
@@ -3513,15 +3430,56 @@ def get_subject(subject_id: str) -> SubjectItem:
 @app.get("/health")
 def health() -> dict[str, Any]:
     q = getattr(app.state, "qdrant", None)
-    n = 0
+    gpu = getattr(app.state, "gpu", None)
+    
+    subjects_count = 0
+    groups_count = 0
     if q is not None:
         try:
-            n = len(_qdrant_list_subjects(q, getattr(app.state, "qdrant_collection", None)))
+            subjects_count = len(_qdrant_list_subjects(q, getattr(app.state, "qdrant_collection", None)))
         except Exception:
-            n = 0
+            subjects_count = 0
+        
+        try:
+            group_collection = os.environ.get("QDRANT_GROUPS_COLLECTION", "face_groups")
+            if q.collection_exists(group_collection):
+                res = q.count(collection_name=group_collection)
+                groups_count = getattr(res, "count", 0)
+        except Exception:
+            groups_count = 0
+
+    gpu_status = {}
+    if gpu is not None:
+        try:
+            gpu_status = {
+                "queue_size": gpu._queue.qsize(),
+                "max_queue": gpu._queue.maxsize,
+                "workers": len(gpu._workers),
+                "batch_window_s": gpu._batch_window_s,
+            }
+        except Exception:
+            gpu_status = {"error": "failed to get gpu status"}
+
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    
+    # Proactive GC if memory is high (e.g., > 1GB)
+    if mem_info.rss > 1024 * 1024 * 1024:
+        gc.collect()
+        mem_info = process.memory_info()
+
     return {
         "ok": True,
-        "subjects": n,
+        "subjects": subjects_count,
+        "groups": groups_count,
         "qdrant_enabled": q is not None,
         "qdrant_collection": getattr(app.state, "qdrant_collection", None),
+        "gpu_inference": gpu_status,
+        "system": {
+            "memory_rss_mb": mem_info.rss / (1024 * 1024),
+            "memory_vms_mb": mem_info.vms / (1024 * 1024),
+            "cpu_percent": process.cpu_percent(),
+            "threads": process.num_threads(),
+            "gc_objects": len(gc.get_objects()),
+        }
     }

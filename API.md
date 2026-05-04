@@ -27,8 +27,9 @@ Environment variables (Docker Compose sets most of these):
 GPU / performance:
 
 - `GPU_INFERENCE_MANAGER` (`1` enables serialized GPU execution, `0` disables)
-- `GPU_QUEUE_MAX` (default: `256`) max queue size for GPU inference manager
-- `GPU_BATCH_WINDOW_MS` (default: `0`) micro-batching window (0 disables batching)
+- `GPU_QUEUE_MAX` (default: `2048`) max queue size for GPU inference manager
+- `GPU_BATCH_WINDOW_MS` (default: `10`) micro-batching window
+- `GPU_NUM_WORKERS` (default: `4`) number of concurrent GPU inference workers
 - `BUFFALO_ENABLE_FALLBACK_VARIANTS` (`0` disables expensive rotation/scale fallback on no-face)
 
 Storage:
@@ -54,6 +55,7 @@ here is the reference for the api: fs_9f2b8a71c4d04e5e9b3d8a7c6b5a4f3e
 - The service stores one vector per uploaded/enrolled image in Qdrant
 - Each vector has payload:
   - `subject_id` (string)
+  - `group_id` (string, optional)
   - `image_id` (string, UUID per image)
   - `created_at` (ISO8601 string)
   - `thumb_path` (string, e.g. `/thumbs/{image_id}.jpg`)
@@ -73,8 +75,22 @@ Response (example):
 {
   "ok": true,
   "subjects": 1,
+  "groups": 2,
   "qdrant_enabled": true,
-  "qdrant_collection": "frigate_faces"
+  "qdrant_collection": "frigate_faces",
+  "gpu_inference": {
+    "queue_size": 0,
+    "max_queue": 2048,
+    "workers": 4,
+    "batch_window_s": 0.01
+  },
+  "system": {
+    "memory_rss_mb": 450.5,
+    "memory_vms_mb": 1200.2,
+    "cpu_percent": 12.5,
+    "threads": 15,
+    "gc_objects": 45000
+  }
 }
 ```
 
@@ -131,6 +147,40 @@ Response (example):
 }
 ```
 
+## Group management
+
+### `POST /v1/groups`
+
+Create a new group.
+
+Request body:
+```json
+{
+  "group_id": "employees",
+  "name": "Employee Group",
+  "meta": {}
+}
+```
+
+### `GET /v1/groups`
+
+List all groups.
+
+Response:
+```json
+{
+  "groups": [
+    {"group_id": "employees", "name": "Employee Group", "meta": {}}
+  ]
+}
+```
+
+### `DELETE /v1/groups/{group_id}`
+
+Delete a group.
+
+---
+
 ## Enrollment (Add)
 
 You can enroll faces using either JSON (base64) or multipart upload.
@@ -141,7 +191,8 @@ Request body:
 ```json
 {
   "subject_id": "alice",
-  "images_b64": ["<base64-encoded-image>", "<base64-encoded-image>"]
+  "images_b64": ["<base64-encoded-image>"],
+  "group_id": "employees"
 }
 ```
 
@@ -168,6 +219,7 @@ curl -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/faces/add" 
 Form fields:
 
 - `subject_id` (text)
+- `group_id` (text, optional)
 - `files` (one or more images)
 
 Curl (Windows `curl.exe`):
@@ -189,7 +241,8 @@ Request body:
 ```json
 {
   "image_b64": "<base64-encoded-image>",
-  "top_k": 5
+  "top_k": 5,
+  "group_id": "employees"
 }
 ```
 
@@ -209,6 +262,7 @@ Form fields:
 
 - `file` (image)
 - `top_k` (optional, default `5`)
+- `group_id` (optional)
 
 Curl:
 ```powershell
@@ -239,7 +293,8 @@ Request body:
 {
   "image_b64": "<base64-encoded-image>",
   "top_k": 5,
-  "min_similarity": 0.75
+  "min_similarity": 0.75,
+  "group_id": "employees"
 }
 ```
 
@@ -262,6 +317,7 @@ Form fields:
 - `file` (image)
 - `top_k` (optional, default `5`)
 - `min_similarity` (optional)
+- `group_id` (optional)
 
 Curl:
 ```powershell
@@ -440,6 +496,7 @@ Form fields:
 - `top_k` (optional, default `5`)
 - `min_similarity` (optional)
 - `process_all_faces` (optional, default `false`) process multiple faces per image
+- `group_id` (optional) filter recognition by group
 
 Response includes `meta.timing` when available:
 
