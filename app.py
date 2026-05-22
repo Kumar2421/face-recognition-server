@@ -35,7 +35,8 @@ from src.models.schemas import (
     SearchEventResponse, SearchEventsListResponse, SearchEventsStatsResponse,
     RecognitionStatsResponse, EventFeedbackRequest, EventFeedbackResponse,
     FeedbackStatsResponse, RecognitionFetchRequest, FaceSubjectsResponse,
-    FaceDeleteSubjectResponse
+    FaceDeleteSubjectResponse, FaceCompareRequest, FaceCompareResponse,
+    PrivacyExtractRequest, PrivacyExtractResponse, PrivacyCropItem
 )
 from src.utils.helpers import (
     _sha1_hex, _sha1_bytes_hex, _uuid5_from_name, _decode_b64_image,
@@ -344,17 +345,18 @@ def _save_search_query_assets(bgr: np.ndarray, image_id: str) -> tuple[str, str]
 
 
 def _decode_b64_bytes(image_b64: str) -> bytes:
+    if image_b64.startswith(("http://", "https://")):
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                r = client.get(image_b64)
+                r.raise_for_status()
+                return r.content
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"failed to download image from URL: {e}")
     try:
         return base64.b64decode(image_b64)
     except Exception:
         raise HTTPException(status_code=400, detail="invalid image_b64")
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="empty image")
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise HTTPException(status_code=400, detail="unable to decode image")
-    return bgr
 
 
 def _quality_check_and_embed(bgr: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
@@ -652,16 +654,26 @@ def _no_match_auto_attach_min_margin() -> float:
         return 0.10
 
 
-def _qdrant_search(client, collection: str, emb: np.ndarray, top_k: int, group_id: str | None = None) -> list[dict[str, Any]]:
+def _qdrant_search(
+    client, 
+    collection: str, 
+    emb: np.ndarray, 
+    top_k: int, 
+    group_id: str | None = None,
+    branch: str | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None
+) -> list[dict[str, Any]]:
     t0 = _t()
     try:
         search_params = None
         try:
-            from qdrant_client.http.models import SearchParams
+            from qdrant_client.http.models import SearchParams, Filter, FieldCondition, MatchValue, Range
         except Exception:
             SearchParams = None  # type: ignore
 
         if SearchParams is not None:
+            # ... (rest of search_params logic)
             try:
                 ef_raw = str(os.environ.get("QDRANT_HNSW_EF", "") or "").strip()
                 ef = int(ef_raw) if ef_raw else None
@@ -693,19 +705,29 @@ def _qdrant_search(client, collection: str, emb: np.ndarray, top_k: int, group_i
             except Exception:
                 search_params = None
 
-        search_filter = None
+        must_filters = []
         if group_id:
-            try:
-                from qdrant_client.http.models import Filter, FieldCondition, MatchValue
-                search_filter = Filter(must=[FieldCondition(key="group_id", match=MatchValue(value=group_id))])
-            except Exception:
-                pass
+            must_filters.append(FieldCondition(key="group_id", match=MatchValue(value=group_id)))
+        if branch:
+            must_filters.append(FieldCondition(key="branch", match=MatchValue(value=branch)))
+        
+        if since_ts or until_ts:
+            r_kwargs = {}
+            if since_ts:
+                r_kwargs["gte"] = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+            if until_ts:
+                r_kwargs["lte"] = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat()
+            must_filters.append(FieldCondition(key="created_at", range=Range(**r_kwargs)))
+
+        search_filter = None
+        if must_filters:
+            search_filter = Filter(must=must_filters)
 
         kwargs = dict(
             collection_name=collection,
             query_vector=emb.astype(np.float32).reshape(-1).tolist(),
             limit=int(top_k),
-            with_payload=["subject_id", "image_id", "thumb_path", "group_id"],
+            with_payload=["subject_id", "image_id", "thumb_path", "group_id", "branch", "created_at"],
             query_filter=search_filter
         )
         if search_params is not None:
@@ -902,23 +924,16 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "x-api-key", "Authorization", "Cache-Control", "Accept", "Origin", "X-Requested-With"],
 )
 
 @app.middleware("http")
-async def add_cors_headers(request, call_next):
-    origin = request.headers.get("origin")
-    response = await call_next(request)
-    if origin:
-        # If origin matches our list or we allow all
-        if "*" in cors_origins or origin in cors_origins:
-            response.headers["Access-Control-Allow-Origin"] = origin
-            response.headers["Access-Control-Allow-Credentials"] = "true"
-            response.headers["Access-Control-Allow-Methods"] = "*"
-            response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
+async def rewrite_api_prefix(request, call_next):
+    # Support /api prefix by stripping it from the path
+    if request.url.path.startswith("/api/"):
+        request.scope["path"] = request.url.path[4:]
+    return await call_next(request)
 
 # Static thumbnails: ensure directory exists before mounting
 _thumbs_dir_mount = os.environ.get("THUMBS_DIR", "/data/thumbs")
@@ -980,6 +995,11 @@ def metrics() -> Response:
     except Exception:
         body = b""
     return Response(content=body, media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/robots.txt", include_in_schema=False)
+def robots() -> Response:
+    return Response("User-agent: *\nDisallow: /", media_type="text/plain")
 
 
 def _collect_provider_info() -> dict[str, Any]:
@@ -1196,11 +1216,13 @@ def _startup() -> None:
     if app.state.qdrant is not None:
         try:
             idx: FaceIndex = app.state.index
+            dim = 512 # Buffalo-L embedding dimension
             if idx.mean_embeddings.size > 0:
                 dim = int(idx.mean_embeddings.shape[1])
-                _ensure_qdrant_collection(
-                    app.state.qdrant, app.state.qdrant_collection, vector_size=dim
-                )
+            
+            _ensure_qdrant_collection(
+                app.state.qdrant, app.state.qdrant_collection, vector_size=dim
+            )
         except Exception as e:
             logger.error("failed to ensure qdrant collection: %s", str(e))
 
@@ -1415,8 +1437,11 @@ async def delete_group(group_id: str) -> dict[str, Any]:
 def faces_add(req: FaceAddRequest) -> FaceAddResponse:
     if not req.subject_id or not str(req.subject_id).strip():
         raise HTTPException(status_code=400, detail="subject_id is required")
-    if not req.images_b64:
-        raise HTTPException(status_code=400, detail="images_b64 must be non-empty")
+
+    # Merge images_b64 and image_urls into a single list
+    all_images: list[str] = list(req.images_b64 or []) + list(req.image_urls or [])
+    if not all_images:
+        raise HTTPException(status_code=400, detail="images_b64 or image_urls must be non-empty")
 
     subject_id = str(req.subject_id).strip()
     q = getattr(app.state, "qdrant", None)
@@ -1432,7 +1457,7 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
     emb_dim: int | None = None
     last_meta: dict[str, Any] | None = None
 
-    for i, img_b64 in enumerate(req.images_b64):
+    for i, img_b64 in enumerate(all_images):
         if existing >= cap:
             break
         image_bytes = _decode_b64_bytes(img_b64)
@@ -1537,13 +1562,14 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
 async def faces_add_upload(
     subject_id: str = Form(...),
     group_id: str | None = Form(None),
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] = File(default=[]),
+    image_urls: list[str] = Form(default=[]),
 ) -> FaceAddResponse:
     subject_id = str(subject_id or "").strip()
     if not subject_id:
         raise HTTPException(status_code=400, detail="subject_id is required")
-    if not files:
-        raise HTTPException(status_code=400, detail="files must be non-empty")
+    if not files and not image_urls:
+        raise HTTPException(status_code=400, detail="files or image_urls must be non-empty")
 
     q = getattr(app.state, "qdrant", None)
     if q is None:
@@ -1646,13 +1672,104 @@ async def faces_add_upload(
         num_embedded += 1
         existing += 1
 
+    # Process image URLs
+    for i, url in enumerate(image_urls):
+        if existing >= cap:
+            break
+        url = str(url or "").strip()
+        if not url:
+            continue
+        image_bytes = _decode_b64_bytes(url)
+        bgr = _decode_image_bytes(image_bytes)
+        try:
+            emb, meta = _quality_check_and_embed(bgr)
+        except HTTPException as e:
+            _debug(f"add_skip subject_id={subject_id} url_idx={i} reason={e.detail}")
+            continue
+        last_meta = meta
+        emb_dim = int(emb.reshape(-1).shape[0])
+        try:
+            _ensure_qdrant_collection(q, app.state.qdrant_collection, vector_size=emb_dim)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"qdrant init failed: {str(e)}")
+
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
+        image_id = image_hash[:16]
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{subject_id}:{image_hash}"))
+        thumb_path = _save_thumb(bgr, app.state.thumbs_dir, image_id)
+        image_path = _save_image(bgr, os.environ.get("IMAGES_DIR", "/data/images"), subject_id, image_id)
+
+        if _enroll_dup_check_enabled():
+            try:
+                thr = float(_enroll_dup_min_similarity())
+                hits = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1)
+                if hits:
+                    best = hits[0]
+                    best_sid = str(best.get("subject_id") or "").strip()
+                    best_sim = float(best.get("similarity") or 0.0)
+                    if best_sid and best_sid != subject_id and best_sim >= thr:
+                        extra = {
+                            "matched_subject_id": best_sid,
+                            "similarity": float(best_sim),
+                            "threshold": float(thr),
+                            "source_url": url,
+                        }
+                        last_meta = last_meta or {}
+                        last_meta["enroll_duplicate_check"] = _quarantine_enroll_possible_match(
+                            bgr,
+                            subject_id=subject_id,
+                            image_id=image_id,
+                            reason="possible_match",
+                            extra=extra,
+                        )
+                        continue
+            except Exception:
+                pass
+
+        try:
+            from qdrant_client.http.models import PointStruct
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"qdrant client error: {str(e)}")
+
+        t0 = _t()
+        try:
+            q.upsert(
+                collection_name=app.state.qdrant_collection,
+                points=[
+                    PointStruct(
+                        id=point_id,
+                        vector=emb.astype(np.float32).reshape(-1).tolist(),
+                        payload={
+                            "subject_id": subject_id,
+                            "group_id": group_id,
+                            "image_id": image_id,
+                            "created_at": _iso_now(),
+                            "thumb_path": thumb_path,
+                            "image_path": image_path,
+                            "source": "enroll",
+                        },
+                    )
+                ],
+            )
+        except Exception as e:
+            _QDRANT_ERR.inc()
+            raise HTTPException(status_code=500, detail=f"qdrant upsert failed: {str(e)}")
+        finally:
+            try:
+                _QDRANT_UPSERT_LAT.observe(max(0.0, _t() - t0))
+            except Exception:
+                pass
+
+        num_embedded += 1
+        existing += 1
+
     if num_embedded == 0:
         raise HTTPException(status_code=404, detail="no faces embedded from provided images")
 
     _record_event(app.state.enroll_events)
     return FaceAddResponse(
         subject_id=subject_id,
-        num_images=len(files),
+        num_images=len(files) + len(image_urls),
         num_embedded=num_embedded,
         embedding_dim=emb_dim,
         meta=last_meta,
@@ -1711,6 +1828,7 @@ def faces_search(req: FaceSearchTopKRequest) -> FaceSearchTopKResponse:
 async def faces_search_upload(
     file: UploadFile = File(...),
     top_k: int = Form(5),
+    group_id: Optional[str] = Form(None),
 ) -> FaceSearchTopKResponse:
     q = getattr(app.state, "qdrant", None)
     if q is None:
@@ -1722,7 +1840,8 @@ async def faces_search_upload(
     bgr = _decode_image_bytes(image_bytes)
     emb, _meta = _quality_check_and_embed(bgr)
     results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, group_id=group_id)
-    
+
+    thumb_path = None
     # Persistent Logging
     try:
         from events_store import SearchEvent
@@ -3143,6 +3262,205 @@ async def quality_check_upload(file: UploadFile = File(...)) -> QualityCheckResp
     )
 
 
+@app.post("/v1/faces/privacy_extract", response_model=PrivacyExtractResponse)
+async def privacy_extract(req: PrivacyExtractRequest) -> PrivacyExtractResponse:
+    t0 = _pc()
+    bgr = _decode_b64_image(req.image_b64)
+    
+    # Use GPU manager if available, else direct embedder
+    infer = getattr(app.state, "gpu", None) or app.state.embedder
+    try:
+        faces = infer.detect_all(bgr)
+    except Exception as e:
+        if "no face" in str(e).lower():
+            return PrivacyExtractResponse(results=[])
+        raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
+
+    evaluator = getattr(app.state, "quality", None)
+    results = []
+    
+    # Compute date window for recognition filtering
+    since_ts, until_ts = _date_window_from_params(
+        day=req.day,
+        from_day=req.from_day,
+        to_day=req.to_day,
+        since_ts=req.since_ts,
+        until_ts=req.until_ts
+    )
+
+    # We need bboxes for all faces to blur them
+    all_bboxes = []
+    for f in faces:
+        bbox_arr = np.asarray(getattr(f, "bbox", None), dtype=np.float32).reshape(-1)
+        if bbox_arr.size == 4:
+            all_bboxes.append(bbox_arr.tolist())
+
+    for i, target_face in enumerate(faces):
+        # 1. Quality filtering BEFORE any processing (on original image)
+        quality_meta = None
+        if evaluator:
+            try:
+                quality_meta = evaluator.evaluate(bgr, target_face)
+            except Exception:
+                pass
+        
+        # 2. Define crop region with 150px padding
+        target_bbox = np.asarray(getattr(target_face, "bbox", None), dtype=np.float32).reshape(-1)
+        x1_t, y1_t, x2_t, y2_t = [int(v) for v in target_bbox]
+        h, w = bgr.shape[:2]
+        
+        # Add 150px padding
+        crop_x1 = max(0, x1_t - 150)
+        crop_y1 = max(0, y1_t - 150)
+        crop_x2 = min(w, x2_t + 150)
+        crop_y2 = min(h, y2_t + 150)
+        
+        # Extract the crop
+        crop_bgr = bgr[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+        
+        # 3. Privacy blurring within the crop
+        for j, other_bbox in enumerate(all_bboxes):
+            if i == j:
+                continue # Don't blur the target face
+            
+            ox1, oy1, ox2, oy2 = [int(v) for v in other_bbox]
+            
+            # Map original coordinates to crop coordinates
+            lx1 = max(0, ox1 - crop_x1)
+            ly1 = max(0, oy1 - crop_y1)
+            lx2 = min(crop_bgr.shape[1], ox2 - crop_x1)
+            ly2 = min(crop_bgr.shape[0], oy2 - crop_y1)
+            
+            # Check if other face is even partially within the crop
+            if lx2 > lx1 and ly2 > ly1:
+                face_region = crop_bgr[ly1:ly2, lx1:lx2]
+                fw = lx2 - lx1
+                fh = ly2 - ly1
+                k_size = int(max(fw, fh) / 3) | 1
+                if k_size < 3: k_size = 3
+                
+                blurred_face = cv2.GaussianBlur(face_region, (k_size, k_size), 30)
+                crop_bgr[ly1:ly2, lx1:lx2] = blurred_face
+
+        # 4. Optional Recognition
+        rec_res = None
+        if req.recognition:
+            emb = getattr(target_face, "normed_embedding", None)
+            if emb is None:
+                emb = getattr(target_face, "embedding", None)
+            
+            if emb is not None:
+                emb = _l2_normalize(np.asarray(emb, dtype=np.float32))
+                q = getattr(app.state, "qdrant", None)
+                if q:
+                    search_results = _qdrant_search(
+                        q, 
+                        app.state.qdrant_collection, 
+                        emb, 
+                        top_k=req.top_k or 1,
+                        group_id=req.group_id,
+                        branch=req.branch,
+                        since_ts=since_ts,
+                        until_ts=until_ts
+                    )
+                    items = [FaceSearchTopKItem(**r) for r in search_results]
+                    
+                    matched = False
+                    subject_id = None
+                    similarity = None
+                    
+                    if items:
+                        best = items[0]
+                        min_sim = float(app.state.min_similarity)
+                        if float(best.similarity) >= min_sim and str(best.subject_id).strip():
+                            ok, second, margin, req_m = _passes_top2_margin(search_results, float(best.similarity))
+                            if ok:
+                                matched = True
+                                subject_id = best.subject_id
+                                similarity = float(best.similarity)
+                    
+                    rec_res = FaceRecognizeResponse(
+                        matched=matched,
+                        subject_id=subject_id,
+                        similarity=similarity,
+                        results=items
+                    )
+
+        # 5. Encode to base64
+        _, buffer = cv2.imencode('.jpg', crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        crop_b64 = base64.b64encode(buffer).decode('utf-8')
+        
+        results.append(PrivacyCropItem(
+            bbox=target_bbox.tolist() if target_bbox.size == 4 else None,
+            quality=quality_meta,
+            image_b64=f"data:image/jpeg;base64,{crop_b64}",
+            recognition=rec_res
+        ))
+
+    return PrivacyExtractResponse(results=results)
+
+
+def _compare_two_faces(bgr1: np.ndarray, bgr2: np.ndarray) -> FaceCompareResponse:
+    t0 = _pc()
+    emb1, meta1 = _quality_check_and_embed(bgr1)
+    emb2, meta2 = _quality_check_and_embed(bgr2)
+    similarity = float(np.dot(emb1, emb2))
+    is_match = similarity > 0.45
+    if similarity > 0.45:
+        confidence = "High"
+    elif similarity > 0.35:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+    return FaceCompareResponse(
+        similarity=similarity,
+        match=is_match,
+        confidence=confidence,
+        meta={
+            "timing_ms": int((_pc() - t0) * 1000),
+            "image1_meta": meta1,
+            "image2_meta": meta2,
+        },
+    )
+
+
+@app.post("/v1/face/compare", response_model=FaceCompareResponse, dependencies=[Depends(get_api_key)])
+def face_compare_json(req: FaceCompareRequest) -> FaceCompareResponse:
+    src1 = req.image1_b64 or req.image1_url
+    src2 = req.image2_b64 or req.image2_url
+    if not src1 or not src2:
+        raise HTTPException(status_code=400, detail="two images required: provide image1_b64/image1_url and image2_b64/image2_url")
+    bgr1 = _decode_image_bytes(_decode_b64_bytes(src1))
+    bgr2 = _decode_image_bytes(_decode_b64_bytes(src2))
+    return _compare_two_faces(bgr1, bgr2)
+
+
+@app.post("/v1/face/compare_upload", response_model=FaceCompareResponse, dependencies=[Depends(get_api_key)])
+async def face_compare_upload(
+    file1: UploadFile | None = File(default=None),
+    file2: UploadFile | None = File(default=None),
+    image1_url: str | None = Form(default=None),
+    image2_url: str | None = Form(default=None),
+) -> FaceCompareResponse:
+    # Resolve image 1: file takes priority, then URL
+    if file1 and file1.size:
+        bgr1 = _decode_image_bytes(await file1.read())
+    elif image1_url:
+        bgr1 = _decode_image_bytes(_decode_b64_bytes(image1_url))
+    else:
+        raise HTTPException(status_code=400, detail="image 1 required: provide file1 or image1_url")
+
+    # Resolve image 2: file takes priority, then URL
+    if file2 and file2.size:
+        bgr2 = _decode_image_bytes(await file2.read())
+    elif image2_url:
+        bgr2 = _decode_image_bytes(_decode_b64_bytes(image2_url))
+    else:
+        raise HTTPException(status_code=400, detail="image 2 required: provide file2 or image2_url")
+
+    return _compare_two_faces(bgr1, bgr2)
+
+
 @app.post("/v1/face/search_upload", response_model=FaceSearchResponse, dependencies=[Depends(get_api_key)])
 async def face_search_upload(file: UploadFile = File(...)) -> FaceSearchResponse:
     image_bytes = await file.read()
@@ -3427,7 +3745,7 @@ def get_subject(subject_id: str) -> SubjectItem:
     cap = _subject_embedding_cap()
     n = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id)
     return SubjectItem(subject_id=subject_id, embeddings_count=n, embeddings_cap=cap, embeddings_capped=bool(n >= cap))
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "POST"])
 def health() -> dict[str, Any]:
     q = getattr(app.state, "qdrant", None)
     gpu = getattr(app.state, "gpu", None)

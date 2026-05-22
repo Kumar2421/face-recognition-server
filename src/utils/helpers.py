@@ -5,6 +5,7 @@ import time
 import os
 import cv2
 import numpy as np
+import httpx
 from datetime import datetime, timezone
 from fastapi import HTTPException
 
@@ -18,11 +19,21 @@ def _uuid5_from_name(name: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_OID, name))
 
 def _decode_b64_image(image_b64: str) -> np.ndarray:
-    try:
-        img = base64.b64decode(image_b64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid base64")
-    arr = np.frombuffer(img, dtype=np.uint8)
+    if image_b64.startswith(("http://", "https://")):
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                r = client.get(image_b64)
+                r.raise_for_status()
+                img_bytes = r.content
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"failed to download image from URL: {e}")
+    else:
+        try:
+            img_bytes = base64.b64decode(image_b64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid base64")
+    
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
         raise HTTPException(status_code=400, detail="unable to decode image")

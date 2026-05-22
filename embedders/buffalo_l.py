@@ -96,7 +96,25 @@ class BuffaloLEmbedder:
 
         self.min_det_score = float(min_det_score)
         self.det_size = int(det_size)
-        self.providers = [p.strip() for p in str(providers).split(",") if p.strip()]
+        
+        # Parse providers and set up optimized options
+        raw_providers = [p.strip() for p in str(providers).split(",") if p.strip()]
+        self.providers = []
+        
+        cuda_mem_limit = int(os.environ.get("ORT_CUDA_MEMORY_LIMIT_MB", "0")) * 1024 * 1024
+        arena_strategy = os.environ.get("ORT_CUDA_ARENA_EXTEND_STRATEGY", "kNextPowerOfTwo")
+        
+        for p in raw_providers:
+            if p == "CUDAExecutionProvider":
+                opts = {"device_id": 0}
+                if cuda_mem_limit > 0:
+                    opts["gpu_mem_limit"] = cuda_mem_limit
+                if arena_strategy:
+                    opts["arena_extend_strategy"] = arena_strategy
+                self.providers.append((p, opts))
+            else:
+                self.providers.append(p)
+
         self.enable_fallback_variants = str(
             os.environ.get("BUFFALO_ENABLE_FALLBACK_VARIANTS", "1")
         ).strip() not in ("0", "false", "False")

@@ -23,9 +23,15 @@ services:
       dockerfile: Dockerfile
 
     volumes:
+      - ./app.py:/app/app.py
+      - ./cross_check.py:/app/cross_check.py
+      - ./ui_page.py:/app/ui_page.py
+      - ./quality:/app/quality
+      - ./embedders:/app/embedders
+      - ./src:/app/src
       - ./input:/data/input:ro
       - ./facefolder:/data/facefolder:ro
-      - ./buffalo_l/models:/models:ro
+      - ./buffalo_l/models:/models:rw
       - ./data/thumbs:/data/thumbs
       - ./data/images:/data/images
       - ./images/events:/data/events
@@ -37,7 +43,7 @@ services:
       - FACE_DIR=/data/facefolder/security
       - CONFIG_PATH=/app/config.yaml
       - QDRANT_URL=http://qdrant:6333
-      - QDRANT_COLLECTION=frigate_faces_v24
+      - QDRANT_COLLECTION=frigate_faces_v25
       # - QDRANT_COLLECTION=frigate_faces_v10
       # - QDRANT_COLLECTION=frigate_faces_v3
       # - QDRANT_COLLECTION=frigate_faces_v2
@@ -50,15 +56,19 @@ services:
       - FACE_SERVICE_DEBUG=1
       - BUFFALO_MIN_DET_SCORE=0.3
       - BUFFALO_ENABLE_FALLBACK_VARIANTS=0
-      - BUFFALO_PROVIDERS=TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider
-      - ORT_TENSORRT_ENGINE_CACHE_ENABLE=1
+      - BUFFALO_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider
+      - ORT_TENSORRT_ENGINE_CACHE_ENABLE=0
       - ORT_TENSORRT_CACHE_PATH=/data/trt_cache
-      - ORT_TENSORRT_FP16_ENABLE=1
+      - ORT_TENSORRT_FP16_ENABLE=0
       - FACE_EMBEDDINGS_INDEX=/data/facefolder/security_embeddings/index.json
       - GPU_INFERENCE_MANAGER=1
       - GPU_QUEUE_MAX=2048
-      - GPU_BATCH_WINDOW_MS=10
-      - GPU_NUM_WORKERS=4
+      - GPU_BATCH_WINDOW_MS=0
+      - GPU_NUM_WORKERS=2
+      - GPU_JOB_TIMEOUT_SEC=180
+      # ONNXRuntime Memory Optimizations
+      - ORT_CUDA_MEMORY_LIMIT_MB=4096
+      - ORT_CUDA_ARENA_EXTEND_STRATEGY=kSameAsRequested
       - RECOGNITION_LOGGING_ENABLED=0
       - FACE_SERVICE_MAX_FACES_PER_IMAGE=1
       - FACE_SERVICE_FORCE_SINGLE_FACE=1
@@ -71,7 +81,7 @@ services:
       - AUTO_ADD_EMBEDDING_ENABLE=1
       - AUTO_ADD_EMBEDDING_MIN_SIM=0.80
       - SUBJECT_MAX_EMBEDDINGS=10
-      - ENROLL_DUPLICATE_CHECK_ENABLE=1
+      - ENROLL_DUPLICATE_CHECK_ENABLE=0
       - ENROLL_DUPLICATE_MIN_SIM=0.80
       - NO_MATCH_AUTO_ENROLL_ENABLE=1
       - NO_MATCH_AUTO_ENROLL_PREFIX=visiter
@@ -113,26 +123,26 @@ services:
   #     - SFTP_FILENAME_INCLUDE_ANY=FACE_SNAP
   #     - SFTP_FILENAME_EXCLUDE_ANY=FACE_BACKGROUND
 
-  external_api_poller:
-    container_name: external_api_poller
-    restart: unless-stopped
-    depends_on:
-      - face_service
-    build:
-      context: .
-      dockerfile: Dockerfile
-    command: ["python3.11", "external_api_poller.py"]
-    environment:
-      - CONFIG_PATH=/app/config.yaml
-      - API_BASE_URL=http://face_service:8000
-      - SYNC_DATE=${SYNC_DATE:-2026-04-18}
+  # external_api_poller:
+  #   container_name: external_api_poller
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - face_service
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   command: ["python3.11", "external_api_poller.py"]
+  #   environment:
+  #     - CONFIG_PATH=/app/config.yaml
+  #     - API_BASE_URL=http://face_service:8000
+  #     - SYNC_DATE=${SYNC_DATE:-2026-04-18}
 
-      - SFTP_MAX_FILES_PER_CAMERA_PER_TICK=500
-      - SFTP_TIMEZONE=Asia/Kolkata
-      - SFTP_SINCE_DATETIME=19-04-2026:12 am
-      - SFTP_UNTIL_DATETIME=20-04-2026:1 am
-    volumes:
-      - .:/app:rw
+  #     - SFTP_MAX_FILES_PER_CAMERA_PER_TICK=500
+  #     - SFTP_TIMEZONE=Asia/Kolkata
+  #     - SFTP_SINCE_DATETIME=19-04-2026:12 am
+  #     - SFTP_UNTIL_DATETIME=20-04-2026:1 am
+  #   volumes:
+  #     - .:/app:rw
 
   qdrant:
     image: qdrant/qdrant:latest

@@ -144,6 +144,13 @@ export async function facesAddUpload(subjectId: string, files: File[]): Promise<
   return apiPostForm('/v1/faces/add_upload', form);
 }
 
+export async function compareFacesUpload(file1: File, file2: File): Promise<any> {
+  const form = new FormData();
+  form.append('file1', file1, file1.name || 'image1.jpg');
+  form.append('file2', file2, file2.name || 'image2.jpg');
+  return apiPostForm('/v1/face/compare_upload', form);
+}
+
 export async function facesSearchUpload(file: File, topK: number = 5, filter: DateFilter = {}): Promise<any> {
   const form = new FormData();
   form.append('file', file, file.name || 'query.jpg');

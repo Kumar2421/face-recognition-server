@@ -1,10 +1,13 @@
 import { useRef, useState } from 'react';
-import { facesRecognizeUpload, facesSearchUpload, getApiBase, qualityCheckUpload } from '../lib/api';
+import { facesRecognizeUpload, facesSearchUpload, getApiBase, qualityCheckUpload, compareFacesUpload } from '../lib/api';
 
 type Item = { subject_id: string; similarity: number; point_id?: string; image_id?: string; thumb_path?: string };
 
 export default function Search() {
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const compareFile1Ref = useRef<HTMLInputElement | null>(null);
+  const compareFile2Ref = useRef<HTMLInputElement | null>(null);
+
   const [topK, setTopK] = useState<number>(5);
   const [results, setResults] = useState<Item[]>([]);
   const [queryThumb, setQueryThumb] = useState<string | null>(null);
@@ -17,6 +20,14 @@ export default function Search() {
   const [fromDay, setFromDay] = useState<string>('');
   const [toDay, setToDay] = useState<string>('');
   const [showJson, setShowJson] = useState<boolean>(false);
+
+  // New state for Comparison feature
+  const [mode, setMode] = useState<'search' | 'compare'>('search');
+  const [compareFile1, setCompareFile1] = useState<File | null>(null);
+  const [compareFile2, setCompareFile2] = useState<File | null>(null);
+  const [comparePreview1, setComparePreview1] = useState<string | null>(null);
+  const [comparePreview2, setComparePreview2] = useState<string | null>(null);
+  const [compareResult, setCompareResult] = useState<any>(null);
 
   async function runSearch(kind: 'search' | 'recognize') {
     setError('');
@@ -72,106 +83,376 @@ export default function Search() {
     }
   }
 
+  async function runCompare() {
+    setError('');
+    setCompareResult(null);
+    if (!compareFile1 || !compareFile2) {
+      setError('Select two images to compare');
+      return;
+    }
+    try {
+      setLoading(true);
+      setJsonResponse(null);
+      const r = await compareFacesUpload(compareFile1, compareFile2);
+      setJsonResponse(r);
+      setCompareResult(r);
+    } catch (e: any) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, setter: (f: File | null) => void, previewSetter: (p: string | null) => void) => {
+    const file = e.target.files?.[0] || null;
+    setter(file);
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => previewSetter(reader.result as string);
+      reader.readAsDataURL(file);
+    } else {
+      previewSetter(null);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent, setter: (f: File | null) => void, previewSetter: (p: string | null) => void) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files?.[0] || null;
+    if (file && file.type.startsWith('image/')) {
+      setter(file);
+      const reader = new FileReader();
+      reader.onloadend = () => previewSetter(reader.result as string);
+      reader.readAsDataURL(file);
+    }
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
       <header>
-        <h2 style={{ fontSize: '1.875rem', fontWeight: 800, color: 'var(--text-primary)', marginBottom: '4px' }}>Search & Recognition</h2>
-        <p style={{ color: 'var(--text-secondary)', fontSize: '0.9375rem' }}>Verify identity or find similar faces in the database.</p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div>
+            <h2 style={{ fontSize: '1.875rem', fontWeight: 800, color: 'var(--text-primary)', marginBottom: '4px' }}>
+              {mode === 'search' ? 'Search & Recognition' : 'Face Comparison'}
+            </h2>
+            <p style={{ color: 'var(--text-secondary)', fontSize: '0.9375rem' }}>
+              {mode === 'search'
+                ? 'Verify identity or find similar faces in the database.'
+                : 'Compare two face images to check if they belong to the same person.'}
+            </p>
+          </div>
+          <div style={{ display: 'flex', gap: '8px', background: 'var(--bg-secondary)', padding: '4px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)' }}>
+            <button
+              onClick={() => setMode('search')}
+              style={{
+                padding: '6px 12px',
+                fontSize: '0.875rem',
+                fontWeight: 600,
+                borderRadius: 'var(--radius-sm)',
+                background: mode === 'search' ? 'var(--bg-primary)' : 'transparent',
+                color: mode === 'search' ? 'var(--text-primary)' : 'var(--text-secondary)',
+                boxShadow: mode === 'search' ? 'var(--shadow-sm)' : 'none',
+                border: 'none'
+              }}
+            >
+              Search
+            </button>
+            <button
+              onClick={() => setMode('compare')}
+              style={{
+                padding: '6px 12px',
+                fontSize: '0.875rem',
+                fontWeight: 600,
+                borderRadius: 'var(--radius-sm)',
+                background: mode === 'compare' ? 'var(--bg-primary)' : 'transparent',
+                color: mode === 'compare' ? 'var(--text-primary)' : 'var(--text-secondary)',
+                boxShadow: mode === 'compare' ? 'var(--shadow-sm)' : 'none',
+                border: 'none'
+              }}
+            >
+              Compare
+            </button>
+          </div>
+        </div>
       </header>
 
-      <div className="card" style={{ display: 'grid', gap: '24px', maxWidth: '800px', background: 'var(--bg-primary)' }}>
-        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-          <button 
-            onClick={() => setShowJson(!showJson)} 
-            style={{ 
-              fontSize: '0.75rem', 
-              padding: '4px 8px', 
-              background: showJson ? 'var(--primary)' : 'var(--bg-secondary)',
-              color: showJson ? 'white' : 'var(--text-secondary)',
-              border: '1px solid var(--border)',
-              borderRadius: '4px'
-            }}
-          >
-            {showJson ? 'Hide JSON' : 'Show JSON'}
-          </button>
-        </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 120px', gap: '20px' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Query Image</label>
-            <div style={{ 
-              border: '2px dashed var(--border)', 
-              borderRadius: 'var(--radius-md)', 
-              padding: '24px', 
-              textAlign: 'center',
-              background: 'var(--bg-secondary)',
-              cursor: 'pointer'
-            }} onClick={() => fileRef.current?.click()}>
-              <input type="file" ref={fileRef} accept="image/*" style={{ display: 'none' }} />
-              <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{fileRef.current?.files?.[0]?.name || 'Select Image...'}</span>
+      {mode === 'search' ? (
+        <div className="card" style={{ display: 'grid', gap: '24px', maxWidth: '800px', background: 'var(--bg-primary)' }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <button
+              onClick={() => setShowJson(!showJson)}
+              style={{
+                fontSize: '0.75rem',
+                padding: '4px 8px',
+                background: showJson ? 'var(--primary)' : 'var(--bg-secondary)',
+                color: showJson ? 'white' : 'var(--text-secondary)',
+                border: '1px solid var(--border)',
+                borderRadius: '4px'
+              }}
+            >
+              {showJson ? 'Hide JSON' : 'Show JSON'}
+            </button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 120px', gap: '20px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Query Image</label>
+              <div style={{
+                border: '2px dashed var(--border)',
+                borderRadius: 'var(--radius-md)',
+                padding: '24px',
+                textAlign: 'center',
+                background: 'var(--bg-secondary)',
+                cursor: 'pointer'
+              }} onClick={() => fileRef.current?.click()}>
+                <input type="file" ref={fileRef} accept="image/*" style={{ display: 'none' }} />
+                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{fileRef.current?.files?.[0]?.name || 'Select Image...'}</span>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Top Matches</label>
+              <input
+                type="number"
+                value={topK}
+                min={1}
+                max={50}
+                onChange={(e) => setTopK(Math.max(1, Math.min(50, Number(e.target.value) || 5)))}
+                style={{ padding: '12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)' }}
+              />
             </div>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Top Matches</label>
-            <input
-              type="number"
-              value={topK}
-              min={1}
-              max={50}
-              onChange={(e) => setTopK(Math.max(1, Math.min(50, Number(e.target.value) || 5)))}
-              style={{ padding: '12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)' }}
-            />
+            <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Advanced Filters</span>
+            <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
+              <select value={dateMode} onChange={(e) => setDateMode(e.target.value as any)} style={{ padding: '10px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }}>
+                <option value="all">All Records</option>
+                <option value="day">Single Day</option>
+                <option value="range">Custom Range</option>
+              </select>
+
+              {dateMode === 'day' && (
+                <input type="date" value={day} onChange={(e) => setDay(e.target.value)} style={{ padding: '10px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }} />
+              )}
+
+              {dateMode === 'range' && (
+                <>
+                  <input type="date" value={fromDay} onChange={(e) => setFromDay(e.target.value)} style={{ padding: '10px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }} />
+                  <input type="date" value={toDay} onChange={(e) => setToDay(e.target.value)} style={{ padding: '10px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }} />
+                </>
+              )}
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '12px', borderTop: '1px solid var(--border)', paddingTop: '20px' }}>
+            <button onClick={() => runSearch('search')} className="primary" style={{ flex: 1, padding: '12px', fontWeight: 700 }}>Search Database</button>
+            <button onClick={() => runSearch('recognize')} style={{ flex: 1, padding: '12px', fontWeight: 600, background: 'rgba(167, 139, 250, 0.1)', color: '#7c3aed', border: '1px solid rgba(167, 139, 250, 0.2)' }}>Recognize Face</button>
+            <button onClick={runQualityCheck} style={{ flex: 1, padding: '12px', fontWeight: 600 }}>Quality Check</button>
           </div>
         </div>
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-          <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Advanced Filters</span>
-          <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
-            <select value={dateMode} onChange={(e) => setDateMode(e.target.value as any)} style={{ padding: '10px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }}>
-              <option value="all">All Records</option>
-              <option value="day">Single Day</option>
-              <option value="range">Custom Range</option>
-            </select>
-
-            {dateMode === 'day' && (
-              <input type="date" value={day} onChange={(e) => setDay(e.target.value)} style={{ padding: '10px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }} />
-            )}
-
-            {dateMode === 'range' && (
-              <>
-                <input type="date" value={fromDay} onChange={(e) => setFromDay(e.target.value)} style={{ padding: '10px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }} />
-                <input type="date" value={toDay} onChange={(e) => setToDay(e.target.value)} style={{ padding: '10px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }} />
-              </>
-            )}
+      ) : (
+        <div className="card" style={{ display: 'grid', gap: '24px', maxWidth: '800px', background: 'var(--bg-primary)' }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <button
+              onClick={() => setShowJson(!showJson)}
+              style={{
+                fontSize: '0.75rem',
+                padding: '4px 8px',
+                background: showJson ? 'var(--primary)' : 'var(--bg-secondary)',
+                color: showJson ? 'white' : 'var(--text-secondary)',
+                border: '1px solid var(--border)',
+                borderRadius: '4px'
+              }}
+            >
+              {showJson ? 'Hide JSON' : 'Show JSON'}
+            </button>
           </div>
-        </div>
 
-        <div style={{ display: 'flex', gap: '12px', borderTop: '1px solid var(--border)', paddingTop: '20px' }}>
-          <button onClick={() => runSearch('search')} className="primary" style={{ flex: 1, padding: '12px', fontWeight: 700 }}>Search Database</button>
-          <button onClick={() => runSearch('recognize')} style={{ flex: 1, padding: '12px', fontWeight: 600, background: 'rgba(167, 139, 250, 0.1)', color: '#7c3aed', border: '1px solid rgba(167, 139, 250, 0.2)' }}>Recognize Face</button>
-          <button onClick={runQualityCheck} style={{ flex: 1, padding: '12px', fontWeight: 600 }}>Quality Check</button>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Image 1</label>
+              <div
+                style={{
+                  border: '2px dashed var(--border)',
+                  borderRadius: 'var(--radius-md)',
+                  aspectRatio: '1/1',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: 'var(--bg-secondary)',
+                  cursor: 'pointer',
+                  overflow: 'hidden',
+                  position: 'relative'
+                }}
+                onClick={() => compareFile1Ref.current?.click()}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => handleDrop(e, setCompareFile1, setComparePreview1)}
+              >
+                {comparePreview1 ? (
+                  <img src={comparePreview1} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                ) : (
+                  <div style={{ textAlign: 'center', padding: '12px' }}>
+                    <div style={{ fontSize: '24px', marginBottom: '8px' }}>📸</div>
+                    <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: '0.875rem' }}>Drop or Select Image 1</div>
+                  </div>
+                )}
+                <input type="file" ref={compareFile1Ref} accept="image/*" style={{ display: 'none' }} onChange={(e) => handleFileChange(e, setCompareFile1, setComparePreview1)} />
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Image 2</label>
+              <div
+                style={{
+                  border: '2px dashed var(--border)',
+                  borderRadius: 'var(--radius-md)',
+                  aspectRatio: '1/1',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: 'var(--bg-secondary)',
+                  cursor: 'pointer',
+                  overflow: 'hidden',
+                  position: 'relative'
+                }}
+                onClick={() => compareFile2Ref.current?.click()}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => handleDrop(e, setCompareFile2, setComparePreview2)}
+              >
+                {comparePreview2 ? (
+                  <img src={comparePreview2} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                ) : (
+                  <div style={{ textAlign: 'center', padding: '12px' }}>
+                    <div style={{ fontSize: '24px', marginBottom: '8px' }}>📸</div>
+                    <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: '0.875rem' }}>Drop or Select Image 2</div>
+                  </div>
+                )}
+                <input type="file" ref={compareFile2Ref} accept="image/*" style={{ display: 'none' }} onChange={(e) => handleFileChange(e, setCompareFile2, setComparePreview2)} />
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '12px', borderTop: '1px solid var(--border)', paddingTop: '20px' }}>
+            <button
+              onClick={runCompare}
+              className="primary"
+              style={{ flex: 1, padding: '12px', fontWeight: 700 }}
+              disabled={!compareFile1 || !compareFile2 || loading}
+            >
+              Compare Faces
+            </button>
+            <button
+              onClick={() => {
+                setCompareFile1(null);
+                setCompareFile2(null);
+                setComparePreview1(null);
+                setComparePreview2(null);
+                setCompareResult(null);
+              }}
+              style={{ padding: '12px', fontWeight: 600, background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}
+            >
+              Reset
+            </button>
+          </div>
+
+          {compareResult && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+              <div style={{
+                padding: '24px',
+                borderRadius: 'var(--radius-md)',
+                background: compareResult.match ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                border: `1px solid ${compareResult.match ? 'var(--success)' : 'var(--error)'}`,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: '12px',
+                boxShadow: 'var(--shadow-sm)'
+              }}>
+                <div style={{ fontSize: '2.5rem', fontWeight: 900, color: compareResult.match ? 'var(--success)' : 'var(--error)', letterSpacing: '0.05em' }}>
+                  {compareResult.match ? 'MATCH' : 'NO MATCH'}
+                </div>
+                <div style={{ display: 'flex', gap: '48px', textAlign: 'center' }}>
+                  <div>
+                    <div style={{ fontSize: '0.75rem', fontWeight: 800, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '4px' }}>Similarity Score</div>
+                    <div style={{ fontSize: '1.75rem', fontWeight: 800 }}>{(compareResult.similarity * 100).toFixed(2)}%</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: '0.75rem', fontWeight: 800, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '4px' }}>Confidence</div>
+                    <div style={{
+                      fontSize: '1.75rem',
+                      fontWeight: 800,
+                      color: compareResult.confidence === 'High' ? 'var(--success)' : compareResult.confidence === 'Medium' ? '#f59e0b' : 'var(--error)'
+                    }}>
+                      {compareResult.confidence}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
+                {[1, 2].map(num => {
+                  const meta = compareResult.meta[`image${num}_meta`]?.quality;
+                  if (!meta) return null;
+                  return (
+                    <div key={num} className="card" style={{ padding: '16px', background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}>
+                      <h4 style={{ fontSize: '0.8125rem', fontWeight: 800, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '12px', borderBottom: '1px solid var(--border)', paddingBottom: '8px' }}>
+                        Image {num} Quality Details
+                      </h4>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                        <div>
+                          <div style={{ fontSize: '0.625rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Blur</div>
+                          <div style={{ fontSize: '0.9375rem', fontWeight: 600 }}>{meta.blur?.toFixed(1)}</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: '0.625rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Brightness</div>
+                          <div style={{ fontSize: '0.9375rem', fontWeight: 600 }}>{meta.brightness?.toFixed(1)}</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: '0.625rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Pitch</div>
+                          <div style={{ fontSize: '0.9375rem', fontWeight: 600 }}>{meta.pitch?.toFixed(1)}°</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: '0.625rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Yaw</div>
+                          <div style={{ fontSize: '0.9375rem', fontWeight: 600 }}>{meta.yaw?.toFixed(1)}°</div>
+                        </div>
+                        <div style={{ gridColumn: 'span 2' }}>
+                          <div style={{ fontSize: '0.625rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Landmark Confidence</div>
+                          <div style={{ fontSize: '0.9375rem', fontWeight: 600 }}>{(meta.landmark_score * 100).toFixed(1)}%</div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'right' }}>
+                Server processing time: {compareResult.meta?.timing_ms}ms
+              </div>
+            </div>
+          )}
         </div>
-      </div>
+      )}
 
       {loading && <div style={{ color: 'var(--text-muted)' }}>Processing request...</div>}
       {error && <div style={{ padding: '16px', background: 'rgba(239, 68, 68, 0.1)', color: 'var(--error)', borderRadius: 'var(--radius-md)', border: '1px solid var(--error)' }}>{error}</div>}
 
-      {quality && (
+      {mode === 'search' && quality && (
         <section className="card">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
             <h3 style={{ fontSize: '1.125rem', fontWeight: 700 }}>Quality Assessment ({quality.faces?.length || 0} faces)</h3>
-            <span style={{ 
-              padding: '4px 16px', 
-              borderRadius: '99px', 
-              fontSize: '0.75rem', 
-              fontWeight: 800, 
+            <span style={{
+              padding: '4px 16px',
+              borderRadius: '99px',
+              fontSize: '0.75rem',
+              fontWeight: 800,
               background: String(quality?.total_quality || '').toLowerCase() === 'pass' ? 'var(--success)' : 'var(--error)',
               color: 'white'
             }}>
               {String(quality?.total_quality || (quality?.ok ? 'pass' : 'fail')).toUpperCase()}
             </span>
           </div>
-          
+
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 300px', gap: '24px' }}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
               {quality.annotated_image && (
@@ -189,7 +470,7 @@ export default function Search() {
         </section>
       )}
 
-      {(queryThumb || results.length > 0) && (
+      {mode === 'search' && (queryThumb || results.length > 0) && (
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(300px, 400px) 1fr', gap: '32px', alignItems: 'flex-start' }}>
           <section className="card" style={{ position: 'sticky', top: '24px' }}>
             <h3 style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '12px' }}>Query Image</h3>
@@ -241,13 +522,13 @@ export default function Search() {
       {jsonResponse && showJson && (
         <section className="card" style={{ marginTop: '24px' }}>
           <h3 style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '16px' }}>JSON Response</h3>
-          <pre style={{ 
-            margin: 0, 
-            padding: '16px', 
-            background: 'var(--bg-secondary)', 
-            borderRadius: 'var(--radius-md)', 
-            fontSize: '0.8125rem', 
-            border: '1px solid var(--border)', 
+          <pre style={{
+            margin: 0,
+            padding: '16px',
+            background: 'var(--bg-secondary)',
+            borderRadius: 'var(--radius-md)',
+            fontSize: '0.8125rem',
+            border: '1px solid var(--border)',
             color: 'var(--text-secondary)',
             overflowX: 'auto',
             maxHeight: '400px'

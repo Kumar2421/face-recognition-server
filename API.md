@@ -6,7 +6,7 @@ This service provides face embedding, enrollment, and similarity search using **
 
 The built-in web UI is:
 
-- `https://face.service.tools.thefusionapps.com`
+- `https://api.face.service.tools.thefusionapps.com`
 
 ## Configuration
 
@@ -22,7 +22,7 @@ Environment variables (Docker Compose sets most of these):
 - `BUFFALO_MIN_DET_SCORE` (default: `0.5`) minimum detector score for accepting a face
 - `BUFFALO_PROVIDERS` (example: `CUDAExecutionProvider,CPUExecutionProvider`)
 
-- `FACE_SERVICE_API_KEY` (default: `your-secret-key`) security key for POST endpoints
+- `FACE_SERVICE_API_KEY` (default: `your-secret-key`) security key for protected endpoints
 
 GPU / performance:
 
@@ -40,13 +40,20 @@ Storage:
 
 Notes:
 
-- All POST endpoints require an `x-api-key` header matching the `FACE_SERVICE_API_KEY`.
+- Endpoints marked with **Auth: API key** require an `x-api-key` header matching `FACE_SERVICE_API_KEY`.
+- **Flexible Routing**: The API supports an optional `/api` prefix. Both `/v1/...` and `/api/v1/...` are valid.
+- **Image Input Flexibility**: 
+  - Most endpoints accept `image_b64`, `images_b64`, or `image` as field names.
+  - You can provide either a **Base64 encoded string** or a **direct HTTP/HTTPS URL**. If a URL is provided, the server will automatically download and process the image.
 - Qdrant point IDs must be **UUID** or **integer**. This service uses deterministic UUIDs derived from `subject_id` and `image_id`.
 - Detection robustness:
-  - If detection fails, the service retries with rotated and downscaled variants.
+  - If detection fails, the service retries with rotated and downscaled variants (when `BUFFALO_ENABLE_FALLBACK_VARIANTS=1`).
 - Thumbnails are served at `/thumbs/{image_id}.jpg` (root configurable via `THUMBS_DIR`).
+- Original images are served at `/images/{subject_id}/{image_id}.jpg` (root configurable via `IMAGES_DIR`).
+- **CORS**: The service allows standard CORS headers including `Cache-Control` for frontend compatibility.
 
 here is the reference for the api: fs_9f2b8a71c4d04e5e9b3d8a7c6b5a4f3e
+
 ## Data model
 
 ### Face embedding
@@ -59,16 +66,21 @@ here is the reference for the api: fs_9f2b8a71c4d04e5e9b3d8a7c6b5a4f3e
   - `image_id` (string, UUID per image)
   - `created_at` (ISO8601 string)
   - `thumb_path` (string, e.g. `/thumbs/{image_id}.jpg`)
-  - `source` (one of: `enroll`, `external`, `ingested`)
+  - `image_path` (string, e.g. `/images/{subject_id}/{image_id}.jpg`)
+  - `source` (one of: `enroll`, `external`, `ingested`, `auto_recognized`)
   - optional `filename` (string) for upload endpoints
 
 ## Endpoints
 
+---
+
 ### Health
 
-#### `GET /health`
+#### `GET /health` or `POST /health`
 
-Returns service health and Qdrant status.
+Returns service health and Qdrant status. Supports both methods for compatibility with various monitoring tools.
+
+**Auth:** None
 
 Response (example):
 ```json
@@ -94,6 +106,11 @@ Response (example):
 }
 ```
 
+Curl:
+```bash
+curl -s http://localhost:8001/health | python3 -m json.tool
+```
+
 ---
 
 ## Stats
@@ -101,6 +118,8 @@ Response (example):
 ### `GET /v1/stats`
 
 Returns global counters and Qdrant status.
+
+**Auth:** None
 
 Response (example):
 ```json
@@ -114,17 +133,37 @@ Response (example):
 }
 ```
 
+Curl:
+```bash
+curl -s http://localhost:8001/v1/stats | python3 -m json.tool
+```
+
 ---
 
 ## Observability / Debug
 
 ### `GET /metrics`
 
-Prometheus metrics.
+Prometheus metrics in text format.
+
+**Auth:** None
+
+Curl:
+```bash
+curl -s http://localhost:8001/metrics
+```
+
+### `GET /robots.txt`
+
+Static robots policy (disallows all).
+
+**Auth:** None
 
 ### `GET /debug/providers`
 
 Shows ONNXRuntime providers and what providers InsightFace sessions were created with.
+
+**Auth:** None
 
 Response (example):
 ```json
@@ -138,7 +177,7 @@ Response (example):
     "configured_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"]
   },
   "insightface": {
-    "models": ["detection", "recognition"],
+    "models": ["landmark_3d_68", "landmark_2d_106", "detection", "genderage", "recognition"],
     "session_providers": {
       "detection": ["CUDAExecutionProvider", "CPUExecutionProvider"],
       "recognition": ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -147,11 +186,26 @@ Response (example):
 }
 ```
 
+Curl:
+```bash
+curl -s http://localhost:8001/debug/providers | python3 -m json.tool
+```
+
+### `GET /ui`
+
+Serves the built-in HTML debug UI page.
+
+**Auth:** None
+
+---
+
 ## Group management
 
 ### `POST /v1/groups`
 
 Create a new group.
+
+**Auth:** API key
 
 Request body:
 ```json
@@ -162,9 +216,28 @@ Request body:
 }
 ```
 
+Response:
+```json
+{
+  "group_id": "employees",
+  "name": "Employee Group",
+  "meta": {}
+}
+```
+
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/groups" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"group_id":"employees","name":"Employee Group","meta":{}}'
+```
+
 ### `GET /v1/groups`
 
 List all groups.
+
+**Auth:** API key
 
 Response:
 ```json
@@ -175,26 +248,58 @@ Response:
 }
 ```
 
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/groups" \
+  -H "x-api-key: YOUR_API_KEY"
+```
+
 ### `DELETE /v1/groups/{group_id}`
 
 Delete a group.
+
+**Auth:** API key
+
+Response:
+```json
+{
+  "deleted": true,
+  "group_id": "employees"
+}
+```
+
+Curl:
+```bash
+curl -s -X DELETE "http://localhost:8001/v1/groups/employees" \
+  -H "x-api-key: YOUR_API_KEY"
+```
 
 ---
 
 ## Enrollment (Add)
 
-You can enroll faces using either JSON (base64) or multipart upload.
+You can enroll faces using JSON (base64/URL), multipart upload, or image URLs.
 
 ### `POST /v1/faces/add` (JSON)
+
+**Auth:** API key
 
 Request body:
 ```json
 {
   "subject_id": "alice",
   "images_b64": ["<base64-encoded-image>"],
+  "image_urls": ["https://example.com/photo.jpg"],
   "group_id": "employees"
 }
 ```
+
+- `subject_id` (string, required)
+- `images_b64` (array of strings, optional) base64-encoded images or HTTP/HTTPS URLs
+- `image_urls` (array of strings, optional) HTTP/HTTPS image URLs
+- `group_id` (string, optional)
+
+At least one of `images_b64` or `image_urls` must be provided.
 
 Response:
 ```json
@@ -202,33 +307,67 @@ Response:
   "subject_id": "alice",
   "num_images": 2,
   "num_embedded": 2,
-  "embedding_dim": 512
+  "embedding_dim": 512,
+  "meta": {}
 }
 ```
 
-Curl:
+Curl (base64):
 ```bash
-curl -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/faces/add" \
-  -H "x-api-key: your-secret-key" \
+curl -s -X POST "http://localhost:8001/v1/faces/add" \
+  -H "x-api-key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"subject_id":"alice","images_b64":["...base64..."]}'
 ```
 
+Curl (URL):
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/add" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"subject_id":"alice","image_urls":["https://example.com/photo.jpg"]}'
+```
+
 ### `POST /v1/faces/add_upload` (multipart)
+
+**Auth:** API key
 
 Form fields:
 
-- `subject_id` (text)
+- `subject_id` (text, required)
 - `group_id` (text, optional)
-- `files` (one or more images)
+- `files` (one or more images, optional)
+- `image_urls` (one or more URLs, optional)
 
-Curl (Windows `curl.exe`):
-```powershell
-curl.exe -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/faces/add_upload" `
-  -H "x-api-key: your-secret-key" `
-  -F "subject_id=alice" `
-  -F "files=@D:\\path\\to\\img1.jpg;type=image/jpeg" `
-  -F "files=@D:\\path\\to\\img2.png;type=image/png"
+At least one of `files` or `image_urls` must be provided.
+
+Response: Same as `/v1/faces/add`.
+
+Curl (file upload):
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/add_upload" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -F "subject_id=alice" \
+  -F "files=@/path/to/img1.jpg;type=image/jpeg" \
+  -F "files=@/path/to/img2.png;type=image/png"
+```
+
+Curl (URL):
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/add_upload" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -F "subject_id=alice" \
+  -F "image_urls=https://example.com/photo1.jpg" \
+  -F "image_urls=https://example.com/photo2.jpg"
+```
+
+Curl (mixed - files + URLs):
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/add_upload" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -F "subject_id=alice" \
+  -F "files=@/path/to/local.jpg;type=image/jpeg" \
+  -F "image_urls=https://example.com/remote.jpg"
 ```
 
 ---
@@ -237,49 +376,57 @@ curl.exe -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/faces/a
 
 ### `POST /v1/faces/search` (JSON)
 
+**Auth:** API key
+
 Request body:
 ```json
 {
-  "image_b64": "<base64-encoded-image>",
+  "image_b64": "<base64-encoded-image or http-url>",
   "top_k": 5,
   "group_id": "employees"
 }
 ```
 
+Note: You can use `images_b64` or `image` as aliases for `image_b64`.
+
 Response:
 ```json
 {
   "results": [
-    {"subject_id":"alice","similarity":0.83,"point_id":"...","image_id":"...","thumb_path":"/thumbs/....jpg"},
-    {"subject_id":"bob","similarity":0.71,"point_id":"...","image_id":"...","thumb_path":"/thumbs/....jpg"}
-  ]
+    {"subject_id": "alice", "similarity": 0.83, "point_id": "...", "image_id": "...", "thumb_path": "/thumbs/....jpg"},
+    {"subject_id": "bob", "similarity": 0.71, "point_id": "...", "image_id": "...", "thumb_path": "/thumbs/....jpg"}
+  ],
+  "query_thumb_path": "/thumbs/tmp-....jpg"
 }
+```
+
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/search" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"image_b64":"...base64...","top_k":5}'
 ```
 
 ### `POST /v1/faces/search_upload` (multipart)
 
+**Auth:** API key
+
 Form fields:
 
-- `file` (image)
+- `file` (image, required)
 - `top_k` (optional, default `5`)
 - `group_id` (optional)
 
-Curl:
-```powershell
-curl.exe -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/faces/search_upload" `
-  -H "x-api-key: your-secret-key" `
-  -F "top_k=5" `
-  -F "file=@D:\\path\\to\\query.jpg;type=image/jpeg"
-```
+Response: Same as `/v1/faces/search`.
 
-Response:
-```json
-{
-  "results": [
-    {"subject_id":"alice","similarity":0.83,"point_id":"...","image_id":"...","thumb_path":"/thumbs/....jpg"}
-  ],
-  "query_thumb_path": "/thumbs/tmp-....jpg"
-}
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/search_upload" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -F "top_k=5" \
+  -F "group_id=employees" \
+  -F "file=@/path/to/query.jpg;type=image/jpeg"
 ```
 
 ---
@@ -287,6 +434,8 @@ Response:
 ## Recognize (Best match + threshold)
 
 ### `POST /v1/faces/recognize` (JSON)
+
+**Auth:** API key
 
 Request body:
 ```json
@@ -305,36 +454,145 @@ Response:
   "subject_id": "alice",
   "similarity": 0.83,
   "results": [
-    {"subject_id":"alice","similarity":0.83,"point_id":"...","image_id":"...","thumb_path":"/thumbs/....jpg"}
-  ]
+    {"subject_id": "alice", "similarity": 0.83, "point_id": "...", "image_id": "...", "thumb_path": "/thumbs/....jpg"}
+  ],
+  "meta": {
+    "quality": {
+      "blur": 127.0,
+      "brightness": 149.1,
+      "face_ratio": 0.115,
+      "face_abs_px": 180.9,
+      "landmark_score": 0.897,
+      "yaw": 0.128,
+      "pitch": -1.562,
+      "face_crop_shape": [417, 290],
+      "status": "ok",
+      "reason": ""
+    },
+    "decision": {
+      "status": "match",
+      "min_similarity": 0.75,
+      "top2_second": null,
+      "top2_margin": null,
+      "top2_required": 0.12
+    }
+  }
 }
+```
+
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/recognize" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"image_b64":"...base64...","top_k":5,"min_similarity":0.75}'
 ```
 
 ### `POST /v1/faces/recognize_upload` (multipart)
 
+**Auth:** API key
+
 Form fields:
 
-- `file` (image)
+- `file` (image, required)
 - `top_k` (optional, default `5`)
 - `min_similarity` (optional)
 - `group_id` (optional)
 
+Response: Same as `/v1/faces/recognize`.
+
 Curl:
-```powershell
-curl.exe -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/faces/recognize_upload" `
-  -H "x-api-key: your-secret-key" `
-  -F "top_k=5" `
-  -F "min_similarity=0.75" `
-  -F "file=@D:\\path\\to\\query.jpg;type=image/jpeg"
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/recognize_upload" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -F "top_k=5" \
+  -F "min_similarity=0.75" \
+  -F "file=@/path/to/query.jpg;type=image/jpeg"
 ```
 
 ---
 
-## Frigate-compatible endpoint
+## Face comparison
+
+### `POST /v1/face/compare_upload` (multipart)
+
+Compare two face images directly and return similarity score.
+
+**Auth:** API key
+
+Form fields:
+
+- `file1` (image, required)
+- `file2` (image, required)
+
+Response:
+```json
+{
+  "similarity": 0.92,
+  "match": true,
+  "confidence": "High",
+  "meta": {
+    "timing_ms": 150,
+    "image1_meta": {},
+    "image2_meta": {}
+  }
+}
+```
+
+Confidence levels:
+- `High`: similarity > 0.45
+- `Medium`: similarity > 0.35
+- `Low`: similarity <= 0.35
+
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/face/compare_upload" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -F "file1=@/path/to/face1.jpg;type=image/jpeg" \
+  -F "file2=@/path/to/face2.jpg;type=image/jpeg"
+```
+
+---
+
+## Cross-match
+
+### `GET /v1/faces/cross_match/{subject_id}`
+
+Find other subjects that look similar to the given subject. Useful for finding duplicate enrollments.
+
+**Auth:** None
+
+Path params:
+
+- `subject_id` (required)
+
+Query params:
+
+- `top_k` (default `20`)
+
+Response:
+```json
+{
+  "results": [
+    {"subject_id": "bob", "similarity": 0.72, "point_id": "...", "image_id": "...", "thumb_path": "/thumbs/....jpg"}
+  ]
+}
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/faces/cross_match/alice?top_k=10"
+```
+
+---
+
+## Frigate-compatible endpoints
 
 Frigate typically calls `/v1/face/search`.
 
 ### `POST /v1/face/search` (JSON)
+
+**Auth:** API key
 
 Request body:
 ```json
@@ -350,7 +608,11 @@ Response:
 ```json
 {
   "subject_id": "alice",
-  "similarity": 0.83
+  "similarity": 0.83,
+  "meta": {
+    "quality": { "...": "..." },
+    "decision": { "status": "embedded" }
+  }
 }
 ```
 
@@ -360,16 +622,29 @@ Behavior:
 - Otherwise it falls back to the legacy in-memory index.
 - If best similarity < `FACE_SERVICE_MIN_SIMILARITY`, returns `404`.
 
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/face/search" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"image_b64":"...base64..."}'
+```
+
 ### `POST /v1/face/search_upload` (multipart)
+
+**Auth:** API key
 
 Form fields:
 
-- `file` (image)
+- `file` (image, required)
+
+Response: Same as `/v1/face/search`.
 
 Curl:
-```powershell
-curl.exe -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/face/search_upload" `
-  -F "file=@D:\\path\\to\\query.png;type=image/png"
+```bash
+curl -s -X POST "http://localhost:8001/v1/face/search_upload" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -F "file=@/path/to/query.png;type=image/png"
 ```
 
 ---
@@ -380,6 +655,8 @@ curl.exe -s -X POST "https://face.service.tools.thefusionapps.com/api/v1/face/se
 
 Returns unique `subject_id` values currently present in Qdrant.
 
+**Auth:** None
+
 Response:
 ```json
 {
@@ -387,9 +664,16 @@ Response:
 }
 ```
 
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/faces/subjects"
+```
+
 ### `DELETE /v1/faces/subjects/{subject_id}`
 
-Deletes all vectors for a subject.
+Deletes all vectors for a subject from Qdrant.
+
+**Auth:** None
 
 Response:
 ```json
@@ -399,39 +683,104 @@ Response:
 }
 ```
 
+Curl:
+```bash
+curl -s -X DELETE "http://localhost:8001/v1/faces/subjects/alice"
+```
+
 ---
 
 ## Subjects browser (Qdrant)
 
-These endpoints are implemented and used by the web UI to browse subjects and their images.
+These endpoints are used by the web UI to browse subjects and their images.
 
 ### `GET /v1/subjects`
 
+**Auth:** None
+
 Query params:
 
-- `cursor` (optional)
-- `limit` (default `50`)
+- `cursor` (optional) pagination cursor
+- `limit` (default `50`, max `10000`)
 - `with_counts` (default `true`) include embeddings count per subject
+- `q` (optional) search/filter query string
 
 Response (example):
 ```json
 {
   "items": [
-    {"subject_id": "alice", "embeddings_count": 12},
-    {"subject_id": "bob", "embeddings_count": 4}
+    {
+      "subject_id": "alice",
+      "embeddings_count": 12,
+      "embeddings_cap": 10,
+      "embeddings_capped": true
+    },
+    {
+      "subject_id": "bob",
+      "embeddings_count": 4,
+      "embeddings_cap": 10,
+      "embeddings_capped": false
+    }
   ],
   "cursor": null
 }
 ```
 
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/subjects?with_counts=true&limit=50"
+```
+
+### `GET /v1/subjects/{subject_id}`
+
+Get details for a single subject.
+
+**Auth:** None
+
+Response:
+```json
+{
+  "subject_id": "alice",
+  "embeddings_count": 12,
+  "embeddings_cap": 10,
+  "embeddings_capped": true
+}
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/subjects/alice"
+```
+
 ### `GET /v1/subjects/{subject_id}/images`
+
+**Auth:** None
 
 Query params:
 
 - `cursor` (optional)
-- `limit` (default `50`)
+- `limit` (default `50`, max `500`)
 
-Response contains a paginated list of subject images/vectors (includes `image_id` and `thumb_path` where available).
+Response:
+```json
+{
+  "items": [
+    {
+      "image_id": "6b87951debdac32b",
+      "thumb_path": "/thumbs/6b87951debdac32b.jpg",
+      "image_path": "/images/alice/6b87951debdac32b.jpg",
+      "created_at": "2026-05-14T11:21:10.612673+00:00",
+      "source": "enroll"
+    }
+  ],
+  "cursor": null
+}
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/subjects/alice/images?limit=50"
+```
 
 ---
 
@@ -441,9 +790,11 @@ Use this endpoint when you want to know whether an image is **eligible** to be e
 
 ### `POST /v1/quality/check_upload` (multipart)
 
+**Auth:** None
+
 Form fields:
 
-- `file` (image)
+- `file` (image, required)
 
 Response (example):
 
@@ -451,12 +802,26 @@ Response (example):
 {
   "ok": true,
   "total_quality": "pass",
-  "quality": {
-    "status": "ok",
-    "reason": null
-  },
-  "det_score": 0.78,
-  "bbox": [57.6, 68.6, 114.7, 139.4],
+  "faces": [
+    {
+      "ok": true,
+      "quality": {
+        "blur": 127.0,
+        "brightness": 149.1,
+        "face_ratio": 0.115,
+        "face_abs_px": 180.9,
+        "landmark_score": 0.897,
+        "yaw": 0.128,
+        "pitch": -1.562,
+        "face_crop_shape": [417, 290],
+        "status": "ok",
+        "reason": ""
+      },
+      "det_score": 0.897,
+      "bbox": [271.8, 109.6, 452.7, 370.1]
+    }
+  ],
+  "annotated_image": "data:image/jpeg;base64,...",
   "timing": {
     "decode_ms": 3,
     "quality_ms": 12,
@@ -470,13 +835,88 @@ Notes:
 - `total_quality` is a single overall decision:
   - `pass` => eligible for embedding/enrollment
   - `fail` => not eligible under current thresholds
+- `faces` is an array of per-face quality results (supports multi-face images).
+- `annotated_image` contains a base64-encoded JPEG with face bounding boxes drawn.
 - When a quality check fails, `quality.status` will be `rejected` and `quality.reason` indicates why (example: `pose_yaw`).
 
-Curl example:
-
+Curl:
 ```bash
-curl -sS -X POST "https://face.service.tools.thefusionapps.com/api/v1/quality/check_upload" \
+curl -s -X POST "http://localhost:8001/v1/quality/check_upload" \
   -F "file=@/path/to/image.jpg"
+```
+
+---
+
+## Privacy-Focused Extraction
+
+Use this endpoint to extract individual face crops from an image while protecting the privacy of other people in the frame.
+
+### `POST /v1/faces/privacy_extract` (JSON)
+
+**Auth:** API key
+
+Extracts individual face crops from an image with multiple people. For each detected face, it returns a focused crop where all other detected faces are blurred for privacy. Each face is also evaluated for quality on the original image before cropping. Optionally, it can perform face recognition for each extracted face against the enrolled database.
+
+Request body:
+```json
+{
+  "image_b64": "<base64-encoded-image or http-url>",
+  "recognition": false,
+  "top_k": 1,
+  "branch": "optional-branch-filter",
+  "group_id": "optional-group-filter",
+  "day": "2026-05-22",
+  "since_ts": 1777713396.0
+}
+```
+
+Response:
+```json
+{
+  "results": [
+    {
+      "bbox": [271.8, 109.6, 452.7, 370.1],
+      "quality": {
+        "blur": 127.0,
+        "brightness": 149.1,
+        "face_ratio": 0.115,
+        "face_abs_px": 180.9,
+        "landmark_score": 0.897,
+        "yaw": 0.128,
+        "pitch": -1.562,
+        "face_crop_shape": [417, 290],
+        "status": "ok",
+        "reason": ""
+      },
+      "image_b64": "data:image/jpeg;base64,...",
+      "recognition": {
+        "matched": true,
+        "subject_id": "employee-emerald-e00643",
+        "similarity": 0.892,
+        "results": [
+           { "subject_id": "employee-emerald-e00643", "similarity": 0.892, "point_id": "..." }
+        ]
+      }
+    }
+  ]
+}
+```
+
+Notes:
+- `bbox`: Coordinates `[x1, y1, x2, y2]` of the face in the original image.
+- `quality`: Quality evaluation metrics performed on the face before blurring/cropping.
+- `image_b64`: A base64-encoded JPEG crop (with exactly 150px padding) where all *other* detected faces in the original frame have been obscured with a Gaussian blur.
+- `recognition`: (Optional) Recognition results. Only included if `recognition: true` is passed in the request.
+- `top_k`: (Optional) Max results for recognition. Default is 1. Supports `top_n` as alias.
+- `branch`, `group_id`: (Optional) Filters for recognition.
+- Date Filtering: Recognition search can be limited by time using `day`, `from_day`, `to_day`, `since_ts`, or `until_ts`.
+
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/privacy_extract" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"image_b64":"...base64...", "recognition": true, "top_k": 1}'
 ```
 
 ---
@@ -487,47 +927,375 @@ These endpoints store recognition attempts in the local events DB (SQLite) and s
 
 ### `POST /v1/events/recognition` (multipart)
 
+**Auth:** None
+
 Form fields:
 
-- `file` (image)
-- `camera` (required)
-- `source_path` (optional)
-- `ts` (optional float seconds; default now)
-- `top_k` (optional, default `5`)
-- `min_similarity` (optional)
-- `process_all_faces` (optional, default `false`) process multiple faces per image
-- `group_id` (optional) filter recognition by group
+- `file` (image, required)
+- `camera` (text, required)
+- `source_path` (text, optional, default `""`)
+- `ts` (float, optional; default current time)
+- `top_k` (int, optional, default `5`)
+- `min_similarity` (float, optional)
+- `process_all_faces` (bool, optional, default `false`) process multiple faces per image
+- `group_id` (text, optional) filter recognition by group
 
-Response includes `meta.timing` when available:
+Response:
+```json
+{
+  "event_id": "42c72ad0-1f38-4015-9986-0d572ce9a05e",
+  "ts": 1778759909.49,
+  "camera": "front_door",
+  "source_path": "snapshot.jpg",
+  "decision": "match",
+  "subject_id": "alice",
+  "similarity": 0.95,
+  "processing_ms": 70,
+  "model_ms": 82,
+  "rejected_reason": null,
+  "bbox": [271.8, 109.6, 452.7, 370.1, 622.0, 656.0],
+  "det_score": 0.897,
+  "image_path": "/events/accepted/front_door/42c72ad0....jpg",
+  "thumb_path": "/thumbs/evt-42c72ad0....jpg",
+  "image_saved_at": 1778759909.59,
+  "meta": {
+    "quality": { "...": "..." },
+    "decision": {
+      "status": "match",
+      "matched": true,
+      "min_similarity": 0.6,
+      "auto_add_embedding": { "enabled": true, "added": true, "reason": null, "min_similarity": 0.8 },
+      "no_match_auto_enroll": { "enabled": true, "enrolled": false }
+    },
+    "timing": {
+      "decode_ms": 11,
+      "detect_embed_ms": 70,
+      "gpu_queue_wait_ms": 0.16,
+      "gpu_exec_ms": 69.8,
+      "quality_ms": 1,
+      "qdrant_ms": 2,
+      "save_ms": 16,
+      "face_total_ms": 113,
+      "total_ms": 195
+    },
+    "top_k": 5,
+    "face_index": 0,
+    "faces_total": 1,
+    "faces_processed": 1,
+    "multi_face": false
+  },
+  "feedback_label": null,
+  "feedback_note": null,
+  "feedback_updated_at": null
+}
+```
 
-- `decode_ms`
-- `detect_embed_ms`
-- `gpu_queue_wait_ms`
-- `gpu_exec_ms`
-- `quality_ms`
-- `qdrant_ms`
-- `save_ms`
-- `face_total_ms`
-- `total_ms`
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/events/recognition" \
+  -F "camera=front_door" \
+  -F "top_k=5" \
+  -F "file=@/path/to/image.jpg;type=image/jpeg"
+```
 
 ### `GET /v1/events/recognition`
 
+List recognition events with filtering and pagination.
+
+**Auth:** None
+
 Query params:
 
-- `camera`, `subject_id`, `decision`
-- `since_ts`, `until_ts`
+- `camera` (optional) filter by camera name
+- `subject_id` (optional) filter by matched subject
+- `source_path` (optional) filter by source path
+- `decision` (optional) filter by decision: `match`, `no_match`, `rejection`
+- `min_similarity` (optional) minimum similarity filter
+- `max_similarity` (optional) maximum similarity filter
+- `day` (optional) filter by specific date (e.g. `2026-05-14`)
+- `from_day` (optional) start date range
+- `to_day` (optional) end date range
+- `since_ts` (optional) start timestamp (float epoch)
+- `until_ts` (optional) end timestamp (float epoch)
 - `limit` (default `100`)
-- `cursor` (optional)
+- `cursor` (optional) pagination cursor (float timestamp)
+
+Response:
+```json
+{
+  "items": [ { "...recognition event..." } ],
+  "cursor": 1778759909.59
+}
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/events/recognition?camera=front_door&limit=10"
+```
 
 ### `GET /v1/events/recognition/{event_id}`
 
-Fetch a single stored event.
+Fetch a single stored event by ID.
 
-### `POST /v1/events/recognition/forward`
+**Auth:** None
+
+Response: Single `RecognitionEventResponse` object (same shape as items in the list).
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/events/recognition/42c72ad0-1f38-4015-9986-0d572ce9a05e"
+```
+
+### `POST /v1/events/recognition/{event_id}/feedback`
+
+Submit human feedback for a recognition event (used for accuracy tracking).
+
+**Auth:** None
 
 Request body:
 ```json
-{ "event_id": "<uuid>", "target_url": "https://example.com/hook" }
+{
+  "label": "tp",
+  "note": "Confirmed correct match"
+}
+```
+
+Valid `label` values: `tp` (true positive), `fp` (false positive), `fn` (false negative), `ignore`.
+
+Response:
+```json
+{
+  "event_id": "42c72ad0-...",
+  "updated": true,
+  "feedback_label": "tp",
+  "feedback_note": "Confirmed correct match",
+  "feedback_updated_at": 1778760000.0
+}
+```
+
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/events/recognition/42c72ad0-.../feedback" \
+  -H "Content-Type: application/json" \
+  -d '{"label":"tp","note":"Confirmed correct match"}'
+```
+
+### `POST /v1/events/recognition/forward`
+
+Forward a stored recognition event to an external webhook URL.
+
+**Auth:** None
+
+Request body:
+```json
+{
+  "event_id": "<uuid>",
+  "target_url": "https://example.com/hook"
+}
+```
+
+Response:
+```json
+{
+  "forwarded": true,
+  "status_code": 200
+}
+```
+
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/events/recognition/forward" \
+  -H "Content-Type: application/json" \
+  -d '{"event_id":"42c72ad0-...","target_url":"https://example.com/hook"}'
+```
+
+### `GET /v1/events/recognition/cameras`
+
+List all unique camera names from stored events.
+
+**Auth:** None
+
+Query params:
+
+- `limit` (default `5000`)
+
+Response:
+```json
+["front_door", "lobby", "parking"]
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/events/recognition/cameras"
+```
+
+### `GET /v1/events/recognition/stats`
+
+Get aggregated recognition statistics.
+
+**Auth:** None
+
+Query params:
+
+- `day` (optional) specific date
+- `from_day` (optional) start date
+- `to_day` (optional) end date
+- `since_ts` (optional) start timestamp
+- `until_ts` (optional) end timestamp
+- `camera` (optional) filter by camera
+
+Response:
+```json
+{
+  "total": 500,
+  "match": 350,
+  "no_match": 120,
+  "rejection": 30,
+  "unique_matches": 45,
+  "by_camera": {
+    "front_door": { "total": 200, "match": 150, "no_match": 40, "rejection": 10 }
+  }
+}
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/events/recognition/stats?day=2026-05-14"
+```
+
+### `GET /v1/events/recognition/feedback_stats`
+
+Get feedback accuracy statistics.
+
+**Auth:** None
+
+Query params:
+
+- `since_ts` (optional)
+- `until_ts` (optional)
+- `camera` (optional)
+
+Response:
+```json
+{
+  "total": 500,
+  "labeled": 100,
+  "unlabeled": 400,
+  "tp": 80,
+  "fp": 10,
+  "fn": 5,
+  "ignore": 5,
+  "fp_rate_match": 0.05,
+  "by_decision": {
+    "match": { "total": 350, "tp": 80, "fp": 10, "fn": 0, "ignore": 3 }
+  }
+}
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/events/recognition/feedback_stats"
+```
+
+---
+
+## Search history
+
+These endpoints log and query face search operations.
+
+### `GET /v1/search_history`
+
+List search events with pagination.
+
+**Auth:** None
+
+Query params:
+
+- `limit` (default `100`)
+- `cursor` (optional) pagination cursor (float timestamp)
+- `day` (optional) specific date
+- `from_day` (optional) start date
+- `to_day` (optional) end date
+- `since_ts` (optional) start timestamp
+- `until_ts` (optional) end timestamp
+
+Response:
+```json
+{
+  "items": [
+    {
+      "event_id": "...",
+      "ts": 1778760000.0,
+      "query_image_path": "/events/...",
+      "query_thumb_path": "/thumbs/...",
+      "top_subject_id": "alice",
+      "top_similarity": 0.95,
+      "results": [ { "...FaceSearchTopKItem..." } ],
+      "meta": {}
+    }
+  ],
+  "cursor": null
+}
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/search_history?limit=20"
+```
+
+### `GET /v1/search_history/stats`
+
+Get search history statistics.
+
+**Auth:** None
+
+Query params:
+
+- `match_threshold` (default `0.8`) similarity threshold to count as a match
+- `day` (optional) specific date
+- `from_day` (optional) start date
+- `to_day` (optional) end date
+- `since_ts` (optional) start timestamp
+- `until_ts` (optional) end timestamp
+
+Response:
+```json
+{
+  "match": 150,
+  "no_match": 30,
+  "total": 180
+}
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/search_history/stats?match_threshold=0.8"
+```
+
+### `GET /v1/search_history/asset/image/{event_id}`
+
+Serve the full query image for a search event.
+
+**Auth:** None
+
+Response: JPEG image (`image/jpeg`).
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/search_history/asset/image/EVENT_ID" -o query.jpg
+```
+
+### `GET /v1/search_history/asset/thumb/{event_id}`
+
+Serve the thumbnail for a search event query.
+
+**Auth:** None
+
+Response: JPEG image (`image/jpeg`).
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/search_history/asset/thumb/EVENT_ID" -o thumb.jpg
 ```
 
 ---
@@ -546,6 +1314,10 @@ Try:
 - Lower `BUFFALO_MIN_DET_SCORE` (example: `0.2`)
 - Ensure the image is not extremely dark/blurry
 
+### Enrollment blocked by duplicate check
+
+If you get `no faces embedded from provided images` but quality check passes, the duplicate check may be blocking. The face may already exist under a different `subject_id`. Check `ENROLL_DUPLICATE_CHECK_ENABLE` and `ENROLL_DUPLICATE_MIN_SIM`.
+
 ### Qdrant errors
 
 - Ensure `qdrant` service is running:
@@ -558,4 +1330,3 @@ Check:
 
 - `GET /debug/providers` and confirm `CUDAExecutionProvider` appears in `insightface.session_providers`.
 - If it only shows `CPUExecutionProvider`, inference will be slow (hundreds of ms).
-

@@ -9,7 +9,7 @@ class FaceIndex:
     mean_embeddings: np.ndarray
 
 class FaceSearchRequest(BaseModel):
-    image_b64: str
+    image_b64: str = Field(..., validation_alias=AliasChoices("image_b64", "image", "images_b64"))
     camera: Optional[str] = None
     reid_id: Optional[str] = None
     frame_time: Optional[float] = None
@@ -21,7 +21,8 @@ class FaceSearchResponse(BaseModel):
 
 class FaceAddRequest(BaseModel):
     subject_id: str
-    images_b64: List[str]
+    images_b64: List[str] = []
+    image_urls: List[str] = []
     group_id: Optional[str] = None
 
 class GroupCreateRequest(BaseModel):
@@ -61,7 +62,7 @@ class FaceSearchTopKResponse(BaseModel):
     query_thumb_path: Optional[str] = None
 
 class FaceRecognizeRequest(BaseModel):
-    image_b64: str
+    image_b64: str = Field(..., validation_alias=AliasChoices("image_b64", "image", "images_b64"))
     top_k: int = 5
     min_similarity: Optional[float] = None
     group_id: Optional[str] = None
@@ -161,13 +162,27 @@ class FeedbackStatsResponse(BaseModel):
     by_decision: dict
 
 class RecognitionFetchRequest(BaseModel):
-    url: str
+    image_b64: Optional[str] = Field(None, validation_alias=AliasChoices("image_b64", "image", "images_b64"))
+    image_url: Optional[str] = Field(None, validation_alias=AliasChoices("image_url", "url"))
     camera: str
     source_path: Optional[str] = None
     ts: Optional[float] = None
     top_k: int = 5
     min_similarity: Optional[float] = None
     process_all_faces: bool = False
+    group_id: Optional[str] = None
+
+class FaceCompareRequest(BaseModel):
+    image1_b64: Optional[str] = None
+    image2_b64: Optional[str] = None
+    image1_url: Optional[str] = None
+    image2_url: Optional[str] = None
+
+class FaceCompareResponse(BaseModel):
+    similarity: float
+    match: bool
+    confidence: str
+    meta: Optional[dict] = None
 
 class FaceSubjectsResponse(BaseModel):
     subjects: List[str]
@@ -175,3 +190,24 @@ class FaceSubjectsResponse(BaseModel):
 class FaceDeleteSubjectResponse(BaseModel):
     subject_id: str
     deleted: bool
+
+class PrivacyExtractRequest(BaseModel):
+    image_b64: str = Field(..., validation_alias=AliasChoices("image_b64", "image", "images_b64"))
+    recognition: bool = False
+    top_k: int = Field(1, validation_alias=AliasChoices("top_k", "top_n"))
+    branch: Optional[str] = None
+    group_id: Optional[str] = None
+    day: Optional[str] = None
+    from_day: Optional[str] = None
+    to_day: Optional[str] = None
+    since_ts: Optional[float] = None
+    until_ts: Optional[float] = None
+
+class PrivacyCropItem(BaseModel):
+    bbox: Optional[List[float]] = None
+    quality: Optional[dict] = None
+    image_b64: str
+    recognition: Optional[FaceRecognizeResponse] = None
+
+class PrivacyExtractResponse(BaseModel):
+    results: List[PrivacyCropItem]
