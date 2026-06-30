@@ -2,6 +2,17 @@ data*/
 employee_images/
 buffalo_l/
 images*/
+downloaded_images/
+testfolder/
+input/
+
+# Models / weights
+*.onnx
+*.pt
+*.pth
+*.h5
+*.pkl
+*.npy
 
 # Python
 __pycache__/
