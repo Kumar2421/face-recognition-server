@@ -104,6 +104,11 @@ class BuffaloLEmbedder:
         cuda_mem_limit = int(os.environ.get("ORT_CUDA_MEMORY_LIMIT_MB", "0")) * 1024 * 1024
         arena_strategy = os.environ.get("ORT_CUDA_ARENA_EXTEND_STRATEGY", "kNextPowerOfTwo")
         
+        # cuDNN conv algo search: EXHAUSTIVE (ORT default) probes every algorithm
+        # and reserves GBs of workspace per session. HEURISTIC is far leaner with
+        # negligible latency cost for these small models.
+        cudnn_algo = os.environ.get("ORT_CUDNN_CONV_ALGO_SEARCH", "HEURISTIC").strip()
+
         for p in raw_providers:
             if p == "CUDAExecutionProvider":
                 opts = {"device_id": 0}
@@ -111,6 +116,8 @@ class BuffaloLEmbedder:
                     opts["gpu_mem_limit"] = cuda_mem_limit
                 if arena_strategy:
                     opts["arena_extend_strategy"] = arena_strategy
+                if cudnn_algo:
+                    opts["cudnn_conv_algo_search"] = cudnn_algo
                 self.providers.append((p, opts))
             else:
                 self.providers.append(p)
@@ -119,11 +126,28 @@ class BuffaloLEmbedder:
             os.environ.get("BUFFALO_ENABLE_FALLBACK_VARIANTS", "1")
         ).strip() not in ("0", "false", "False")
 
-        self.app = FaceAnalysis(
-            name=str(model_name),
-            root=str(model_root),
-            providers=self.providers,
-        )
+        # Only load the models we actually use. buffalo_l ships 5 ONNX models
+        # (detection, recognition, genderage, landmark_2d_106, landmark_3d_68);
+        # genderage + landmark_2d_106 are unused and each adds a CUDA session +
+        # cuDNN workspace. landmark_3d_68 is kept for pose (yaw/pitch) quality.
+        modules_env = os.environ.get(
+            "BUFFALO_MODULES", "detection,recognition,landmark_3d_68"
+        ).strip()
+        allowed_modules = [m.strip() for m in modules_env.split(",") if m.strip()] or None
+
+        fa_kwargs: dict = {
+            "name": str(model_name),
+            "root": str(model_root),
+            "providers": self.providers,
+        }
+        if allowed_modules:
+            fa_kwargs["allowed_modules"] = allowed_modules
+        try:
+            self.app = FaceAnalysis(**fa_kwargs)
+        except TypeError:
+            # Older insightface without allowed_modules support.
+            fa_kwargs.pop("allowed_modules", None)
+            self.app = FaceAnalysis(**fa_kwargs)
         self.app.prepare(ctx_id=0, det_size=(self.det_size, self.det_size))
 
     def detect_best(self, bgr: np.ndarray):

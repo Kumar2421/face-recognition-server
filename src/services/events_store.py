@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +27,8 @@ class RecognitionEvent:
     thumb_path: str
     image_saved_at: float | None
     meta: dict[str, Any] | None
+    branch: str | None = None
+    access_key: str = "standard"
     feedback_label: str | None = None
     feedback_note: str | None = None
     feedback_updated_at: float | None = None
@@ -41,6 +44,7 @@ class SearchEvent:
     top_similarity: float | None
     results: list[dict[str, Any]] | None
     meta: dict[str, Any] | None
+    access_key: str = "standard"
 
 
 class EventsStore:
@@ -54,9 +58,20 @@ class EventsStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def _session(self):
+        # `with conn:` only opens a transaction (commit/rollback) — it does NOT
+        # close the connection. Closing here prevents fd leaks under load.
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-        with self._connect() as conn:
+        with self._session() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS recognition_events (
@@ -78,7 +93,8 @@ class EventsStore:
                     meta_json TEXT,
                     feedback_label TEXT,
                     feedback_note TEXT,
-                    feedback_updated_at REAL
+                    feedback_updated_at REAL,
+                    access_key TEXT DEFAULT 'standard'
                 )
                 """
             )
@@ -93,7 +109,8 @@ class EventsStore:
                     top_subject_id TEXT,
                     top_similarity REAL,
                     results_json TEXT,
-                    meta_json TEXT
+                    meta_json TEXT,
+                    access_key TEXT DEFAULT 'standard'
                 )
                 """
             )
@@ -142,6 +159,28 @@ class EventsStore:
                     conn.execute("ALTER TABLE recognition_events ADD COLUMN feedback_updated_at REAL")
                 except Exception:
                     pass
+            if "access_key" not in cols:
+                try:
+                    conn.execute("ALTER TABLE recognition_events ADD COLUMN access_key TEXT DEFAULT 'standard'")
+                except Exception:
+                    pass
+            if "branch" not in cols:
+                try:
+                    conn.execute("ALTER TABLE recognition_events ADD COLUMN branch TEXT")
+                except Exception:
+                    pass
+
+            # Search events migration
+            try:
+                scols = [str(r[1]) for r in conn.execute("PRAGMA table_info(search_events)").fetchall()]
+            except Exception:
+                scols = []
+            if "access_key" not in scols:
+                try:
+                    conn.execute("ALTER TABLE search_events ADD COLUMN access_key TEXT DEFAULT 'standard'")
+                except Exception:
+                    pass
+
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_ts ON recognition_events (ts DESC)"
             )
@@ -153,6 +192,9 @@ class EventsStore:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_camera ON recognition_events (camera)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recognition_events_branch ON recognition_events (branch)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_recognition_events_combined ON recognition_events (camera, decision, ts DESC)"
@@ -176,7 +218,7 @@ class EventsStore:
             start = 0
 
         with self._lock:
-            with self._connect() as conn:
+            with self._session() as conn:
                 conn.execute(
                     "INSERT OR IGNORE INTO counters (key, value) VALUES (?, ?)",
                     (key, int(start - 1)),
@@ -189,7 +231,7 @@ class EventsStore:
 
     def insert_event(self, ev: RecognitionEvent) -> None:
         with self._lock:
-            with self._connect() as conn:
+            with self._session() as conn:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO recognition_events (
@@ -197,8 +239,8 @@ class EventsStore:
                         subject_id, similarity, processing_ms, model_ms, rejected_reason,
                         bbox_json, det_score,
                         image_path, thumb_path, image_saved_at, meta_json
-                        , feedback_label, feedback_note, feedback_updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        , feedback_label, feedback_note, feedback_updated_at, access_key, branch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ev.event_id,
@@ -220,20 +262,22 @@ class EventsStore:
                         ev.feedback_label,
                         ev.feedback_note,
                         float(ev.feedback_updated_at) if ev.feedback_updated_at is not None else None,
+                        str(ev.access_key or "standard"),
+                        (str(ev.branch).strip() or None) if ev.branch else None,
                     ),
                 )
 
     def insert_search_event(self, ev: SearchEvent) -> None:
         with self._lock:
-            with self._connect() as conn:
+            with self._session() as conn:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO search_events (
                         event_id, ts,
                         query_image_path, query_thumb_path,
                         top_subject_id, top_similarity,
-                        results_json, meta_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        results_json, meta_json, access_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(ev.event_id),
@@ -244,6 +288,7 @@ class EventsStore:
                         float(ev.top_similarity) if ev.top_similarity is not None else None,
                         json.dumps(ev.results) if ev.results is not None else None,
                         json.dumps(ev.meta) if ev.meta is not None else None,
+                        str(ev.access_key or "standard"),
                     ),
                 )
 
@@ -258,13 +303,15 @@ class EventsStore:
         max_similarity: float | None = None,
         since_ts: float | None = None,
         until_ts: float | None = None,
+        branch: str | None = None,
         limit: int = 100,
         cursor_ts: float | None = None,
-    ) -> tuple[list[dict[str, Any]], float | None]:
+        access_key: str = "standard",
+        ) -> tuple[list[dict[str, Any]], float | None]:
         limit = max(1, min(int(limit or 100), 5000))
 
-        where: list[str] = []
-        args: list[Any] = []
+        where: list[str] = ["access_key = ?"]
+        args: list[Any] = [str(access_key or "standard")]
         if camera:
             where.append("camera = ?")
             args.append(str(camera))
@@ -277,6 +324,9 @@ class EventsStore:
         if decision:
             where.append("decision = ?")
             args.append(str(decision))
+        if branch:
+            where.append("branch = ?")
+            args.append(str(branch))
         if min_similarity is not None:
             where.append("similarity >= ?")
             args.append(float(min_similarity))
@@ -303,7 +353,7 @@ class EventsStore:
         args.append(limit)
 
         with self._lock:
-            with self._connect() as conn:
+            with self._session() as conn:
                 rows = conn.execute(sql, args).fetchall()
 
         items: list[dict[str, Any]] = []
@@ -321,6 +371,7 @@ class EventsStore:
                 "event_id": r["event_id"],
                 "ts": float(r["ts"]),
                 "camera": r["camera"],
+                "branch": r["branch"] if "branch" in r.keys() else None,
                 "source_path": r["source_path"],
                 "decision": r["decision"],
                 "subject_id": r["subject_id"],
@@ -352,10 +403,11 @@ class EventsStore:
         match_threshold: float,
         since_ts: float | None = None,
         until_ts: float | None = None,
+        access_key: str = "standard",
     ) -> dict[str, int]:
         thr = float(match_threshold)
-        where: list[str] = []
-        args: list[Any] = [thr]
+        where: list[str] = ["access_key = ?"]
+        args: list[Any] = [str(access_key or "standard")]
         if since_ts is not None:
             where.append("ts >= ?")
             args.append(float(since_ts))
@@ -370,12 +422,12 @@ class EventsStore:
             "FROM search_events"
         )
 
-        args2 = [thr, thr] + args[1:]
+        args2 = [thr, thr] + args
         if where:
             sql += " WHERE " + " AND ".join(where)
 
         with self._lock:
-            with self._connect() as conn:
+            with self._session() as conn:
                 row = conn.execute(sql, args2).fetchone()
 
         try:
@@ -395,11 +447,12 @@ class EventsStore:
         cursor_ts: float | None = None,
         since_ts: float | None = None,
         until_ts: float | None = None,
+        access_key: str = "standard",
     ) -> tuple[list[dict[str, Any]], float | None]:
         limit = max(1, min(int(limit or 100), 5000))
 
-        where: list[str] = []
-        args: list[Any] = []
+        where: list[str] = ["access_key = ?"]
+        args: list[Any] = [str(access_key or "standard")]
         if since_ts is not None:
             where.append("ts >= ?")
             args.append(float(since_ts))
@@ -417,7 +470,7 @@ class EventsStore:
         args.append(limit)
 
         with self._lock:
-            with self._connect() as conn:
+            with self._session() as conn:
                 rows = conn.execute(sql, args).fetchall()
 
         items: list[dict[str, Any]] = []
@@ -446,12 +499,12 @@ class EventsStore:
 
         return items, next_cursor
 
-    def list_cameras(self, *, limit: int = 5000) -> list[str]:
+    def list_cameras(self, *, limit: int = 5000, access_key: str = "standard") -> list[str]:
         limit = max(1, min(int(limit or 5000), 50000))
-        sql = "SELECT camera FROM recognition_events WHERE camera != '' GROUP BY camera ORDER BY camera ASC LIMIT ?"
+        sql = "SELECT camera FROM recognition_events WHERE camera != '' AND access_key = ? GROUP BY camera ORDER BY camera ASC LIMIT ?"
         with self._lock:
-            with self._connect() as conn:
-                rows = conn.execute(sql, (int(limit),)).fetchall()
+            with self._session() as conn:
+                rows = conn.execute(sql, (str(access_key or "standard"), int(limit))).fetchall()
         out: list[str] = []
         for r in rows or []:
             try:
@@ -468,9 +521,10 @@ class EventsStore:
         since_ts: float | None = None,
         until_ts: float | None = None,
         camera: str | None = None,
+        access_key: str = "standard",
     ) -> dict[str, Any]:
-        where: list[str] = []
-        args: list[Any] = []
+        where: list[str] = ["access_key = ?"]
+        args: list[Any] = [str(access_key or "standard")]
         if camera:
             where.append("camera = ?")
             args.append(str(camera))
@@ -500,7 +554,7 @@ class EventsStore:
         by_camera: dict[str, dict[str, int]] = {}
 
         with self._lock:
-            with self._connect() as conn:
+            with self._session() as conn:
                 rows = conn.execute(sql, args).fetchall()
                 row_unique = conn.execute(sql_unique, args).fetchone()
                 if row_unique:
@@ -537,15 +591,15 @@ class EventsStore:
             "by_camera": by_camera
         }
 
-    def get_event(self, event_id: str) -> dict[str, Any] | None:
+    def get_event(self, event_id: str, access_key: str = "standard") -> dict[str, Any] | None:
         event_id = str(event_id or "").strip()
         if not event_id:
             return None
         with self._lock:
-            with self._connect() as conn:
+            with self._session() as conn:
                 r = conn.execute(
-                    "SELECT * FROM recognition_events WHERE event_id = ?",
-                    (event_id,),
+                    "SELECT * FROM recognition_events WHERE event_id = ? AND access_key = ?",
+                    (event_id, str(access_key or "standard")),
                 ).fetchone()
         if r is None:
             return None
@@ -561,6 +615,7 @@ class EventsStore:
             "event_id": r["event_id"],
             "ts": float(r["ts"]),
             "camera": r["camera"],
+            "branch": r["branch"] if "branch" in r.keys() else None,
             "source_path": r["source_path"],
             "decision": r["decision"],
             "subject_id": r["subject_id"],
@@ -586,6 +641,7 @@ class EventsStore:
         label: str | None,
         note: str | None,
         updated_at: float,
+        access_key: str = "standard",
     ) -> bool:
         event_id = str(event_id or "").strip()
         if not event_id:
@@ -593,10 +649,10 @@ class EventsStore:
         label_v = str(label or "").strip() or None
         note_v = str(note or "").strip() or None
         with self._lock:
-            with self._connect() as conn:
+            with self._session() as conn:
                 cur = conn.execute(
-                    "UPDATE recognition_events SET feedback_label = ?, feedback_note = ?, feedback_updated_at = ? WHERE event_id = ?",
-                    (label_v, note_v, float(updated_at), event_id),
+                    "UPDATE recognition_events SET feedback_label = ?, feedback_note = ?, feedback_updated_at = ? WHERE event_id = ? AND access_key = ?",
+                    (label_v, note_v, float(updated_at), event_id, str(access_key or "standard")),
                 )
                 return int(getattr(cur, "rowcount", 0) or 0) > 0
 
@@ -606,9 +662,10 @@ class EventsStore:
         since_ts: float | None = None,
         until_ts: float | None = None,
         camera: str | None = None,
+        access_key: str = "standard",
     ) -> dict[str, Any]:
-        where: list[str] = []
-        args: list[Any] = []
+        where: list[str] = ["access_key = ?"]
+        args: list[Any] = [str(access_key or "standard")]
         if camera:
             where.append("camera = ?")
             args.append(str(camera))
@@ -629,7 +686,7 @@ class EventsStore:
         total = 0
 
         with self._lock:
-            with self._connect() as conn:
+            with self._session() as conn:
                 rows = conn.execute(sql, args).fetchall()
 
         for r in rows or []:

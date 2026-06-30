@@ -232,7 +232,7 @@ export default function Rejections() {
             </span>
           </div>
           <button onClick={() => load(false)} className="primary" style={{ fontWeight: 600 }}>
-            {loading ? 'Refreshing...' : 'Refresh Events'}
+            {loading ? <><span className="spinner" />Refreshing...</> : 'Refresh Events'}
           </button>
         </div>
       </header>
@@ -306,7 +306,7 @@ export default function Rejections() {
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '20px' }}>
         {filtered.map(ev => (
-          <div key={`${ev.subject_id}_${ev.minTs}`} className="card" style={{ display: 'flex', flexDirection: 'column', gap: '10px', padding: '12px' }}>
+          <div key={`${ev.subject_id}_${ev.minTs}`} className="card hover-lift" style={{ display: 'flex', flexDirection: 'column', gap: '10px', padding: '12px', cursor: 'default' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
               <div style={{ overflow: 'hidden' }}>
                 <h4 style={{ fontWeight: 800, fontSize: '0.9375rem', color: 'var(--text-primary)', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{ev.subject_id || 'Unknown'}</h4>
@@ -405,7 +405,7 @@ export default function Rejections() {
             disabled={loading}
             style={{ minWidth: '200px', fontWeight: 600 }}
           >
-            {loading ? 'Loading...' : 'Load More Events'}
+            {loading ? <><span className="spinner" />Loading...</> : 'Load More Events'}
           </button>
         </div>
       )}

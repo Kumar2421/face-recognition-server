@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { crossCheckVisitorsVsEmployees, getApiBase, recognitionCameras, recognitionEvents, setRecognitionEventFeedback, subjectImages, type CrossCheckHit, type EventFeedbackLabel, type RecognitionEvent } from '../lib/api';
+import { useModalDismiss } from '../lib/useModalDismiss';
 
 function fmtTs(ts: number): string {
   try {
@@ -292,6 +293,8 @@ export default function Employees() {
     return () => { cancelled = true; };
   }, [camera, dateMode, day, fromDay, toDay]);
 
+  useModalDismiss(!!selectedEmployee, () => setSelectedEmployee(null));
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px' }}>
@@ -316,7 +319,7 @@ export default function Employees() {
             Reset
           </button>
           <button onClick={() => load(true)} className="primary" style={{ fontWeight: 600 }}>
-            {loading ? 'Refreshing...' : 'Refresh Feed'}
+            {loading ? <><span className="spinner" />Refreshing...</> : 'Refresh Feed'}
           </button>
         </div>
       </header>
@@ -426,7 +429,7 @@ export default function Employees() {
           return (
             <div
               key={sid}
-              className="card"
+              className="card hover-lift"
               style={{
                 display: 'grid',
                 gridTemplateColumns: '40px 1.2fr 180px 1fr 1fr 150px 150px 80px 60px',
@@ -549,17 +552,18 @@ export default function Employees() {
           className={nextCursor != null ? 'primary' : ''}
           style={{ padding: '12px 48px', minWidth: '200px' }}
         >
-          {loadingMore ? 'Loading...' : (nextCursor == null ? 'No More Results' : 'Load More Employees')}
+          {loadingMore ? <><span className="spinner" />Loading...</> : (nextCursor == null ? 'No More Results' : 'Load More Employees')}
         </button>
       </footer>
 
       {/* Full View Modal */}
       {selectedEmployee && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '40px' }}>
-          <div className="card" style={{ width: '100%', maxWidth: '1000px', maxHeight: '90vh', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '24px', padding: '32px', position: 'relative' }}>
+        <div className="modal-overlay" onClick={() => setSelectedEmployee(null)} style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '40px' }}>
+          <div className="card modal-content" onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: '1000px', maxHeight: '90vh', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '24px', padding: '32px', position: 'relative' }}>
             <button
               onClick={() => setSelectedEmployee(null)}
-              style={{ position: 'absolute', top: 16, right: 16, border: 'none', background: 'transparent', cursor: 'pointer', fontSize: '1.5rem', color: 'var(--text-muted)' }}
+              className="modal-close"
+              style={{ position: 'absolute', top: 16, right: 16, background: 'transparent', cursor: 'pointer', fontSize: '1.5rem', color: 'var(--text-muted)' }}
             >
               ✕
             </button>

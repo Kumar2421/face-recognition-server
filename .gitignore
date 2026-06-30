@@ -1,4 +1,17 @@
-data/
+data*/
 employee_images/
 buffalo_l/
-images/
+images*/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Claude / local tooling
+.claude/
+.claude copy/
+.agents/
+skills-lock.json

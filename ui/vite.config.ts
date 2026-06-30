@@ -8,6 +8,9 @@ export default defineConfig({
     host: true,
     port: 5173,
     strictPort: true,
+    // Bind-mounted into the face_ui container; native inotify events don't
+    // cross the mount, so poll the filesystem to keep HMR working.
+    watch: { usePolling: true, interval: 300 },
     allowedHosts: [
       'face.service.tools.thefusionapps.com',
     ],

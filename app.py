@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field, AliasChoices
 from src.models.schemas import (
     FaceIndex, FaceSearchRequest, FaceSearchResponse, FaceAddRequest,
     GroupCreateRequest, GroupResponse, GroupListResponse, FaceAddResponse,
+    BranchCreateRequest, BranchResponse, BranchListResponse,
     FaceSearchTopKRequest, FaceSearchTopKItem, FaceSearchTopKResponse,
     FaceRecognizeRequest, FaceRecognizeResponse, FaceQualityResult,
     QualityCheckResponse, RecognitionEventResponse, RecognitionEventsListResponse,
@@ -36,14 +37,16 @@ from src.models.schemas import (
     RecognitionStatsResponse, EventFeedbackRequest, EventFeedbackResponse,
     FeedbackStatsResponse, RecognitionFetchRequest, FaceSubjectsResponse,
     FaceDeleteSubjectResponse, FaceCompareRequest, FaceCompareResponse,
-    PrivacyExtractRequest, PrivacyExtractResponse, PrivacyCropItem
+    PrivacyExtractRequest, PrivacyExtractResponse, PrivacyCropItem,
+    PrivacyBlurRequest, PrivacyBlurResponse,
+    KeyCreateRequest, KeyInfo, KeyListResponse, KeyDeleteResponse
 )
 from src.utils.helpers import (
     _sha1_hex, _sha1_bytes_hex, _uuid5_from_name, _decode_b64_image,
     _decode_image_bytes, _t, _now_ts, _iso_now, _ensure_dir, _save_thumb
 )
 from src.services.inference_manager import GPUInferenceManager
-from src.services.events_store import EventsStore, RecognitionEvent
+from src.services.events_store import EventsStore, RecognitionEvent, SearchEvent
 from src.core.config_loader import apply_env_defaults_from_config, load_config
 
 from quality import FaceQualityEvaluator
@@ -76,14 +79,39 @@ def _get_api_key() -> str:
     """Read the expected API key at request time so config.yaml-sourced values are honoured."""
     return os.environ.get("FACE_SERVICE_API_KEY", "your-secret-key")
 
+def _get_legacy_api_key() -> str:
+    """Read the legacy API key from environment."""
+    return os.environ.get("FACE_SERVICE_LEGACY_API_KEY", "")
+
+def _resolve_access_key(header_value: str, *, required: bool) -> str:
+    """Map an API key -> data partition (access_key).
+
+    Each distinct key owns an isolated bucket, so the dashboard shows only the
+    data belonging to whatever single key the user supplies. The two configured
+    keys keep their historical buckets for back-compat.
+    """
+    val = str(header_value or "").strip()
+    if not val:
+        if required:
+            raise HTTPException(status_code=403, detail="API Key missing")
+        return "standard"
+    if val == str(_get_api_key()).strip():
+        return "standard"
+    legacy = _get_legacy_api_key()
+    if legacy and val == str(legacy).strip():
+        return "legacy"
+    # Master-issued key stored in the registry -> its assigned tenant bucket.
+    reg = _registry_lookup(val)
+    if reg:
+        return reg
+    # Any other key = its own deterministic tenant bucket.
+    return "k_" + hashlib.sha1(val.encode("utf-8")).hexdigest()[:16]
+
 async def get_api_key(header_value: str = Security(api_key_header)):
-    expected = _get_api_key()
-    if not header_value:
-        raise HTTPException(status_code=403, detail="API Key missing")
-    if str(header_value).strip() != str(expected).strip():
-        logger.warning(f"AUTH FAIL: '{header_value}' != '{expected}'")
-        raise HTTPException(status_code=403, detail="Invalid API Key")
-    return header_value
+    return _resolve_access_key(header_value, required=True)
+
+async def get_optional_access_key(header_value: str = Security(api_key_header)) -> str:
+    return _resolve_access_key(header_value, required=False)
 
 
 def _as_float(v: Any, default: float) -> float:
@@ -91,6 +119,17 @@ def _as_float(v: Any, default: float) -> float:
         return float(v)
     except Exception:
         return default
+
+
+def _normalize_created_at(created_at: str | None, ts: float | None) -> str:
+    if created_at and str(created_at).strip():
+        return str(created_at).strip()
+    if ts is not None:
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+        except Exception:
+            pass
+    return _iso_now()
 
 
 # In-memory cache for recently enrolled embeddings to prevent race conditions
@@ -330,19 +369,23 @@ def _save_search_query_assets(bgr: np.ndarray, image_id: str) -> tuple[str, str]
         from pathlib import Path as _Path
         _ensure_dir(app.state.search_events_dir)
         _ensure_dir(app.state.search_thumbs_dir)
-        
+
         # Save main query image
         img_path = _Path(app.state.search_events_dir) / f"{image_id}.jpg"
-        cv2.imwrite(str(img_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        
+        ok = cv2.imwrite(str(img_path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+             logger.error(f"cv2.imwrite failed for {img_path}")
+             return "", ""
+
         # Save thumbnail
         thumb_path = _save_thumb(bgr, app.state.search_thumbs_dir, image_id)
-        
+        if not thumb_path:
+             logger.error(f"failed to save thumbnail for {image_id}")
+
         return f"/v1/search_history/asset/image/{image_id}", thumb_path
     except Exception as e:
-        logger.error("failed to save search query assets: %s", str(e))
+        logger.error(f"failed to save search query assets for {image_id}: {str(e)}")
         return "", ""
-
 
 def _decode_b64_bytes(image_b64: str) -> bytes:
     if image_b64.startswith(("http://", "https://")):
@@ -562,7 +605,7 @@ def _subject_embedding_cap() -> int:
         return 10
 
 
-def _qdrant_count_subject_embeddings(client, collection: str, subject_id: str) -> int:
+def _qdrant_count_subject_embeddings(client, collection: str, subject_id: str, access_key: str = "standard") -> int:
     subject_id = str(subject_id or "").strip()
     if not subject_id:
         return 0
@@ -574,7 +617,10 @@ def _qdrant_count_subject_embeddings(client, collection: str, subject_id: str) -
         cnt = client.count(
             collection_name=collection,
             exact=True,
-            count_filter=Filter(must=[FieldCondition(key="subject_id", match=MatchValue(value=subject_id))]),
+            count_filter=Filter(must=[
+                FieldCondition(key="subject_id", match=MatchValue(value=subject_id)),
+                FieldCondition(key="access_key", match=MatchValue(value=access_key))
+            ]),
         )
         return int(getattr(cnt, "count", 0) or 0)
     except Exception:
@@ -654,26 +700,44 @@ def _no_match_auto_attach_min_margin() -> float:
         return 0.10
 
 
+def _recognition_logging_enabled() -> bool:
+    val = str(os.environ.get("RECOGNITION_LOGGING_ENABLED", "1")).strip().lower()
+    enabled = val not in ("0", "false", "no", "off")
+    return enabled
+
 def _qdrant_search(
     client, 
     collection: str, 
     emb: np.ndarray, 
     top_k: int, 
-    group_id: str | None = None,
     branch: str | None = None,
     since_ts: float | None = None,
-    until_ts: float | None = None
+    until_ts: float | None = None,
+    access_key: str = "standard",
 ) -> list[dict[str, Any]]:
-    t0 = _t()
+    t0 = _pc()
     try:
         search_params = None
         try:
-            from qdrant_client.http.models import SearchParams, Filter, FieldCondition, MatchValue, Range
+            from qdrant_client.http.models import SearchParams, Filter, FieldCondition, MatchValue, Range, DatetimeRange
         except Exception:
             SearchParams = None  # type: ignore
 
+        must_filters = [FieldCondition(key="access_key", match=MatchValue(value=access_key))]
+        if branch:
+            must_filters.append(FieldCondition(key="branch", match=MatchValue(value=branch)))
+        
+        if since_ts or until_ts:
+            r_kwargs = {}
+            if since_ts:
+                r_kwargs["gte"] = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+            if until_ts:
+                r_kwargs["lte"] = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat()
+            must_filters.append(FieldCondition(key="created_at", range=DatetimeRange(**r_kwargs)))
+        
+        search_filter = Filter(must=must_filters)
+
         if SearchParams is not None:
-            # ... (rest of search_params logic)
             try:
                 ef_raw = str(os.environ.get("QDRANT_HNSW_EF", "") or "").strip()
                 ef = int(ef_raw) if ef_raw else None
@@ -706,8 +770,6 @@ def _qdrant_search(
                 search_params = None
 
         must_filters = []
-        if group_id:
-            must_filters.append(FieldCondition(key="group_id", match=MatchValue(value=group_id)))
         if branch:
             must_filters.append(FieldCondition(key="branch", match=MatchValue(value=branch)))
         
@@ -717,7 +779,7 @@ def _qdrant_search(
                 r_kwargs["gte"] = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
             if until_ts:
                 r_kwargs["lte"] = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat()
-            must_filters.append(FieldCondition(key="created_at", range=Range(**r_kwargs)))
+            must_filters.append(FieldCondition(key="created_at", range=DatetimeRange(**r_kwargs)))
 
         search_filter = None
         if must_filters:
@@ -727,7 +789,7 @@ def _qdrant_search(
             collection_name=collection,
             query_vector=emb.astype(np.float32).reshape(-1).tolist(),
             limit=int(top_k),
-            with_payload=["subject_id", "image_id", "thumb_path", "group_id", "branch", "created_at"],
+            with_payload=["subject_id", "image_id", "thumb_path", "branch", "created_at"],
             query_filter=search_filter
         )
         if search_params is not None:
@@ -766,13 +828,15 @@ def _qdrant_search(
     return out
 
 
-def _qdrant_list_subjects(client, collection: str, limit: int = 5000) -> list[str]:
+def _qdrant_list_subjects(client, collection: str, limit: int = 5000, access_key: str = "standard") -> list[str]:
     try:
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
         points, _ = client.scroll(
             collection_name=collection,
             limit=int(limit),
             with_payload=True,
             with_vectors=False,
+            scroll_filter=Filter(must=[FieldCondition(key="access_key", match=MatchValue(value=access_key))])
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"qdrant scroll failed: {str(e)}")
@@ -1170,6 +1234,14 @@ def _startup() -> None:
     # CPU-bound task offloading (e.g., image decoding)
     app.state.executor = concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count() or 4)
 
+    # Dedicated thread pool for model inference (embedding/quality). The ONNX
+    # session can't be shipped to a process pool, but ort releases the GIL so a
+    # small thread pool keeps the event loop free without thrashing a single GPU.
+    app.state.embed_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=int(os.environ.get("EMBED_THREADS", "2") or 2),
+        thread_name_prefix="embed",
+    )
+
     embeddings_index = os.environ.get("FACE_EMBEDDINGS_INDEX")
     try:
         if embeddings_index:
@@ -1255,6 +1327,13 @@ def _startup() -> None:
         logger.error("failed to init events store: %s", str(e))
         app.state.events = None
 
+    # Warm the API-key registry (master-managed tenant keys).
+    try:
+        _reload_key_registry(force=True)
+        logger.info("api key registry loaded: %d keys", len(_key_registry))
+    except Exception as e:
+        logger.warning("api key registry warm-up failed: %s", str(e))
+
 
 @app.on_event("shutdown")
 def shutdown_event():
@@ -1262,11 +1341,16 @@ def shutdown_event():
         app.state.gpu.close()
     if hasattr(app.state, "executor") and app.state.executor:
         app.state.executor.shutdown(wait=True)
+    if hasattr(app.state, "embed_executor") and app.state.embed_executor:
+        app.state.embed_executor.shutdown(wait=True)
         
 
 
 @app.post("/v1/face/search", response_model=FaceSearchResponse, dependencies=[Depends(get_api_key)])
-def face_search(req: FaceSearchRequest) -> FaceSearchResponse:
+def face_search(
+    req: FaceSearchRequest,
+    access_key: str = Depends(get_api_key),
+) -> FaceSearchResponse:
     if _debug_enabled():
         try:
             _debug(
@@ -1285,7 +1369,7 @@ def face_search(req: FaceSearchRequest) -> FaceSearchResponse:
     q = getattr(app.state, "qdrant", None)
     if q is not None:
         emb, meta = _quality_check_and_embed(bgr)
-        results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1)
+        results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1, access_key=access_key)
         if not results:
             _debug("no_match")
             raise HTTPException(status_code=404, detail="no match")
@@ -1353,8 +1437,172 @@ def face_search(req: FaceSearchRequest) -> FaceSearchResponse:
     return FaceSearchResponse(subject_id=str(idx.subject_ids[best_i]), similarity=float(best_sim), meta=meta)
 
 
+# ===================== API key registry (master-managed) =====================
+# Master key = FACE_SERVICE_LEGACY_API_KEY. It manages tenant keys stored in a
+# Qdrant collection and auto-reloaded into an in-memory registry. Each tenant
+# key resolves to its own access_key bucket, so every other endpoint scopes its
+# data automatically via get_api_key / get_optional_access_key.
+
+_KEYS_COLLECTION = os.environ.get("KEYS_COLLECTION", "api_keys")
+_KEY_RELOAD_SEC = float(os.environ.get("KEY_RELOAD_SEC", "15"))
+_key_registry: dict[str, dict[str, Any]] = {}
+_key_registry_ts: float = 0.0
+
+
+def _master_key() -> str:
+    return str(_get_legacy_api_key() or "").strip()
+
+
+def _mask_key(raw: str) -> str:
+    s = str(raw or "")
+    return "****" if len(s) <= 8 else f"{s[:6]}…{s[-4:]}"
+
+
+def _key_point_id(raw: str) -> str:
+    return _uuid5_from_name(f"apikey:{raw}")
+
+
+def _keys_qdrant():
+    return getattr(app.state, "qdrant", None)
+
+
+def _ensure_keys_collection(client) -> None:
+    _ensure_qdrant_collection(client, _KEYS_COLLECTION, 1)
+
+
+def _scroll_key_payloads(client) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    _ensure_keys_collection(client)
+    next_off = None
+    while True:
+        batch, next_off = client.scroll(
+            collection_name=_KEYS_COLLECTION, limit=1000,
+            with_payload=True, with_vectors=False, offset=next_off,
+        )
+        for pnt in batch or []:
+            out.append(getattr(pnt, "payload", None) or {})
+        if not next_off:
+            break
+    return out
+
+
+def _reload_key_registry(force: bool = False) -> None:
+    global _key_registry, _key_registry_ts
+    now = time.time()
+    if not force and (now - _key_registry_ts) < _KEY_RELOAD_SEC:
+        return
+    client = _keys_qdrant()
+    if client is None:
+        _key_registry_ts = now
+        return
+    reg: dict[str, dict[str, Any]] = {}
+    try:
+        for p in _scroll_key_payloads(client):
+            raw = str(p.get("key") or "")
+            if not raw or not bool(p.get("active", True)):
+                continue
+            reg[raw] = {
+                "key_id": str(p.get("key_id") or ""),
+                "access_key": str(p.get("access_key") or ""),
+                "name": p.get("name"),
+                "active": bool(p.get("active", True)),
+                "created_at": p.get("created_at"),
+            }
+        _key_registry = reg
+        _key_registry_ts = now
+    except Exception as e:
+        logger.warning(f"key registry reload failed: {e}")
+
+
+def _registry_lookup(raw: str) -> str | None:
+    _reload_key_registry(False)
+    info = _key_registry.get(str(raw or "").strip())
+    return info["access_key"] if info else None
+
+
+async def require_master_key(header_value: str = Security(api_key_header)):
+    master = _master_key()
+    if not master:
+        raise HTTPException(status_code=503, detail="master key (legacy_api_key) not configured")
+    if str(header_value or "").strip() != master:
+        raise HTTPException(status_code=403, detail="master key required")
+    return True
+
+
+@app.post("/v1/keys", response_model=KeyInfo, dependencies=[Depends(require_master_key)])
+def create_key(req: KeyCreateRequest) -> KeyInfo:
+    client = _keys_qdrant()
+    if client is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+    raw = str(req.api_key or "").strip() or ("fs_" + uuid.uuid4().hex + uuid.uuid4().hex[:8])
+    reserved = {str(_get_api_key()).strip(), _master_key()}
+    if raw in reserved:
+        raise HTTPException(status_code=400, detail="key conflicts with a reserved key")
+    access_key = "t_" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    kid = _key_point_id(raw)
+    rec = {
+        "key_id": kid, "key": raw, "name": req.name, "access_key": access_key,
+        "active": True, "created_at": _iso_now(),
+    }
+    try:
+        from qdrant_client.http.models import PointStruct
+        _ensure_keys_collection(client)
+        client.upsert(
+            collection_name=_KEYS_COLLECTION,
+            points=[PointStruct(id=kid, vector=[0.0], payload=rec)],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"key store failed: {str(e)}")
+    _reload_key_registry(force=True)
+    # Raw key returned ONCE here; subsequent listings only show a masked value.
+    return KeyInfo(
+        key_id=kid, name=req.name, access_key=access_key, created_at=rec["created_at"],
+        active=True, api_key=raw, api_key_masked=_mask_key(raw),
+    )
+
+
+@app.get("/v1/keys", response_model=KeyListResponse, dependencies=[Depends(require_master_key)])
+def list_keys() -> KeyListResponse:
+    client = _keys_qdrant()
+    if client is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+    try:
+        recs = _scroll_key_payloads(client)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"key list failed: {str(e)}")
+    keys = [
+        KeyInfo(
+            key_id=str(r.get("key_id") or ""), name=r.get("name"),
+            access_key=str(r.get("access_key") or ""), created_at=r.get("created_at"),
+            active=bool(r.get("active", True)), api_key_masked=_mask_key(str(r.get("key") or "")),
+        )
+        for r in recs
+    ]
+    return KeyListResponse(keys=keys)
+
+
+@app.delete("/v1/keys/{key_id}", response_model=KeyDeleteResponse, dependencies=[Depends(require_master_key)])
+def delete_key(key_id: str) -> KeyDeleteResponse:
+    client = _keys_qdrant()
+    if client is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+    ok = False
+    try:
+        from qdrant_client.http.models import PointIdsList
+        _ensure_keys_collection(client)
+        client.delete(collection_name=_KEYS_COLLECTION, points_selector=PointIdsList(points=[str(key_id)]))
+        ok = True
+    except Exception as e:
+        logger.error(f"delete key failed: {str(e)}")
+    _reload_key_registry(force=True)
+    return KeyDeleteResponse(key_id=str(key_id), deleted=ok)
+
+
 @app.post("/v1/groups", response_model=GroupResponse, dependencies=[Depends(get_api_key)])
-async def create_group(req: GroupCreateRequest) -> GroupResponse:
+async def create_group(
+    req: GroupCreateRequest,
+    access_key: str = Depends(get_api_key),
+) -> GroupResponse:
     q = getattr(app.state, "qdrant", None)
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
@@ -1382,6 +1630,7 @@ async def create_group(req: GroupCreateRequest) -> GroupResponse:
                         "group_id": req.group_id,
                         "name": req.name or req.group_id,
                         "meta": req.meta or {},
+                        "access_key": access_key,
                         "created_at": _iso_now()
                     }
                 )
@@ -1393,7 +1642,7 @@ async def create_group(req: GroupCreateRequest) -> GroupResponse:
     return GroupResponse(group_id=req.group_id, name=req.name, meta=req.meta)
 
 @app.get("/v1/groups", response_model=GroupListResponse, dependencies=[Depends(get_api_key)])
-async def list_groups() -> GroupListResponse:
+async def list_groups(access_key: str = Depends(get_optional_access_key)) -> GroupListResponse:
     q = getattr(app.state, "qdrant", None)
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
@@ -1403,7 +1652,13 @@ async def list_groups() -> GroupListResponse:
         if not q.collection_exists(group_collection):
             return GroupListResponse(groups=[])
         
-        points, _ = q.scroll(collection_name=group_collection, limit=100, with_payload=True)
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        points, _ = q.scroll(
+            collection_name=group_collection, 
+            limit=100, 
+            with_payload=True,
+            scroll_filter=Filter(must=[FieldCondition(key="access_key", match=MatchValue(value=access_key))])
+        )
         groups = []
         for p in points:
             payload = p.payload or {}
@@ -1417,24 +1672,260 @@ async def list_groups() -> GroupListResponse:
         raise HTTPException(status_code=500, detail=f"failed to list groups: {str(e)}")
 
 @app.delete("/v1/groups/{group_id}", dependencies=[Depends(get_api_key)])
-async def delete_group(group_id: str) -> dict[str, Any]:
+async def delete_group(
+    group_id: str,
+    access_key: str = Depends(get_api_key),
+) -> dict[str, Any]:
     q = getattr(app.state, "qdrant", None)
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
     
     group_collection = os.environ.get("QDRANT_GROUPS_COLLECTION", "face_groups")
     try:
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
         q.delete(
             collection_name=group_collection,
-            points_selector=[_uuid5_from_name(group_id)]
+            points_selector=Filter(must=[
+                FieldCondition(key="group_id", match=MatchValue(value=group_id)),
+                FieldCondition(key="access_key", match=MatchValue(value=access_key))
+            ])
         )
         return {"deleted": True, "group_id": group_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"failed to delete group: {str(e)}")
 
 
+# Cache of validated branch ids -> monotonic expiry. Branches change rarely,
+# so skip the two per-request Qdrant round-trips once a branch is confirmed.
+_BRANCH_OK_CACHE: dict[str, float] = {}
+_BRANCH_CACHE_TTL = float(os.environ.get("BRANCH_CACHE_TTL", "300") or 300)
+
+
+def _ensure_branch_exists(q, branch_id: str | None, access_key: str = "standard") -> None:
+    if not branch_id:
+        return
+    bid = str(branch_id).strip()
+    if not bid:
+        return
+
+    exp = _BRANCH_OK_CACHE.get(bid)
+    if exp is not None and exp > _pc():
+        return
+
+    branch_collection = os.environ.get("QDRANT_BRANCHES_COLLECTION", "face_branches")
+    try:
+        if not q.collection_exists(branch_collection):
+             raise HTTPException(status_code=400, detail=f"branch '{bid}' not found (no branches registered)")
+
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        res, _ = q.scroll(
+            collection_name=branch_collection,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="branch_id", match=MatchValue(value=bid)),
+                FieldCondition(key="access_key", match=MatchValue(value=access_key))
+            ]),
+            limit=1,
+            with_payload=False,
+            with_vectors=False
+        )
+        if not res:
+            raise HTTPException(status_code=400, detail=f"branch '{bid}' is not available for your access key. please create it first.")
+        _BRANCH_OK_CACHE[bid] = _pc() + _BRANCH_CACHE_TTL
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"failed to verify branch existence: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"error verifying branch '{bid}'")
+
+
+@app.post("/v1/branches", response_model=BranchResponse, dependencies=[Depends(get_api_key)])
+async def create_branch(
+    req: BranchCreateRequest,
+    access_key: str = Depends(get_api_key),
+) -> BranchResponse:
+    q = getattr(app.state, "qdrant", None)
+    if q is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+    
+    branch_collection = os.environ.get("QDRANT_BRANCHES_COLLECTION", "face_branches")
+    try:
+        from qdrant_client.http.models import Distance, VectorParams
+        if not q.collection_exists(branch_collection):
+            q.create_collection(
+                collection_name=branch_collection,
+                vectors_config=VectorParams(size=1, distance=Distance.COSINE), # Dummy vector
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to ensure branches collection: {str(e)}")
+
+    try:
+        from qdrant_client.http.models import PointStruct
+        q.upsert(
+            collection_name=branch_collection,
+            points=[
+                PointStruct(
+                    id=_uuid5_from_name(req.branch_id),
+                    vector=[0.0],
+                    payload={
+                        "branch_id": req.branch_id,
+                        "name": req.name or req.branch_id,
+                        "meta": req.meta or {},
+                        "access_key": access_key,
+                        "created_at": _iso_now()
+                    }
+                )
+            ]
+        )
+        _BRANCH_OK_CACHE[str(req.branch_id).strip()] = _pc() + _BRANCH_CACHE_TTL
+        return BranchResponse(
+            branch_id=req.branch_id,
+            name=req.name or req.branch_id,
+            meta=req.meta or {}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to create branch: {str(e)}")
+
+
+@app.get("/v1/branches", response_model=BranchListResponse, dependencies=[Depends(get_api_key)])
+async def list_branches(access_key: str = Depends(get_optional_access_key)) -> BranchListResponse:
+    q = getattr(app.state, "qdrant", None)
+    if q is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+    
+    branch_collection = os.environ.get("QDRANT_BRANCHES_COLLECTION", "face_branches")
+    try:
+        if not q.collection_exists(branch_collection):
+            return BranchListResponse(branches=[])
+        
+        branches = []
+        # Scroll all points from branch collection
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        res, _ = q.scroll(
+            collection_name=branch_collection, 
+            limit=1000, 
+            with_payload=True, 
+            with_vectors=False,
+            scroll_filter=Filter(must=[FieldCondition(key="access_key", match=MatchValue(value=access_key))])
+        )
+        
+        try:
+            from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        except Exception:
+            Filter = None
+
+        for p in res:
+            pl = p.payload or {}
+            bid = str(pl.get("branch_id") or "")
+            
+            e_count = 0
+            s_count = 0
+            if Filter and bid:
+                try:
+                    # enrollment_count
+                    cnt_res = q.count(
+                        collection_name=app.state.qdrant_collection,
+                        count_filter=Filter(must=[
+                            FieldCondition(key="branch", match=MatchValue(value=bid)),
+                            FieldCondition(key="access_key", match=MatchValue(value=access_key))
+                        ]),
+                        exact=True
+                    )
+                    e_count = int(getattr(cnt_res, "count", 0) or 0)
+
+                    # subject_count
+                    sids = set()
+                    next_offset = None
+                    while True:
+                        batch, next_offset = q.scroll(
+                            collection_name=app.state.qdrant_collection,
+                            scroll_filter=Filter(must=[
+                                FieldCondition(key="branch", match=MatchValue(value=bid)),
+                                FieldCondition(key="access_key", match=MatchValue(value=access_key))
+                            ]),
+                            limit=1000,
+                            with_payload=["subject_id"],
+                            with_vectors=False,
+                            offset=next_offset
+                        )
+                        for b in batch:
+                            sid = (b.payload or {}).get("subject_id")
+                            if sid: sids.add(sid)
+                        if not next_offset: break
+                    s_count = len(sids)
+                except Exception:
+                    pass
+
+            branches.append(BranchResponse(
+                branch_id=bid,
+                name=str(pl.get("name") or ""),
+                meta=dict(pl.get("meta") or {}),
+                enrollment_count=e_count,
+                subject_count=s_count
+            ))
+
+        # Also surface branches that exist only as a payload value on enrolled
+        # data for this key (no Branch entity was ever created). Lets the UI
+        # offer real branches to filter by without requiring POST /v1/branches.
+        try:
+            known = {str(b.branch_id) for b in branches}
+            if Filter:
+                next_off = None
+                scanned = 0
+                while scanned < 20000:  # cap scan for safety
+                    batch, next_off = q.scroll(
+                        collection_name=app.state.qdrant_collection,
+                        scroll_filter=Filter(must=[FieldCondition(key="access_key", match=MatchValue(value=access_key))]),
+                        limit=1000,
+                        with_payload=["branch"],
+                        with_vectors=False,
+                        offset=next_off,
+                    )
+                    for b in batch or []:
+                        bid = str((b.payload or {}).get("branch") or "").strip()
+                        if bid and bid not in known:
+                            known.add(bid)
+                            branches.append(BranchResponse(branch_id=bid, name=bid, meta={}))
+                    scanned += len(batch or [])
+                    if not next_off:
+                        break
+        except Exception:
+            pass
+
+        return BranchListResponse(branches=branches)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to list branches: {str(e)}")
+
+
+@app.delete("/v1/branches/{branch_id}", dependencies=[Depends(get_api_key)])
+async def delete_branch(
+    branch_id: str,
+    access_key: str = Depends(get_api_key),
+) -> dict[str, Any]:
+    q = getattr(app.state, "qdrant", None)
+    if q is None:
+        raise HTTPException(status_code=501, detail="qdrant not configured")
+    
+    branch_collection = os.environ.get("QDRANT_BRANCHES_COLLECTION", "face_branches")
+    try:
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+        q.delete(
+            collection_name=branch_collection,
+            points_selector=Filter(must=[
+                FieldCondition(key="branch_id", match=MatchValue(value=branch_id)),
+                FieldCondition(key="access_key", match=MatchValue(value=access_key))
+            ])
+        )
+        _BRANCH_OK_CACHE.pop(str(branch_id).strip(), None)
+        return {"deleted": True, "branch_id": branch_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to delete branch: {str(e)}")
+
+
 @app.post("/v1/faces/add", response_model=FaceAddResponse, dependencies=[Depends(get_api_key)])
-def faces_add(req: FaceAddRequest) -> FaceAddResponse:
+def faces_add(
+    req: FaceAddRequest,
+    access_key: str = Depends(get_api_key),
+) -> FaceAddResponse:
     if not req.subject_id or not str(req.subject_id).strip():
         raise HTTPException(status_code=400, detail="subject_id is required")
 
@@ -1449,13 +1940,16 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
         raise HTTPException(status_code=501, detail="qdrant not configured")
 
     cap = _subject_embedding_cap()
-    existing = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id)
+    existing = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id, access_key=access_key)
     if existing >= cap:
         raise HTTPException(status_code=409, detail=f"subject embedding cap reached ({existing}/{cap})")
 
     num_embedded = 0
     emb_dim: int | None = None
     last_meta: dict[str, Any] | None = None
+    
+    # Use provided date or default to now
+    enroll_ts = _normalize_created_at(req.created_at, req.ts)
 
     for i, img_b64 in enumerate(all_images):
         if existing >= cap:
@@ -1484,7 +1978,7 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
         if _enroll_dup_check_enabled():
             try:
                 thr = float(_enroll_dup_min_similarity())
-                hits = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1)
+                hits = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1, access_key=access_key)
                 if hits:
                     best = hits[0]
                     best_sid = str(best.get("subject_id") or "").strip()
@@ -1522,9 +2016,10 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
                         vector=emb.astype(np.float32).reshape(-1).tolist(),
                         payload={
                             "subject_id": subject_id,
-                            "group_id": req.group_id,
+                            "branch": req.branch,
+                            "access_key": access_key,
                             "image_id": image_id,
-                            "created_at": _iso_now(),
+                            "created_at": enroll_ts,
                             "thumb_path": thumb_path,
                             "image_path": image_path,
                             "source": "enroll",
@@ -1561,9 +2056,12 @@ def faces_add(req: FaceAddRequest) -> FaceAddResponse:
 @app.post("/v1/faces/add_upload", response_model=FaceAddResponse, dependencies=[Depends(get_api_key)])
 async def faces_add_upload(
     subject_id: str = Form(...),
-    group_id: str | None = Form(None),
+    branch: str | None = Form(None),
+    created_at: str | None = Form(None),
+    ts: float | None = Form(None),
     files: list[UploadFile] = File(default=[]),
     image_urls: list[str] = Form(default=[]),
+    access_key: str = Depends(get_api_key),
 ) -> FaceAddResponse:
     subject_id = str(subject_id or "").strip()
     if not subject_id:
@@ -1576,13 +2074,16 @@ async def faces_add_upload(
         raise HTTPException(status_code=501, detail="qdrant not configured")
 
     cap = _subject_embedding_cap()
-    existing = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id)
+    existing = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id, access_key=access_key)
     if existing >= cap:
         raise HTTPException(status_code=409, detail=f"subject embedding cap reached ({existing}/{cap})")
 
     num_embedded = 0
     emb_dim: int | None = None
     last_meta: dict[str, Any] | None = None
+    
+    # Use provided date or default to now
+    enroll_ts = _normalize_created_at(created_at, ts)
 
     for i, f in enumerate(files):
         if existing >= cap:
@@ -1611,7 +2112,7 @@ async def faces_add_upload(
         if _enroll_dup_check_enabled():
             try:
                 thr = float(_enroll_dup_min_similarity())
-                hits = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1)
+                hits = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1, access_key=access_key)
                 if hits:
                     best = hits[0]
                     best_sid = str(best.get("subject_id") or "").strip()
@@ -1649,9 +2150,10 @@ async def faces_add_upload(
                         vector=emb.astype(np.float32).reshape(-1).tolist(),
                         payload={
                             "subject_id": subject_id,
-                            "group_id": group_id,
+                            "branch": branch,
+                            "access_key": access_key,
                             "image_id": image_id,
-                            "created_at": _iso_now(),
+                            "created_at": enroll_ts,
                             "thumb_path": thumb_path,
                             "source": "enroll",
                             "filename": str(getattr(f, "filename", "") or ""),
@@ -1702,7 +2204,7 @@ async def faces_add_upload(
         if _enroll_dup_check_enabled():
             try:
                 thr = float(_enroll_dup_min_similarity())
-                hits = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1)
+                hits = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=1, access_key=access_key)
                 if hits:
                     best = hits[0]
                     best_sid = str(best.get("subject_id") or "").strip()
@@ -1741,9 +2243,10 @@ async def faces_add_upload(
                         vector=emb.astype(np.float32).reshape(-1).tolist(),
                         payload={
                             "subject_id": subject_id,
-                            "group_id": group_id,
+                            "branch": branch,
+                            "access_key": access_key,
                             "image_id": image_id,
-                            "created_at": _iso_now(),
+                            "created_at": enroll_ts,
                             "thumb_path": thumb_path,
                             "image_path": image_path,
                             "source": "enroll",
@@ -1776,8 +2279,11 @@ async def faces_add_upload(
     )
 
 
-@app.post("/v1/faces/search", response_model=FaceSearchTopKResponse, dependencies=[Depends(get_api_key)])
-def faces_search(req: FaceSearchTopKRequest) -> FaceSearchTopKResponse:
+@app.post("/v1/faces/search", response_model=FaceSearchTopKResponse)
+def faces_search(
+    req: FaceSearchTopKRequest,
+    access_key: str = Depends(get_api_key)
+) -> FaceSearchTopKResponse:
     top_k = int(req.top_k or 5)
     top_k = max(1, min(top_k, 50))
 
@@ -1785,13 +2291,20 @@ def faces_search(req: FaceSearchTopKRequest) -> FaceSearchTopKResponse:
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
 
+    s_ts, e_ts = _date_window_from_params(
+        day=req.day,
+        from_day=req.from_day,
+        to_day=req.to_day,
+        since_ts=req.since_ts,
+        until_ts=req.until_ts
+    )
+
     bgr = _decode_b64_image(req.image_b64)
     emb, _meta = _quality_check_and_embed(bgr)
-    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, group_id=req.group_id)
+    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, branch=req.branch, since_ts=s_ts, until_ts=e_ts, access_key=access_key)
 
     thumb_path = ""
     try:
-        from events_store import SearchEvent
 
         store: EventsStore | None = getattr(app.state, "events", None)
         if store is not None:
@@ -1809,6 +2322,7 @@ def faces_search(req: FaceSearchTopKRequest) -> FaceSearchTopKResponse:
                 top_similarity=top_sim,
                 results=results,
                 meta=_meta,
+                access_key=access_key,
             )
             store.insert_search_event(ev)
     except Exception as e:
@@ -1828,23 +2342,36 @@ def faces_search(req: FaceSearchTopKRequest) -> FaceSearchTopKResponse:
 async def faces_search_upload(
     file: UploadFile = File(...),
     top_k: int = Form(5),
-    group_id: Optional[str] = Form(None),
+    branch: Optional[str] = Form(None),
+    day: Optional[str] = Form(None),
+    from_day: Optional[str] = Form(None),
+    to_day: Optional[str] = Form(None),
+    since_ts: Optional[float] = Form(None),
+    until_ts: Optional[float] = Form(None),
+    access_key: str = Depends(get_api_key),
 ) -> FaceSearchTopKResponse:
     q = getattr(app.state, "qdrant", None)
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
+
+    s_ts, e_ts = _date_window_from_params(
+        day=day,
+        from_day=from_day,
+        to_day=to_day,
+        since_ts=since_ts,
+        until_ts=until_ts
+    )
 
     top_k = int(top_k or 5)
     top_k = max(1, min(top_k, 50))
     image_bytes = await file.read()
     bgr = _decode_image_bytes(image_bytes)
     emb, _meta = _quality_check_and_embed(bgr)
-    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, group_id=group_id)
+    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, branch=branch, since_ts=s_ts, until_ts=e_ts, access_key=access_key)
 
     thumb_path = None
     # Persistent Logging
     try:
-        from events_store import SearchEvent
         event_id = str(uuid.uuid4())
         img_url, thumb_path = _save_search_query_assets(bgr, event_id)
         
@@ -1859,7 +2386,8 @@ async def faces_search_upload(
             top_subject_id=top_sid,
             top_similarity=top_sim,
             results=results,
-            meta=_meta
+            meta=_meta,
+            access_key=access_key,
         )
         if app.state.events:
             app.state.events.insert_search_event(ev)
@@ -1871,8 +2399,11 @@ async def faces_search_upload(
     return FaceSearchTopKResponse(results=[FaceSearchTopKItem(**r) for r in results], query_thumb_path=thumb_path or None)
 
 
-@app.post("/v1/faces/recognize", response_model=FaceRecognizeResponse, dependencies=[Depends(get_api_key)])
-def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
+@app.post("/v1/faces/recognize", response_model=FaceRecognizeResponse)
+def faces_recognize(
+    req: FaceRecognizeRequest,
+    access_key: str = Depends(get_api_key)
+) -> FaceRecognizeResponse:
     top_k = int(req.top_k or 5)
     top_k = max(1, min(top_k, 50))
     min_sim = float(req.min_similarity) if req.min_similarity is not None else float(app.state.min_similarity)
@@ -1881,14 +2412,23 @@ def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
 
+    _ensure_branch_exists(q, req.branch, access_key=access_key)
+
+    s_ts, e_ts = _date_window_from_params(
+        day=req.day,
+        from_day=req.from_day,
+        to_day=req.to_day,
+        since_ts=req.since_ts,
+        until_ts=req.until_ts
+    )
+
     bgr = _decode_b64_image(req.image_b64)
     emb, meta = _quality_check_and_embed(bgr)
-    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, group_id=req.group_id)
+    results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, branch=req.branch, since_ts=s_ts, until_ts=e_ts, access_key=access_key)
     items = [FaceSearchTopKItem(**r) for r in results]
 
     # Persistent Logging
     try:
-        from events_store import SearchEvent
         event_id = str(uuid.uuid4())
         img_url, thumb_path = _save_search_query_assets(bgr, event_id)
         
@@ -1903,8 +2443,10 @@ def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
             top_subject_id=top_sid,
             top_similarity=top_sim,
             results=results,
-            meta=meta
+            meta=meta,
+            access_key=access_key,
         )
+
         if app.state.events:
             app.state.events.insert_search_event(ev)
             logger.info("Recognize Event Logged: %s", event_id)
@@ -1944,7 +2486,11 @@ def faces_recognize(req: FaceRecognizeRequest) -> FaceRecognizeResponse:
 
 
 @app.get("/v1/faces/cross_match/{subject_id}", response_model=FaceSearchTopKResponse)
-async def faces_cross_match(subject_id: str, top_k: int = 20) -> FaceSearchTopKResponse:
+async def faces_cross_match(
+    subject_id: str,
+    top_k: int = 20,
+    access_key: str = Depends(get_optional_access_key),
+) -> FaceSearchTopKResponse:
     q = getattr(app.state, "qdrant", None)
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
@@ -1965,7 +2511,10 @@ async def faces_cross_match(subject_id: str, top_k: int = 20) -> FaceSearchTopKR
             from qdrant_client.http.models import Filter, FieldCondition, MatchValue
             hits = q.scroll(
                 collection_name=app.state.qdrant_collection,
-                scroll_filter=Filter(must=[FieldCondition(key="subject_id", match=MatchValue(value=subject_id))]),
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="subject_id", match=MatchValue(value=subject_id)),
+                    FieldCondition(key="access_key", match=MatchValue(value=access_key))
+                ]),
                 limit=1,
                 with_vectors=True
             )
@@ -1979,7 +2528,7 @@ async def faces_cross_match(subject_id: str, top_k: int = 20) -> FaceSearchTopKR
         raise HTTPException(status_code=404, detail=f"subject {subject_id} not found or has no embeddings")
 
     # 2. Search for similar subjects
-    hits = _qdrant_search(q, app.state.qdrant_collection, vector, top_k=100)
+    hits = _qdrant_search(q, app.state.qdrant_collection, vector, top_k=100, access_key=access_key)
     
     # 3. Filter for different subject_ids (usually visitor-*) and high similarity
     threshold = 0.85
@@ -2001,21 +2550,21 @@ async def faces_cross_match(subject_id: str, top_k: int = 20) -> FaceSearchTopKR
 @app.post("/v1/events/recognition", response_model=RecognitionEventResponse)
 async def ingest_recognition_event(
     file: UploadFile = File(...),
-    camera: str = Form(...),
+    camera: str = Form(""),
     source_path: str = Form(""),
     ts: float | None = Form(None),
     top_k: int = Form(5),
     min_similarity: float | None = Form(None),
     process_all_faces: bool = Form(False),
-    group_id: str | None = Form(None),
+    branch: str | None = Form(None),
+    access_key: str = Depends(get_optional_access_key),
 ) -> RecognitionEventResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
         raise HTTPException(status_code=500, detail="events store not configured")
 
     camera = str(camera or "").strip()
-    if not camera:
-        raise HTTPException(status_code=400, detail="camera is required")
+    branch = str(branch).strip() if branch else None
 
     t_req0 = _t()
     t_total0 = _pc()
@@ -2178,6 +2727,7 @@ async def ingest_recognition_event(
                     event_id=event_id,
                     ts=ts_val,
                     camera=camera,
+                    branch=branch,
                     source_path=source_path,
                     decision="rejected",
                     subject_id=None,
@@ -2191,12 +2741,14 @@ async def ingest_recognition_event(
                     thumb_path=thumb_path,
                     image_saved_at=image_saved_at,
                     meta=meta,
+                    access_key=access_key,
                 )
             )
             return RecognitionEventResponse(
                 event_id=event_id,
                 ts=ts_val,
                 camera=camera,
+                branch=branch,
                 source_path=source_path,
                 decision="rejected",
                 subject_id=None,
@@ -2311,6 +2863,7 @@ async def ingest_recognition_event(
                         event_id=ev_id,
                         ts=ts_val,
                         camera=camera,
+                        branch=branch,
                         source_path=source_path,
                         decision="rejected",
                         subject_id=None,
@@ -2324,6 +2877,7 @@ async def ingest_recognition_event(
                         thumb_path=thumb_path,
                         image_saved_at=image_saved_at,
                         meta=meta,
+                        access_key=access_key,
                     )
                 )
                 faces_processed += 1
@@ -2332,6 +2886,7 @@ async def ingest_recognition_event(
                         event_id=ev_id,
                         ts=ts_val,
                         camera=camera,
+                        branch=branch,
                         source_path=source_path,
                         decision="rejected",
                         subject_id=None,
@@ -2345,6 +2900,7 @@ async def ingest_recognition_event(
                         thumb_path=thumb_path,
                         image_saved_at=image_saved_at,
                         meta=meta,
+                        access_key=access_key,
                     )
                 continue
 
@@ -2385,6 +2941,7 @@ async def ingest_recognition_event(
                     event_id=ev_id,
                     ts=ts_val,
                     camera=camera,
+                    branch=branch,
                     source_path=source_path,
                     decision="rejected",
                     subject_id=None,
@@ -2398,6 +2955,7 @@ async def ingest_recognition_event(
                     thumb_path=thumb_path,
                     image_saved_at=image_saved_at,
                     meta=meta,
+                    access_key=access_key,
                 )
             )
             faces_processed += 1
@@ -2406,6 +2964,7 @@ async def ingest_recognition_event(
                     event_id=ev_id,
                     ts=ts_val,
                     camera=camera,
+                    branch=branch,
                     source_path=source_path,
                     decision="rejected",
                     subject_id=None,
@@ -2419,6 +2978,7 @@ async def ingest_recognition_event(
                     thumb_path=thumb_path,
                     image_saved_at=image_saved_at,
                     meta=meta,
+                    access_key=access_key,
                 )
             continue
 
@@ -2431,7 +2991,7 @@ async def ingest_recognition_event(
             raise HTTPException(status_code=500, detail=f"qdrant init failed: {str(e)}")
 
         t_qs0 = _pc()
-        results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, group_id=group_id)
+        results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, branch=branch, access_key=access_key)
         
         # Check in-memory cache if no database match
         if not results or results[0]["similarity"] < float(min_sim):
@@ -2500,7 +3060,7 @@ async def ingest_recognition_event(
                         if not matched:
                             q = getattr(app.state, "qdrant", None)
                             if q:
-                                results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=5)
+                                results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=5, access_key=access_key)
                                 if results and results[0]["similarity"] >= recheck_thr:
                                     logger.info("race_condition_prevented: matched %s via DB re-check (thr=%.2f)", results[0]["subject_id"], recheck_thr)
                                     matched = True
@@ -2604,6 +3164,7 @@ async def ingest_recognition_event(
                                             vector=np.asarray(emb, dtype=np.float32).reshape(-1).tolist(),
                                             payload={
                                                 "subject_id": str(new_subject_id),
+                                                "access_key": access_key,
                                                 "image_id": str(nm_image_id),
                                                 "created_at": _iso_now(),
                                                 "thumb_path": thumb_path,
@@ -2648,7 +3209,7 @@ async def ingest_recognition_event(
             if float(similarity) >= float(_auto_add_min_similarity()):
                 try:
                     cap = _subject_embedding_cap()
-                    existing = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id)
+                    existing = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id, access_key=access_key)
                     if existing >= cap:
                         auto_add_reason = "cap_reached"
                     else:
@@ -2669,6 +3230,7 @@ async def ingest_recognition_event(
                                         vector=np.asarray(emb, dtype=np.float32).reshape(-1).tolist(),
                                         payload={
                                             "subject_id": str(subject_id),
+                                            "access_key": access_key,
                                             "image_id": str(auto_image_id),
                                             "created_at": _iso_now(),
                                             "thumb_path": thumb_path,
@@ -2741,6 +3303,7 @@ async def ingest_recognition_event(
                 event_id=ev_id,
                 ts=ts_val,
                 camera=camera,
+                branch=branch,
                 source_path=source_path,
                 decision=decision,
                 subject_id=subject_id,
@@ -2754,6 +3317,7 @@ async def ingest_recognition_event(
                 thumb_path=thumb_path,
                 image_saved_at=image_saved_at,
                 meta=meta,
+                access_key=access_key,
             )
         )
 
@@ -2763,6 +3327,7 @@ async def ingest_recognition_event(
                 event_id=ev_id,
                 ts=ts_val,
                 camera=camera,
+                branch=branch,
                 source_path=source_path,
                 decision=decision,
                 subject_id=subject_id,
@@ -2800,6 +3365,7 @@ def list_recognition_events(
     decision: str | None = None,
     min_similarity: float | None = None,
     max_similarity: float | None = None,
+    branch: str | None = None,
     day: str | None = None,
     from_day: str | None = None,
     to_day: str | None = None,
@@ -2807,6 +3373,7 @@ def list_recognition_events(
     until_ts: float | None = None,
     limit: int = 100,
     cursor: float | None = None,
+    access_key: str = Depends(get_optional_access_key),
 ) -> RecognitionEventsListResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
@@ -2828,8 +3395,10 @@ def list_recognition_events(
         max_similarity=max_similarity,
         since_ts=since_ts,
         until_ts=until_ts,
+        branch=branch,
         limit=limit,
         cursor_ts=cursor,
+        access_key=access_key,
     )
     return RecognitionEventsListResponse(
         items=[RecognitionEventResponse(**it) for it in items],
@@ -2846,6 +3415,7 @@ def list_search_events(
     to_day: str | None = None,
     since_ts: float | None = None,
     until_ts: float | None = None,
+    access_key: str = Depends(get_optional_access_key),
 ) -> SearchEventsListResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
@@ -2864,6 +3434,7 @@ def list_search_events(
         cursor_ts=cursor,
         since_ts=since_ts,
         until_ts=until_ts,
+        access_key=access_key,
     )
     res = []
     for it in items:
@@ -2883,6 +3454,7 @@ def search_events_stats(
     to_day: str | None = None,
     since_ts: float | None = None,
     until_ts: float | None = None,
+    access_key: str = Depends(get_optional_access_key),
 ) -> SearchEventsStatsResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
@@ -2900,6 +3472,7 @@ def search_events_stats(
         match_threshold=float(match_threshold),
         since_ts=since_ts,
         until_ts=until_ts,
+        access_key=access_key,
     )
     return SearchEventsStatsResponse(**out)
 
@@ -2923,14 +3496,17 @@ def get_search_event_thumb(event_id: str) -> Response:
 
 
 @app.get("/v1/events/recognition/cameras", response_model=list[str])
-def list_recognition_cameras(limit: int = 5000) -> list[str]:
+def list_recognition_cameras(
+    limit: int = 5000,
+    access_key: str = Depends(get_optional_access_key),
+) -> list[str]:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
         raise HTTPException(status_code=500, detail="events store not configured")
 
     out: set[str] = set()
     try:
-        for c in store.list_cameras(limit=int(limit or 5000)):
+        for c in store.list_cameras(limit=int(limit or 5000), access_key=access_key):
             c = str(c or "").strip()
             if c:
                 out.add(c)
@@ -2973,7 +3549,10 @@ class ForwardEventRequest(BaseModel):
 
 
 @app.post("/v1/events/recognition/forward")
-async def forward_recognition_event(req: ForwardEventRequest) -> dict[str, Any]:
+async def forward_recognition_event(
+    req: ForwardEventRequest,
+    access_key: str = Depends(get_optional_access_key),
+) -> dict[str, Any]:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
         raise HTTPException(status_code=500, detail="events store not configured")
@@ -2982,7 +3561,7 @@ async def forward_recognition_event(req: ForwardEventRequest) -> dict[str, Any]:
     if not event_id:
         raise HTTPException(status_code=400, detail="event_id is required")
 
-    it = store.get_event(event_id)
+    it = store.get_event(event_id, access_key=access_key)
     if not it:
         raise HTTPException(status_code=404, detail="event not found")
 
@@ -3033,12 +3612,13 @@ def recognition_feedback_stats(
     since_ts: float | None = None,
     until_ts: float | None = None,
     camera: str | None = None,
+    access_key: str = Depends(get_optional_access_key),
 ) -> FeedbackStatsResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
         raise HTTPException(status_code=500, detail="events store not configured")
 
-    st = store.feedback_stats(since_ts=since_ts, until_ts=until_ts, camera=camera)
+    st = store.feedback_stats(since_ts=since_ts, until_ts=until_ts, camera=camera, access_key=access_key)
     return FeedbackStatsResponse(**st)
 
 
@@ -3050,6 +3630,7 @@ def recognition_stats(
     since_ts: float | None = None,
     until_ts: float | None = None,
     camera: str | None = None,
+    access_key: str = Depends(get_optional_access_key),
 ) -> RecognitionStatsResponse:
     s0, e0 = _date_window_from_params(
         day=day,
@@ -3062,23 +3643,31 @@ def recognition_stats(
         since_ts=s0,
         until_ts=e0,
         camera=camera,
+        access_key=access_key,
     )
     return RecognitionStatsResponse(**res)
 
 
 @app.get("/v1/events/recognition/{event_id}", response_model=RecognitionEventResponse)
-def get_recognition_event(event_id: str) -> RecognitionEventResponse:
+def get_recognition_event(
+    event_id: str,
+    access_key: str = Depends(get_optional_access_key),
+) -> RecognitionEventResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
         raise HTTPException(status_code=500, detail="events store not configured")
-    it = store.get_event(event_id)
+    it = store.get_event(event_id, access_key=access_key)
     if not it:
         raise HTTPException(status_code=404, detail="event not found")
     return RecognitionEventResponse(**it)
 
 
 @app.post("/v1/events/recognition/{event_id}/feedback", response_model=EventFeedbackResponse)
-def set_recognition_event_feedback(event_id: str, req: EventFeedbackRequest) -> EventFeedbackResponse:
+def set_recognition_event_feedback(
+    event_id: str,
+    req: EventFeedbackRequest,
+    access_key: str = Depends(get_optional_access_key),
+) -> EventFeedbackResponse:
     store: EventsStore | None = getattr(app.state, "events", None)
     if store is None:
         raise HTTPException(status_code=500, detail="events store not configured")
@@ -3096,7 +3685,7 @@ def set_recognition_event_feedback(event_id: str, req: EventFeedbackRequest) -> 
 
     note = str(req.note or "").strip() if req.note is not None else None
     updated_at = float(_now_ts())
-    updated = bool(store.set_feedback(event_id, label=label, note=note, updated_at=updated_at))
+    updated = bool(store.set_feedback(event_id, label=label, note=note, updated_at=updated_at, access_key=access_key))
     if not updated:
         raise HTTPException(status_code=404, detail="event not found")
 
@@ -3117,20 +3706,28 @@ def _log_recognition_event_background(
     similarity: float | None,
     items: list[Any],
     events_store: Any,
-    thumbs_dir: str
+    thumbs_dir: str,
+    access_key: str = "standard",
+    branch: str | None = None,
 ):
-    if os.environ.get("RECOGNITION_LOGGING_ENABLED", "1") == "0":
+    logger.info(f"Background logging task started (RE_LOGGING={os.environ.get('RECOGNITION_LOGGING_ENABLED')})")
+    if not _recognition_logging_enabled():
+        logger.info("Background logging disabled via check")
         return
 
     try:
-        from src.services.events_store import SearchEvent
         event_id = str(uuid.uuid4())
+        logger.info(f"Saving assets for event {event_id}")
         img_url, thumb_path = _save_search_query_assets(bgr, event_id)
         
+        if not img_url:
+            logger.warning(f"Failed to save assets for event {event_id}")
+
         top_sid = subject_id
         top_sim = similarity
         
-        ev = SearchEvent(
+        # 1. Save to Search History
+        ev_search = SearchEvent(
             event_id=event_id,
             ts=_t(),
             query_image_path=img_url,
@@ -3138,57 +3735,114 @@ def _log_recognition_event_background(
             top_subject_id=top_sid,
             top_similarity=top_sim,
             results=results,
-            meta=meta
+            meta=meta,
+            access_key=access_key,
         )
         if events_store:
-            events_store.insert_search_event(ev)
+            events_store.insert_search_event(ev_search)
+            logger.info(f"Inserted search event {event_id}")
+
+        # 2. Save to Recognition History (so it shows up in Recognition.tsx)
+        decision = "no_match"
+        if top_sid and top_sim is not None:
+             # Logic to determine decision status
+             # We don't have min_sim here easily, but we can infer from items/results
+             # Or just mark it as match if we have a top_sid and it was matched in main thread
+             # Actually, the items list might tell us if it was a match.
+             # For now, let's just mark it based on presence.
+             decision = "match" if top_sid else "no_match"
+
+        ev_rec = RecognitionEvent(
+            event_id=event_id,
+            ts=_t(),
+            camera="api_recognize_upload",
+            branch=branch,
+            source_path="api_upload",
+            decision=decision,
+            subject_id=top_sid,
+            similarity=top_sim,
+            processing_ms=None,
+            model_ms=None,
+            rejected_reason=None,
+            bbox=None,
+            det_score=None,
+            image_path=img_url,
+            thumb_path=thumb_path,
+            image_saved_at=_t(),
+            meta=meta,
+            access_key=access_key,
+        )
+        if events_store:
+            events_store.insert_event(ev_rec)
+            logger.info(f"Inserted recognition event {event_id}")
+
     except Exception as e:
         logger.error("failed to log recognize upload event in background: %s", str(e))
 
 
 @app.post("/v1/faces/recognize_upload", response_model=FaceRecognizeResponse, dependencies=[Depends(get_api_key)])
 async def faces_recognize_upload(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     top_k: int = Form(5),
     min_similarity: float | None = Form(None),
-    group_id: str | None = Form(None),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
+    branch: str | None = Form(None),
+    day: Optional[str] = Form(None),
+    from_day: Optional[str] = Form(None),
+    to_day: Optional[str] = Form(None),
+    since_ts: Optional[float] = Form(None),
+    until_ts: Optional[float] = Form(None),
+    access_key: str = Depends(get_api_key),
 ) -> FaceRecognizeResponse:
     t_start = _pc()
     q = getattr(app.state, "qdrant", None)
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
 
+    _ensure_branch_exists(q, branch, access_key=access_key)
+
+    s_ts, e_ts = _date_window_from_params(
+        day=day,
+        from_day=from_day,
+        to_day=to_day,
+        since_ts=since_ts,
+        until_ts=until_ts
+    )
+
     top_k = int(top_k or 5)
     top_k = max(1, min(top_k, 50))
     min_sim = float(min_similarity) if min_similarity is not None else float(app.state.min_similarity)
 
     image_bytes = await file.read()
-    
+
     t_decode_start = _pc()
     loop = asyncio.get_event_loop()
     bgr = await loop.run_in_executor(app.state.executor, _decode_image_bytes, image_bytes)
     if bgr is None:
         raise HTTPException(status_code=400, detail="unable to decode image")
     decode_ms = int((_pc() - t_decode_start) * 1000.0)
-    
+
     t_embed_start = _pc()
-    emb, meta = _quality_check_and_embed(bgr)
+    # Run model inference off the event loop so concurrent camera traffic
+    # doesn't block frontend API calls (stats/events) from being served.
+    emb, meta = await loop.run_in_executor(app.state.embed_executor, _quality_check_and_embed, bgr)
     embed_ms = int((_pc() - t_embed_start) * 1000.0)
-    
+
     t_search_start = _pc()
     # Execute Qdrant search in executor to avoid blocking the event loop
     results = await loop.run_in_executor(
-        None, 
-        _qdrant_search, 
-        q, 
-        app.state.qdrant_collection, 
-        emb, 
-        top_k, 
-        group_id
+        None,
+        _qdrant_search,
+        q,
+        app.state.qdrant_collection,
+        emb,
+        top_k,
+        branch,
+        s_ts,
+        e_ts,
+        access_key
     )
-    search_ms = int((_pc() - t_search_start) * 1000.0)
-    
+    search_ms = int((_pc() - t_search_start) * 1000.0)    
     items = [FaceSearchTopKItem(**r) for r in results]
 
     # Enhanced timing metadata
@@ -3212,7 +3866,9 @@ async def faces_recognize_upload(
         results[0]["similarity"] if results else None,
         items,
         app.state.events,
-        app.state.search_thumbs_dir
+        app.state.search_thumbs_dir,
+        access_key,
+        branch
     )
 
     if not items:
@@ -3263,7 +3919,10 @@ async def quality_check_upload(file: UploadFile = File(...)) -> QualityCheckResp
 
 
 @app.post("/v1/faces/privacy_extract", response_model=PrivacyExtractResponse)
-async def privacy_extract(req: PrivacyExtractRequest) -> PrivacyExtractResponse:
+async def privacy_extract(
+    req: PrivacyExtractRequest,
+    access_key: str = Depends(get_optional_access_key),
+) -> PrivacyExtractResponse:
     t0 = _pc()
     bgr = _decode_b64_image(req.image_b64)
     
@@ -3345,6 +4004,13 @@ async def privacy_extract(req: PrivacyExtractRequest) -> PrivacyExtractResponse:
         # 4. Optional Recognition
         rec_res = None
         if req.recognition:
+            s_ts, e_ts = _date_window_from_params(
+                day=req.day,
+                from_day=req.from_day,
+                to_day=req.to_day,
+                since_ts=req.since_ts,
+                until_ts=req.until_ts
+            )
             emb = getattr(target_face, "normed_embedding", None)
             if emb is None:
                 emb = getattr(target_face, "embedding", None)
@@ -3358,10 +4024,10 @@ async def privacy_extract(req: PrivacyExtractRequest) -> PrivacyExtractResponse:
                         app.state.qdrant_collection, 
                         emb, 
                         top_k=req.top_k or 1,
-                        group_id=req.group_id,
                         branch=req.branch,
-                        since_ts=since_ts,
-                        until_ts=until_ts
+                        since_ts=s_ts,
+                        until_ts=e_ts,
+                        access_key=access_key
                     )
                     items = [FaceSearchTopKItem(**r) for r in search_results]
                     
@@ -3398,6 +4064,94 @@ async def privacy_extract(req: PrivacyExtractRequest) -> PrivacyExtractResponse:
         ))
 
     return PrivacyExtractResponse(results=results)
+
+
+def _bbox_iou(a: list[float], b: list[float]) -> float:
+    """IoU of two [x1,y1,x2,y2] boxes."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+@app.post("/v1/faces/privacy_blur", response_model=PrivacyBlurResponse, dependencies=[Depends(get_api_key)])
+async def privacy_blur(req: PrivacyBlurRequest) -> PrivacyBlurResponse:
+    """Privacy v2: blur every detected face on the full frame EXCEPT the one at
+    `bbox`. `blur_all=true` blurs all faces (including the bbox target).
+    Returns the full image as base64. Input accepts base64 or http(s) URL."""
+    bgr = _decode_b64_image(req.image_b64)
+    h, w = bgr.shape[:2]
+
+    infer = getattr(app.state, "gpu", None) or app.state.embedder
+    try:
+        faces = infer.detect_all(bgr)
+    except Exception as e:
+        if "no face" in str(e).lower():
+            faces = []
+        else:
+            raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
+
+    # Collect detected face boxes.
+    boxes: list[list[float]] = []
+    for f in faces:
+        arr = np.asarray(getattr(f, "bbox", None), dtype=np.float32).reshape(-1)
+        if arr.size == 4:
+            boxes.append(arr.tolist())
+
+    # Pick the keep-index = detected face best overlapping the supplied bbox.
+    keep_idx = -1
+    kept_bbox = None
+    if not req.blur_all and req.bbox is not None:
+        target = [float(v) for v in req.bbox][:4]
+        if len(target) == 4:
+            best_iou = 0.0
+            for i, b in enumerate(boxes):
+                iou = _bbox_iou(target, b)
+                if iou > best_iou:
+                    best_iou, keep_idx = iou, i
+            # No detected face overlaps the bbox → keep that raw region anyway.
+            if keep_idx >= 0:
+                kept_bbox = boxes[keep_idx]
+            else:
+                kept_bbox = target
+
+    blurred = 0
+    for i, b in enumerate(boxes):
+        if not req.blur_all and i == keep_idx:
+            continue
+        x1, y1 = max(0, int(b[0])), max(0, int(b[1]))
+        x2, y2 = min(w, int(b[2])), min(h, int(b[3]))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        region = bgr[y1:y2, x1:x2]
+        fw, fh = x2 - x1, y2 - y1
+        k = int(max(fw, fh) / 3) | 1
+        if k < 3:
+            k = 3
+        bgr[y1:y2, x1:x2] = cv2.GaussianBlur(region, (k, k), 30)
+        blurred += 1
+
+    # When keeping by raw bbox (no detected overlap), un-blur nothing extra —
+    # the target region was never blurred since it isn't in `boxes`.
+    ok, buffer = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise HTTPException(status_code=500, detail="failed to encode output image")
+    out_b64 = base64.b64encode(buffer).decode('utf-8')
+
+    return PrivacyBlurResponse(
+        image_b64=f"data:image/jpeg;base64,{out_b64}",
+        faces_total=len(boxes),
+        blurred_count=blurred,
+        kept_bbox=kept_bbox,
+    )
 
 
 def _compare_two_faces(bgr1: np.ndarray, bgr2: np.ndarray) -> FaceCompareResponse:
@@ -3475,16 +4229,19 @@ def ui() -> Response:
 
 
 @app.get("/v1/faces/subjects", response_model=FaceSubjectsResponse)
-def faces_subjects() -> FaceSubjectsResponse:
+def faces_subjects(access_key: str = Depends(get_optional_access_key)) -> FaceSubjectsResponse:
     q = getattr(app.state, "qdrant", None)
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
-    subjects = _qdrant_list_subjects(q, app.state.qdrant_collection)
+    subjects = _qdrant_list_subjects(q, app.state.qdrant_collection, access_key=access_key)
     return FaceSubjectsResponse(subjects=subjects)
 
 
 @app.delete("/v1/faces/subjects/{subject_id}", response_model=FaceDeleteSubjectResponse)
-def faces_delete_subject(subject_id: str) -> FaceDeleteSubjectResponse:
+def faces_delete_subject(
+    subject_id: str,
+    access_key: str = Depends(get_api_key),
+) -> FaceDeleteSubjectResponse:
     subject_id = str(subject_id or "").strip()
     if not subject_id:
         raise HTTPException(status_code=400, detail="subject_id is required")
@@ -3506,6 +4263,10 @@ def faces_delete_subject(subject_id: str) -> FaceDeleteSubjectResponse:
                     FieldCondition(
                         key="subject_id",
                         match=MatchValue(value=subject_id),
+                    ),
+                    FieldCondition(
+                        key="access_key",
+                        match=MatchValue(value=access_key),
                     )
                 ]
             ),
@@ -3517,7 +4278,7 @@ def faces_delete_subject(subject_id: str) -> FaceDeleteSubjectResponse:
 
 
 @app.get("/v1/stats")
-def stats() -> dict[str, Any]:
+def stats(access_key: str = Depends(get_optional_access_key)) -> dict[str, Any]:
     q = getattr(app.state, "qdrant", None)
     enabled = q is not None
     collection = getattr(app.state, "qdrant_collection", None)
@@ -3530,7 +4291,7 @@ def stats() -> dict[str, Any]:
         except Exception:
             embeddings_total = 0
         try:
-            subjects_total = len(_qdrant_list_subjects(q, collection))
+            subjects_total = len(_qdrant_list_subjects(q, collection, access_key=access_key))
         except Exception:
             subjects_total = 0
 
@@ -3543,11 +4304,22 @@ def stats() -> dict[str, Any]:
         app.state.enroll_events = [t for t in app.state.enroll_events if t >= cutoff]
     except Exception:
         app.state.enroll_events = []
+
+    last_24h_searches = len(app.state.search_events or [])
+    store: EventsStore | None = getattr(app.state, "events", None)
+    if store:
+        try:
+            # Use the store to get accurate segregated counts for the last 24h
+            s_stats = store.search_events_stats(match_threshold=0.0, since_ts=cutoff, access_key=access_key)
+            last_24h_searches = s_stats.get("total", 0)
+        except Exception:
+            pass
+
     return {
         "subjects_total": subjects_total,
         "embeddings_total": embeddings_total,
         "last_24h_enrolls": len(app.state.enroll_events or []),
-        "last_24h_searches": len(app.state.search_events or []),
+        "last_24h_searches": last_24h_searches,
         "qdrant_enabled": enabled,
         "qdrant_collection": collection,
     }
@@ -3585,23 +4357,66 @@ def list_subjects(
     limit: int = 50,
     with_counts: bool = True,
     q: str | None = None,
+    branch: str | None = None,
+    day: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+    access_key: str = Depends(get_optional_access_key),
 ) -> SubjectsListResponse:
     client = getattr(app.state, "qdrant", None)
     if client is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
-    limit = max(1, min(int(limit or 50), 10000))
+    # Increase max limit to 20000
+    limit = max(1, min(int(limit or 50), 20000))
 
     qstr = str(q or "").strip().lower()
     want_filter = bool(qstr)
+    branch_filter = str(branch or "").strip()
+
+    since_ts, until_ts = _date_window_from_params(
+        day=day,
+        from_day=from_day,
+        to_day=to_day,
+        since_ts=since_ts,
+        until_ts=until_ts,
+    )
 
     try:
-        scan_limit = 10000
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue, Range, DatetimeRange
+    except Exception:
+        Filter = None
 
-        points: list[Any] = []
+    # Pre-construct filter outside the loop
+    must_filters = [FieldCondition(key="access_key", match=MatchValue(value=access_key))]
+    if branch_filter and Filter:
+        must_filters.append(FieldCondition(key="branch", match=MatchValue(value=branch_filter)))
+    
+    if (since_ts or until_ts) and Filter:
+        r_kwargs = {}
+        if since_ts:
+            r_kwargs["gte"] = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+        if until_ts:
+            r_kwargs["lte"] = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat()
+        must_filters.append(FieldCondition(key="created_at", range=DatetimeRange(**r_kwargs)))
+
+    search_filter = None
+    if must_filters and Filter:
+        search_filter = Filter(must=must_filters)
+
+    try:
+        # Reduced scan_limit for better stability across environments
+        scan_limit = 2000
         next_cur: Any = cursor
-        scanned = 0
         uniq: dict[str, None] = {}
-        while True:
+        
+        # Safety counter to prevent infinite scanning
+        max_iterations = 500 
+        iteration = 0
+
+        while iteration < max_iterations:
+            iteration += 1
             scroll_kwargs: dict[str, Any] = {
                 "collection_name": app.state.qdrant_collection,
                 "limit": int(scan_limit),
@@ -3610,13 +4425,28 @@ def list_subjects(
             }
             if next_cur:
                 scroll_kwargs["offset"] = next_cur
-            batch, new_next = client.scroll(**scroll_kwargs)
+            
+            if search_filter:
+                scroll_kwargs["scroll_filter"] = search_filter
+
+            try:
+                batch, new_next = client.scroll(**scroll_kwargs)
+            except TypeError:
+                if "scroll_filter" in scroll_kwargs:
+                    scroll_kwargs["filter"] = scroll_kwargs.pop("scroll_filter")
+                batch, new_next = client.scroll(**scroll_kwargs)
+            
             next_cur = new_next
 
             for pnt in batch or []:
-                scanned += 1
                 try:
                     payload = getattr(pnt, "payload", None) or {}
+                    
+                    if branch_filter:
+                        p_branch = str(payload.get("branch") or "").strip()
+                        if p_branch != branch_filter:
+                            continue
+
                     sid = str(payload.get("subject_id") or "").strip()
                     if not sid:
                         continue
@@ -3635,24 +4465,34 @@ def list_subjects(
                 break
             if not next_cur:
                 break
-
-        points = []
     except Exception as e:
+        logger.error(f"list_subjects scroll failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"qdrant scroll failed: {str(e)}")
 
     cap = _subject_embedding_cap()
     items: list[SubjectItem] = []
     if with_counts:
         try:
-            from qdrant_client.http.models import FieldCondition, Filter, MatchValue
+            from qdrant_client.http.models import FieldCondition, Filter, MatchValue, Range, DatetimeRange
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"qdrant client error: {str(e)}")
         for sid in uniq.keys():
             try:
+                must_conditions = [FieldCondition(key="subject_id", match=MatchValue(value=sid))]
+                if branch_filter:
+                    must_conditions.append(FieldCondition(key="branch", match=MatchValue(value=branch_filter)))
+                if since_ts or until_ts:
+                    r_kwargs = {}
+                    if since_ts:
+                        # ISO8601 string comparison matches enrollment 'created_at' format
+                        r_kwargs["gte"] = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+                    if until_ts:
+                        r_kwargs["lte"] = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat()
+                    must_conditions.append(FieldCondition(key="created_at", range=DatetimeRange(**r_kwargs)))
                 cnt = client.count(
                     collection_name=app.state.qdrant_collection,
                     exact=True,
-                    count_filter=Filter(must=[FieldCondition(key="subject_id", match=MatchValue(value=sid))]),
+                    count_filter=Filter(must=must_conditions),
                 )
                 n = int(getattr(cnt, "count", 0) or 0)
             except Exception:
@@ -3665,6 +4505,8 @@ def list_subjects(
                     embeddings_capped=bool(n >= cap),
                 )
             )
+
+
     else:
         items = [
             SubjectItem(
@@ -3681,7 +4523,17 @@ def list_subjects(
 
 
 @app.get("/v1/subjects/{subject_id}/images", response_model=SubjectImagesResponse)
-def list_subject_images(subject_id: str, cursor: str | None = None, limit: int = 50) -> SubjectImagesResponse:
+def list_subject_images(
+    subject_id: str, 
+    cursor: str | None = None, 
+    limit: int = 50,
+    day: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+    access_key: str = Depends(get_optional_access_key),
+) -> SubjectImagesResponse:
     subject_id = str(subject_id or '').strip()
     if not subject_id:
         raise HTTPException(status_code=400, detail="subject_id is required")
@@ -3689,10 +4541,34 @@ def list_subject_images(subject_id: str, cursor: str | None = None, limit: int =
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
     limit = max(1, min(int(limit or 50), 500))
+
+    since_ts, until_ts = _date_window_from_params(
+        day=day,
+        from_day=from_day,
+        to_day=to_day,
+        since_ts=since_ts,
+        until_ts=until_ts,
+    )
+
     try:
-        from qdrant_client.http.models import FieldCondition, Filter, MatchValue
+        from qdrant_client.http.models import FieldCondition, Filter, MatchValue, Range, DatetimeRange
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"qdrant client error: {str(e)}")
+
+    must_filters = [
+        FieldCondition(key="subject_id", match=MatchValue(value=subject_id)),
+        FieldCondition(key="access_key", match=MatchValue(value=access_key)),
+    ]
+    if since_ts or until_ts:
+        r_kwargs = {}
+        if since_ts:
+            # ISO8601 string comparison in Qdrant correctly filters 'created_at'
+            r_kwargs["gte"] = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+        if until_ts:
+            r_kwargs["lte"] = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat()
+        must_filters.append(FieldCondition(key="created_at", range=DatetimeRange(**r_kwargs)))
+    
+    scroll_filter = Filter(must=must_filters)
 
     try:
         points, next_cur = q.scroll(
@@ -3701,7 +4577,7 @@ def list_subject_images(subject_id: str, cursor: str | None = None, limit: int =
             with_payload=True,
             with_vectors=False,
             offset=cursor,
-            scroll_filter=Filter(must=[FieldCondition(key="subject_id", match=MatchValue(value=subject_id))]),
+            scroll_filter=scroll_filter,
         )
     except TypeError:
         # older qdrant_client versions use 'filter' parameter name
@@ -3711,7 +4587,7 @@ def list_subject_images(subject_id: str, cursor: str | None = None, limit: int =
             with_payload=True,
             with_vectors=False,
             offset=cursor,
-            filter=Filter(must=[FieldCondition(key="subject_id", match=MatchValue(value=subject_id))]),
+            filter=scroll_filter,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"qdrant scroll failed: {str(e)}")
@@ -3735,15 +4611,60 @@ def list_subject_images(subject_id: str, cursor: str | None = None, limit: int =
 
 
 @app.get("/v1/subjects/{subject_id}", response_model=SubjectItem)
-def get_subject(subject_id: str) -> SubjectItem:
+def get_subject(
+    subject_id: str,
+    day: str | None = None,
+    from_day: str | None = None,
+    to_day: str | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+    access_key: str = Depends(get_optional_access_key),
+) -> SubjectItem:
     subject_id = str(subject_id or "").strip()
     if not subject_id:
         raise HTTPException(status_code=400, detail="subject_id is required")
     q = getattr(app.state, "qdrant", None)
     if q is None:
         raise HTTPException(status_code=501, detail="qdrant not configured")
+
+    since_ts, until_ts = _date_window_from_params(
+        day=day,
+        from_day=from_day,
+        to_day=to_day,
+        since_ts=since_ts,
+        until_ts=until_ts,
+    )
+
+    try:
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue, Range, DatetimeRange
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"qdrant client error: {str(e)}")
+
+    must_filters = [
+        FieldCondition(key="subject_id", match=MatchValue(value=subject_id)),
+        FieldCondition(key="access_key", match=MatchValue(value=access_key)),
+    ]
+    if since_ts or until_ts:
+        r_kwargs = {}
+        if since_ts:
+            # ISO8601 string comparison in Qdrant correctly filters 'created_at'
+            r_kwargs["gte"] = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+        if until_ts:
+            r_kwargs["lte"] = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat()
+        must_filters.append(FieldCondition(key="created_at", range=DatetimeRange(**r_kwargs)))
+
+    try:
+        res = q.count(
+            collection_name=app.state.qdrant_collection,
+            count_filter=Filter(must=must_filters),
+            exact=True
+        )
+        n = int(getattr(res, "count", 0) or 0)
+    except Exception:
+        # Fallback to without range if needed or just return 0
+        n = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id, access_key=access_key)
+
     cap = _subject_embedding_cap()
-    n = _qdrant_count_subject_embeddings(q, app.state.qdrant_collection, subject_id)
     return SubjectItem(subject_id=subject_id, embeddings_count=n, embeddings_cap=cap, embeddings_capped=bool(n >= cap))
 @app.api_route("/health", methods=["GET", "POST"])
 def health() -> dict[str, Any]:
@@ -3754,7 +4675,7 @@ def health() -> dict[str, Any]:
     groups_count = 0
     if q is not None:
         try:
-            subjects_count = len(_qdrant_list_subjects(q, getattr(app.state, "qdrant_collection", None)))
+            subjects_count = len(_qdrant_list_subjects(q, getattr(app.state, "qdrant_collection", None), access_key="standard"))
         except Exception:
             subjects_count = 0
         

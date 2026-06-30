@@ -1,19 +1,25 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { deleteSubject, subjects, type SubjectItem, subjectImages, type SubjectImageItem, getApiBase, type DateFilter } from '../lib/api';
+import { deleteSubject, subjects, type SubjectItem, subjectImages, type SubjectImageItem, getApiBase, type DateFilter, getBranches, type BranchItem } from '../lib/api';
+
+const PAGE_SIZE = 24;
+// Pull a large batch once, then paginate client-side (reliable Prev/Next).
+const FETCH_LIMIT = 1000;
 
 export default function Subjects() {
   const [items, setItems] = useState<SubjectItem[]>([]);
-  const [cursor, setCursor] = useState<string | null>(null);
+  const [page, setPage] = useState<number>(1);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [limit, setLimit] = useState<number>(25);
   const [query, setQuery] = useState<string>('');
   const [previews, setPreviews] = useState<Record<string, SubjectImageItem | null>>({});
   const [dateMode, setDateMode] = useState<'all' | 'day' | 'range'>('all');
   const [day, setDay] = useState<string>('');
   const [fromDay, setFromDay] = useState<string>('');
   const [toDay, setToDay] = useState<string>('');
+
+  const [branchList, setBranchList] = useState<BranchItem[]>([]);
+  const [selectedBranch, setSelectedBranch] = useState<string>('');
 
   const dateFilter: DateFilter = useMemo(() => {
     return {
@@ -29,23 +35,55 @@ export default function Subjects() {
     return (items || []).filter((it) => String(it.subject_id || '').toLowerCase().includes(q));
   }, [items, query]);
 
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const pageClamped = Math.min(page, totalPages);
+  const pageItems = useMemo(
+    () => filtered.slice((pageClamped - 1) * PAGE_SIZE, pageClamped * PAGE_SIZE),
+    [filtered, pageClamped]
+  );
 
-  async function load(c: string | null, l: number) {
+  async function load() {
     setLoading(true);
     setError(null);
     try {
-      const r = await subjects({ cursor: c || undefined, limit: l, with_counts: true, q: String(query || '').trim() || undefined, ...dateFilter });
-      const list = r.items || [];
-      setItems(list);
-      setCursor(r.cursor || null);
-      // Load one preview image per subject
-      loadPreviews(list);
+      const r = await subjects({
+        limit: FETCH_LIMIT,
+        with_counts: true,
+        q: String(query || '').trim() || undefined,
+        branch: selectedBranch || undefined,
+        ...dateFilter
+      });
+      setItems(r.items || []);
     } catch (e: any) {
       setError(String(e));
       setItems([]);
-      setCursor(null);
     } finally {
       setLoading(false);
+    }
+  }
+
+  // jump back to page 1 and reload (used when filters change)
+  function reload() {
+    setPage(1);
+    load();
+  }
+
+  function goNext() {
+    if (page >= totalPages || loading) return;
+    setPage((p) => Math.min(p + 1, totalPages));
+  }
+
+  function goPrev() {
+    if (page <= 1 || loading) return;
+    setPage((p) => Math.max(1, p - 1));
+  }
+
+  async function loadBranches() {
+    try {
+      const r = await getBranches();
+      setBranchList(r.branches || []);
+    } catch (e) {
+      console.error('Failed to load branches:', e);
     }
   }
 
@@ -68,23 +106,34 @@ export default function Subjects() {
   }
 
   useEffect(() => {
-    load(null, limit);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [limit, dateFilter]);
+    loadBranches();
+  }, []);
 
   useEffect(() => {
+    reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dateFilter, selectedBranch]);
+
+  useEffect(() => {
+    setPage(1);
     const t = setTimeout(() => {
-      load(null, limit);
+      reload();
     }, 250);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query]);
 
+  // Load preview thumbnails only for the subjects on the current page.
+  useEffect(() => {
+    loadPreviews(pageItems);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pageItems]);
+
   async function onDelete(s: string) {
     if (!confirm(`Delete subject ${s}?`)) return;
     try {
       await deleteSubject(s);
-      await load(null, limit);
+      load();
     } catch (e: any) {
       alert(`Delete failed: ${String(e)}`);
     }
@@ -100,6 +149,22 @@ export default function Subjects() {
       </header>
 
       <div className="card" style={{ display: 'flex', flexWrap: 'wrap', gap: '24px', alignItems: 'flex-end', background: 'var(--bg-primary)' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Branch</span>
+          <select 
+            value={selectedBranch} 
+            onChange={(e) => setSelectedBranch(e.target.value)} 
+            style={{ padding: '8px 12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: '0.875rem', minWidth: '150px' }}
+          >
+            <option value="">All Branches</option>
+            {branchList.map((b) => (
+              <option key={b.branch_id} value={b.branch_id}>
+                {b.name || b.branch_id} {b.subject_count !== undefined ? `(${b.subject_count})` : ''}
+              </option>
+            ))}
+          </select>
+        </div>
+
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Date Range</span>
           <div style={{ display: 'flex', gap: '8px' }}>
@@ -134,31 +199,19 @@ export default function Subjects() {
           />
         </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '100px' }}>
-          <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Limit</span>
-          <input 
-            type="number" 
-            min={5} 
-            max={100} 
-            value={limit} 
-            onChange={(e) => setLimit(Math.max(5, Math.min(100, Number(e.target.value) || 25)))} 
-            style={{ padding: '8px 12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)' }} 
-          />
-        </div>
-
-        <button onClick={() => load(null, limit)} className="primary" style={{ height: '42px', padding: '0 24px' }}>
+        <button onClick={reload} className="primary" style={{ height: '42px', padding: '0 24px' }}>
           Refresh
         </button>
       </div>
 
-      {loading && <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-muted)' }}>Loading subjects...</div>}
+      {loading && <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px', padding: '40px', color: 'var(--text-muted)', fontWeight: 500 }}><span className="spinner" />Loading subjects...</div>}
       {error && <div style={{ color: 'var(--error)', background: 'rgba(239, 68, 68, 0.1)', padding: '16px', borderRadius: 'var(--radius-md)', border: '1px solid var(--error)' }}>{error}</div>}
 
       {!loading && !error && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '24px' }}>
-          {filtered.map((it) => (
-            <div key={it.subject_id} className="card" style={{ display: 'flex', flexDirection: 'column', gap: '16px', transition: 'transform 0.2s, box-shadow 0.2s', cursor: 'default' }} onMouseEnter={(e) => { e.currentTarget.style.transform = 'translateY(-4px)'; e.currentTarget.style.boxShadow = 'var(--shadow-md)'; }} onMouseLeave={(e) => { e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = 'var(--shadow-sm)'; }}>
-              <div style={{ height: '180px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', overflow: 'hidden', position: 'relative' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '16px' }}>
+          {pageItems.map((it) => (
+            <div key={it.subject_id} className="card hover-lift" style={{ display: 'flex', flexDirection: 'column', gap: '12px', padding: '12px', borderRadius: 'var(--radius-sm)', cursor: 'default' }}>
+              <div style={{ height: '160px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-sm)', overflow: 'hidden', position: 'relative' }}>
                 {(() => {
                   const p = previews[it.subject_id];
                   const src = p?.image_path || p?.thumb_path ? `${getApiBase()}${p.image_path || p.thumb_path}` : '';
@@ -189,13 +242,13 @@ export default function Subjects() {
               <div style={{ display: 'flex', gap: '8px', marginTop: 'auto' }}>
                 <Link
                   to={`/subjects/${encodeURIComponent(it.subject_id)}`}
-                  style={{ flex: 1, textAlign: 'center', background: 'var(--primary)', color: 'white', padding: '8px', borderRadius: 'var(--radius-md)', fontWeight: 600, fontSize: '0.875rem' }}
+                  style={{ flex: 1, textAlign: 'center', background: 'var(--primary)', color: 'white', padding: '8px', borderRadius: 'var(--radius-sm)', fontWeight: 600, fontSize: '0.875rem' }}
                 >
                   View Details
                 </Link>
-                <button 
-                  onClick={() => onDelete(it.subject_id)} 
-                  style={{ padding: '8px 12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--error)', color: 'var(--error)', background: 'transparent' }}
+                <button
+                  onClick={() => onDelete(it.subject_id)}
+                  style={{ padding: '8px 12px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--error)', color: 'var(--error)', background: 'transparent' }}
                   onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(239, 68, 68, 0.05)'; }}
                   onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
                 >
@@ -205,16 +258,24 @@ export default function Subjects() {
             </div>
           ))}
           {filtered.length === 0 && (
-            <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '80px', color: 'var(--text-muted)', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-lg)', border: '2px dashed var(--border)' }}>
+            <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '80px', color: 'var(--text-muted)', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', border: '2px dashed var(--border)' }}>
               No subjects found matching your criteria.
             </div>
           )}
         </div>
       )}
 
-      {cursor && !loading && (
-        <div style={{ display: 'flex', justifyContent: 'center', marginTop: '16px' }}>
-          <button onClick={() => load(cursor, limit)} style={{ padding: '10px 32px' }}>Load More Subjects</button>
+      {!error && filtered.length > 0 && (
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '12px', marginTop: '8px', paddingBottom: '8px' }}>
+          <button onClick={goPrev} disabled={pageClamped <= 1 || loading} style={{ padding: '8px 18px', borderRadius: 'var(--radius-sm)' }}>
+            Prev
+          </button>
+          <span style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', fontWeight: 600, minWidth: '90px', textAlign: 'center' }}>
+            Page {pageClamped} / {totalPages}
+          </span>
+          <button onClick={goNext} disabled={pageClamped >= totalPages || loading} className="primary" style={{ padding: '8px 18px', borderRadius: 'var(--radius-sm)' }}>
+            Next
+          </button>
         </div>
       )}
     </div>

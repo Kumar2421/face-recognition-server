@@ -5,7 +5,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
 try:
@@ -15,6 +16,14 @@ except Exception:  # pragma: no cover
 
 
 cross_check_router = APIRouter()
+
+api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+
+async def get_optional_access_key(header_value: str = Security(api_key_header)) -> str:
+    legacy_key = os.environ.get("FACE_SERVICE_LEGACY_API_KEY")
+    if legacy_key and header_value == legacy_key:
+        return "legacy"
+    return "standard"
 
 
 def _as_float(v: Any, default: float) -> float:
@@ -117,10 +126,11 @@ def _now_ts() -> float:
     return float(datetime.now(timezone.utc).timestamp())
 
 
-def _get_employee_mean_embeddings(request: Request) -> tuple[list[str], np.ndarray]:
+def _get_employee_mean_embeddings(request: Request, access_key: str = "standard") -> tuple[list[str], np.ndarray]:
     app = request.app
+    cache_key = f"_employee_means_cache_{access_key}"
     try:
-        cached = getattr(app.state, "_employee_means_cache", None)
+        cached = getattr(app.state, cache_key, None)
     except Exception:
         cached = None
 
@@ -139,6 +149,8 @@ def _get_employee_mean_embeddings(request: Request) -> tuple[list[str], np.ndarr
     if q is None:
         return [], np.zeros((0, 0), dtype=np.float32)
 
+    from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
     sums: dict[str, np.ndarray] = {}
     counts: dict[str, int] = {}
     next_cur: Any = None
@@ -152,6 +164,7 @@ def _get_employee_mean_embeddings(request: Request) -> tuple[list[str], np.ndarr
             "limit": int(batch_limit),
             "with_payload": True,
             "with_vectors": True,
+            "scroll_filter": Filter(must=[FieldCondition(key="access_key", match=MatchValue(value=access_key))])
         }
         if next_cur is not None:
             kwargs["offset"] = next_cur
@@ -200,7 +213,7 @@ def _get_employee_mean_embeddings(request: Request) -> tuple[list[str], np.ndarr
         vecs = np.stack(m, axis=0).astype(np.float32)
 
     try:
-        app.state._employee_means_cache = {"ts": float(now), "sids": sids, "vecs": vecs}
+        setattr(app.state, cache_key, {"ts": float(now), "sids": sids, "vecs": vecs})
     except Exception:
         pass
     return sids, vecs
@@ -216,6 +229,7 @@ def cross_check_visitors_vs_employees(
     since_ts: float | None = None,
     until_ts: float | None = None,
     limit: int = 500,
+    access_key: str = Depends(get_optional_access_key),
 ) -> CrossCheckResponse:
     store = getattr(request.app.state, "events", None)
     if store is None:
@@ -233,7 +247,7 @@ def cross_check_visitors_vs_employees(
     if since_ts2 is None and until_ts2 is None:
         since_ts2, until_ts2 = _today_range_ts()
 
-    emp_sids, emp_means = _get_employee_mean_embeddings(request)
+    emp_sids, emp_means = _get_employee_mean_embeddings(request, access_key=access_key)
     if emp_means.size == 0 or not emp_sids:
         return CrossCheckResponse(items=[])
 
@@ -247,6 +261,7 @@ def cross_check_visitors_vs_employees(
         since_ts=since_ts2,
         until_ts=until_ts2,
         limit=int(limit),
+        access_key=access_key,
     )
 
     min_sim = _as_float(os.environ.get("FACE_SERVICE_MIN_SIMILARITY", "0.25"), 0.25)

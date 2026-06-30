@@ -32,9 +32,12 @@ services:
       - ./input:/data/input:ro
       - ./facefolder:/data/facefolder:ro
       - ./buffalo_l/models:/models:rw
-      - ./data/thumbs:/data/thumbs
-      - ./data/images:/data/images
-      - ./images/events:/data/events
+      # - ./data/thumbs:/data/thumbs
+      # - ./data/images:/data/images
+      # - ./images/events:/data/events
+      - ./data/thumbs1:/data/thumbs
+      - ./data/images1:/data/images
+      - ./images/events1:/data/events
       - ./data/trt_cache:/data/trt_cache
       - ./config.yaml:/app/config.yaml:ro
 
@@ -43,7 +46,7 @@ services:
       - FACE_DIR=/data/facefolder/security
       - CONFIG_PATH=/app/config.yaml
       - QDRANT_URL=http://qdrant:6333
-      - QDRANT_COLLECTION=frigate_faces_v25
+      - QDRANT_COLLECTION=frigate_faces_v27
       # - QDRANT_COLLECTION=frigate_faces_v10
       # - QDRANT_COLLECTION=frigate_faces_v3
       # - QDRANT_COLLECTION=frigate_faces_v2
@@ -67,9 +70,13 @@ services:
       - GPU_NUM_WORKERS=2
       - GPU_JOB_TIMEOUT_SEC=180
       # ONNXRuntime Memory Optimizations
-      - ORT_CUDA_MEMORY_LIMIT_MB=4096
+      - ORT_CUDA_MEMORY_LIMIT_MB=2048
       - ORT_CUDA_ARENA_EXTEND_STRATEGY=kSameAsRequested
-      - RECOGNITION_LOGGING_ENABLED=0
+      # Lean cuDNN workspace (EXHAUSTIVE default reserves GBs per session)
+      - ORT_CUDNN_CONV_ALGO_SEARCH=HEURISTIC
+      # Load only used models (drop unused genderage + landmark_2d_106)
+      - BUFFALO_MODULES=detection,recognition,landmark_3d_68
+      - RECOGNITION_LOGGING_ENABLED=1
       - FACE_SERVICE_MAX_FACES_PER_IMAGE=1
       - FACE_SERVICE_FORCE_SINGLE_FACE=1
       - FACE_MIN_RESOLUTION=40
@@ -78,12 +85,12 @@ services:
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,https://face.service.tools.thefusionapps.com}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - AUTO_ADD_EMBEDDING_ENABLE=1
+      - AUTO_ADD_EMBEDDING_ENABLE=0
       - AUTO_ADD_EMBEDDING_MIN_SIM=0.80
       - SUBJECT_MAX_EMBEDDINGS=10
       - ENROLL_DUPLICATE_CHECK_ENABLE=0
       - ENROLL_DUPLICATE_MIN_SIM=0.80
-      - NO_MATCH_AUTO_ENROLL_ENABLE=1
+      - NO_MATCH_AUTO_ENROLL_ENABLE=0
       - NO_MATCH_AUTO_ENROLL_PREFIX=visiter
       - NO_MATCH_AUTO_ENROLL_BLOCK_MIN_SIM=0.70
       - DATE_WISE_RECOGNITION_FALLBACK_MASTER=0
@@ -93,6 +100,7 @@ services:
       - "8001:8000"
 
     deploy:
+    
       resources:
         reservations:
           devices:
@@ -151,7 +159,7 @@ services:
     ports:
       - "6333:6333"
     volumes:
-      - qdrant_storage:/qdrant/storage
+      - ./data/qdrant_storage:/qdrant/storage
 
 volumes:
   qdrant_storage:

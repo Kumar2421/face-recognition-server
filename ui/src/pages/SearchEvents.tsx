@@ -1,5 +1,6 @@
 import { useMemo, useState, useEffect } from 'react';
 import { getApiBase, searchEvents, searchEventsStats, type SearchEvent, type SearchEventsStatsResponse } from '../lib/api';
+import { useModalDismiss } from '../lib/useModalDismiss';
 
 export default function SearchEvents() {
   const [items, setItems] = useState<SearchEvent[]>([]);
@@ -136,8 +137,10 @@ export default function SearchEvents() {
     };
   }, [matchThreshold, activeDateParams]);
 
+  useModalDismiss(!!selected, () => setSelected(null));
+
   if (loading) {
-    return <div style={{ display: 'flex', justifyContent: 'center', padding: '40px' }}>Loading events...</div>;
+    return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px', padding: '64px', color: 'var(--text-muted)', fontWeight: 500 }}><span className="spinner" />Loading events...</div>;
   }
 
   return (
@@ -224,7 +227,7 @@ export default function SearchEvents() {
             const detScore = (ev.meta as any)?.det_score ?? (ev.meta as any)?.det?.score ?? null;
 
             return (
-              <div key={ev.event_id} className="card" onClick={() => setSelected(ev)} style={{ cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: '10px', padding: '10px', position: 'relative' }}>
+              <div key={ev.event_id} className="card hover-lift" onClick={() => setSelected(ev)} style={{ display: 'flex', flexDirection: 'column', gap: '10px', padding: '10px', position: 'relative' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                   <div style={{ overflow: 'hidden' }}>
                     <h4 style={{ fontWeight: 700, fontSize: '0.875rem', color: 'var(--text-primary)', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>
@@ -313,13 +316,14 @@ export default function SearchEvents() {
       {cursor && (
         <div style={{ display: 'flex', justifyContent: 'center', paddingTop: '20px' }}>
           <button onClick={loadMore} disabled={loadingMore} className="btn btn-secondary" style={{ minWidth: '160px' }}>
-            {loadingMore ? 'Loading...' : 'Load More Results'}
+            {loadingMore ? <><span className="spinner" />Loading...</> : 'Load More Results'}
           </button>
         </div>
       )}
 
       {selected && (
         <div
+          className="modal-overlay"
           onClick={() => setSelected(null)}
           style={{
             position: 'fixed',
@@ -336,7 +340,7 @@ export default function SearchEvents() {
           }}
         >
           <div
-            className="card"
+            className="card modal-content"
             onClick={e => e.stopPropagation()}
             style={{
               width: '100%',
@@ -352,7 +356,8 @@ export default function SearchEvents() {
           >
             <button
               onClick={() => setSelected(null)}
-              style={{ position: 'absolute', top: 12, right: 12, border: 'none', background: 'transparent', cursor: 'pointer', fontSize: '1.5rem', color: 'var(--text-muted)' }}
+              className="modal-close"
+              style={{ position: 'absolute', top: 12, right: 12, background: 'transparent', cursor: 'pointer', fontSize: '1.5rem', color: 'var(--text-muted)' }}
             >
               ✕
             </button>

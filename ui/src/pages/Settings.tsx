@@ -15,6 +15,8 @@ export default function Settings() {
     try {
       localStorage.setItem('api_base', apiBase.trim());
       localStorage.setItem('api_key', apiKey.trim());
+      // Legacy dual-key removed: a single key now scopes the whole dashboard.
+      localStorage.removeItem('legacy_api_key');
       setSaved('Saved. Reloading...');
       setTimeout(() => window.location.reload(), 600);
     } catch (e) {
@@ -26,6 +28,7 @@ export default function Settings() {
     try {
       localStorage.removeItem('api_base');
       localStorage.removeItem('api_key');
+      localStorage.removeItem('legacy_api_key');
       setSaved('Cleared overrides. Reloading...');
       setTimeout(() => window.location.reload(), 600);
     } catch (e) {
@@ -61,7 +64,7 @@ export default function Settings() {
             placeholder="fs_..."
             style={{ padding: '12px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontSize: '1rem' }}
           />
-          <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Required for security enabled environments. Matches FACE_SERVICE_API_KEY.</span>
+          <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>This single key scopes the entire dashboard — every page shows only the data belonging to this key.</span>
         </div>
 
         <div style={{ display: 'flex', gap: '12px', borderTop: '1px solid var(--border)', paddingTop: '20px' }}>

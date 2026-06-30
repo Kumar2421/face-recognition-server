@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import os
@@ -75,3 +76,4 @@ def apply_env_defaults_from_config(cfg: dict[str, Any]) -> None:
     # API base used by poller
     set_if_missing("API_BASE_URL", _deep_get(cfg, ["api", "base_url"]))
     set_if_missing("FACE_SERVICE_API_KEY", _deep_get(cfg, ["api", "api_key"]))
+    set_if_missing("FACE_SERVICE_LEGACY_API_KEY", _deep_get(cfg, ["api", "legacy_api_key"]))

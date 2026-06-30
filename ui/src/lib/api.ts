@@ -6,7 +6,8 @@ export function getApiBase(): string {
   return (import.meta.env.VITE_API_BASE as string) || 'http://localhost:8001';
 }
 
-export function getApiKey(): string {
+// Standard (primary) key. Used for writes/enroll and as the default read key.
+export function getStandardKey(): string {
   try {
     const saved = localStorage.getItem('api_key');
     if (saved && saved.trim()) return saved.trim();
@@ -14,16 +15,27 @@ export function getApiKey(): string {
   return (import.meta.env.VITE_API_KEY as string) || '';
 }
 
-export async function apiGet<T = any>(path: string): Promise<T> {
+// Single active key for writes + reads. Whole dashboard scopes to this key's
+// data partition (backend resolves key -> access_key bucket).
+export function getApiKey(): string {
+  return getStandardKey();
+}
+
+export async function apiGet<T = any>(path: string, key: string = getApiKey()): Promise<T> {
   const r = await fetch(`${getApiBase()}${path}`, {
     cache: 'no-store',
-    headers: { 
+    headers: {
       'Cache-Control': 'no-cache',
-      'x-api-key': getApiKey()
+      'x-api-key': key
     },
   });
   if (!r.ok) throw new Error(`GET ${path} failed: ${r.status}`);
   return r.json();
+}
+
+// Single-key GET. (Former dual-bucket merge removed — one key = one tenant.)
+export async function apiGetMerged<T = any>(path: string): Promise<T> {
+  return apiGet<T>(path);
 }
 
 export async function apiPostJson<T = any>(path: string, body: any, headers: Record<string, string> = {}): Promise<T> {
@@ -85,11 +97,11 @@ export type Stats = {
 };
 
 export async function stats(): Promise<Stats> {
-  return apiGet('/v1/stats');
+  return apiGetMerged('/v1/stats');
 }
 
 export async function facesSubjects(): Promise<{ subjects: string[] }> {
-  return apiGet('/v1/faces/subjects');
+  return apiGetMerged('/v1/faces/subjects');
 }
 
 // Phase 2 endpoints
@@ -102,21 +114,34 @@ export type DateFilter = {
   to_day?: string | null;
 };
 
-export async function subjects(params: { cursor?: string | null; limit?: number; with_counts?: boolean; q?: string | null } & DateFilter = {}): Promise<SubjectsListResponse> {
+export type BranchItem = { branch_id: string; name?: string | null; meta?: any; enrollment_count?: number; subject_count?: number };
+export type BranchListResponse = { branches: BranchItem[] };
+
+export async function getBranches(): Promise<BranchListResponse> {
+  return apiGetMerged('/v1/branches');
+}
+
+export async function subjects(params: { cursor?: string | null; limit?: number; with_counts?: boolean; q?: string | null; branch?: string | null } & DateFilter = {}): Promise<SubjectsListResponse> {
   const q = new URLSearchParams();
   if (params.cursor) q.set('cursor', params.cursor);
   if (params.limit != null) q.set('limit', String(params.limit));
   if (params.with_counts != null) q.set('with_counts', String(params.with_counts));
   if (params.q) q.set('q', String(params.q));
+  if (params.branch) q.set('branch', String(params.branch));
   if (params.day) q.set('day', String(params.day));
   if (params.from_day) q.set('from_day', String(params.from_day));
   if (params.to_day) q.set('to_day', String(params.to_day));
   const qs = q.toString();
-  return apiGet(`/v1/subjects${qs ? `?${qs}` : ''}`);
+  return apiGetMerged(`/v1/subjects${qs ? `?${qs}` : ''}`);
 }
 
-export async function getSubject(subjectId: string): Promise<SubjectItem> {
-  return apiGet(`/v1/subjects/${encodeURIComponent(subjectId)}`);
+export async function getSubject(subjectId: string, params: DateFilter = {}): Promise<SubjectItem> {
+  const q = new URLSearchParams();
+  if (params.day) q.set('day', String(params.day));
+  if (params.from_day) q.set('from_day', String(params.from_day));
+  if (params.to_day) q.set('to_day', String(params.to_day));
+  const qs = q.toString();
+  return apiGetMerged(`/v1/subjects/${encodeURIComponent(subjectId)}${qs ? `?${qs}` : ''}`);
 }
 
 export type SubjectImageItem = { image_id: string; thumb_path?: string | null; image_path?: string | null; created_at?: string | null; source?: string | null };
@@ -130,7 +155,7 @@ export async function subjectImages(subjectId: string, params: { cursor?: string
   if (params.from_day) q.set('from_day', String(params.from_day));
   if (params.to_day) q.set('to_day', String(params.to_day));
   const qs = q.toString();
-  return apiGet(`/v1/subjects/${encodeURIComponent(subjectId)}/images${qs ? `?${qs}` : ''}`);
+  return apiGetMerged(`/v1/subjects/${encodeURIComponent(subjectId)}/images${qs ? `?${qs}` : ''}`);
 }
 
 export async function deleteSubject(subjectId: string): Promise<{ subject_id: string; deleted: boolean }> {
@@ -151,20 +176,22 @@ export async function compareFacesUpload(file1: File, file2: File): Promise<any>
   return apiPostForm('/v1/face/compare_upload', form);
 }
 
-export async function facesSearchUpload(file: File, topK: number = 5, filter: DateFilter = {}): Promise<any> {
+export async function facesSearchUpload(file: File, topK: number = 5, filter: DateFilter = {}, branch?: string): Promise<any> {
   const form = new FormData();
   form.append('file', file, file.name || 'query.jpg');
   form.append('top_k', String(topK));
+  if (branch) form.append('branch', branch);
   if (filter.day) form.append('day', String(filter.day));
   if (filter.from_day) form.append('from_day', String(filter.from_day));
   if (filter.to_day) form.append('to_day', String(filter.to_day));
   return apiPostForm('/v1/faces/search_upload', form);
 }
 
-export async function facesRecognizeUpload(file: File, topK: number = 5, filter: DateFilter = {}): Promise<any> {
+export async function facesRecognizeUpload(file: File, topK: number = 5, filter: DateFilter = {}, branch?: string): Promise<any> {
   const form = new FormData();
   form.append('file', file, file.name || 'query.jpg');
   form.append('top_k', String(topK));
+  if (branch) form.append('branch', branch);
   if (filter.day) form.append('day', String(filter.day));
   if (filter.from_day) form.append('from_day', String(filter.from_day));
   if (filter.to_day) form.append('to_day', String(filter.to_day));
@@ -178,7 +205,7 @@ export async function qualityCheckUpload(file: File): Promise<any> {
 }
 
 export async function crossMatch(subjectId: string): Promise<any> {
-  return apiGet(`/v1/faces/cross_match/${encodeURIComponent(subjectId)}`);
+  return apiGetMerged(`/v1/faces/cross_match/${encodeURIComponent(subjectId)}`);
 }
 
 export type CrossCheckHit = {
@@ -214,7 +241,7 @@ export async function crossCheckVisitorsVsEmployees(params: {
   if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
   if (params.limit != null) q.set('limit', String(params.limit));
   const qs = q.toString();
-  return apiGet(`/v1/cross_check/visitors_vs_employees${qs ? `?${qs}` : ''}`);
+  return apiGetMerged(`/v1/cross_check/visitors_vs_employees${qs ? `?${qs}` : ''}`);
 }
 
 // Recognition events
@@ -222,11 +249,13 @@ export type RecognitionEvent = {
   event_id: string;
   ts: number;
   camera: string;
+  branch?: string | null;
   source_path: string;
   decision: string;
   subject_id?: string | null;
   similarity?: number | null;
   processing_ms?: number | null;
+  model_ms?: number | null;
   rejected_reason?: string | null;
   bbox?: number[] | null;
   det_score?: number | null;
@@ -268,12 +297,13 @@ export async function recognitionStats(params: {
   if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
   if (params.camera) q.set('camera', params.camera);
   const qs = q.toString();
-  return apiGet(`/v1/events/recognition/stats${qs ? `?${qs}` : ''}`);
+  return apiGetMerged(`/v1/events/recognition/stats${qs ? `?${qs}` : ''}`);
 }
 
 export async function recognitionEvents(params: {
   decision?: string;
   camera?: string;
+  branch?: string;
   subject_id?: string;
   min_similarity?: number;
   max_similarity?: number;
@@ -289,6 +319,7 @@ export async function recognitionEvents(params: {
   q.set('_cb', String(Date.now()));
   if (params.decision) q.set('decision', params.decision);
   if (params.camera) q.set('camera', params.camera);
+  if (params.branch) q.set('branch', params.branch);
   if (params.subject_id) q.set('subject_id', params.subject_id);
   if (params.min_similarity != null) q.set('min_similarity', String(params.min_similarity));
   if (params.max_similarity != null) q.set('max_similarity', String(params.max_similarity));
@@ -300,14 +331,14 @@ export async function recognitionEvents(params: {
   if (params.limit != null) q.set('limit', String(params.limit));
   if (params.cursor != null) q.set('cursor', String(params.cursor));
   const qs = q.toString();
-  return apiGet(`/v1/events/recognition${qs ? `?${qs}` : ''}`);
+  return apiGetMerged(`/v1/events/recognition${qs ? `?${qs}` : ''}`);
 }
 
 export async function recognitionCameras(params: { limit?: number } = {}): Promise<RecognitionCamerasResponse> {
   const q = new URLSearchParams();
   if (params.limit != null) q.set('limit', String(params.limit));
   const qs = q.toString();
-  return apiGet(`/v1/events/recognition/cameras${qs ? `?${qs}` : ''}`);
+  return apiGetMerged(`/v1/events/recognition/cameras${qs ? `?${qs}` : ''}`);
 }
 
 export type EventFeedbackLabel = 'tp' | 'fp' | 'fn' | 'ignore' | '';
@@ -342,7 +373,7 @@ export async function recognitionFeedbackStats(params: { since_ts?: number; unti
   if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
   if (params.camera) q.set('camera', String(params.camera));
   const qs = q.toString();
-  return apiGet(`/v1/events/recognition/feedback_stats${qs ? `?${qs}` : ''}`);
+  return apiGetMerged(`/v1/events/recognition/feedback_stats${qs ? `?${qs}` : ''}`);
 }
 
 // Search events
@@ -390,7 +421,7 @@ export async function searchEvents(params: {
   if (params.since_ts != null) q.set('since_ts', String(params.since_ts));
   if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
   const qs = q.toString();
-  return apiGet(`/v1/search_history${qs ? `?${qs}` : ''}`);
+  return apiGetMerged(`/v1/search_history${qs ? `?${qs}` : ''}`);
 }
 
 export async function searchEventsStats(params: {
@@ -409,5 +440,5 @@ export async function searchEventsStats(params: {
   if (params.since_ts != null) q.set('since_ts', String(params.since_ts));
   if (params.until_ts != null) q.set('until_ts', String(params.until_ts));
   const qs = q.toString();
-  return apiGet(`/v1/search_history/stats${qs ? `?${qs}` : ''}`);
+  return apiGetMerged(`/v1/search_history/stats${qs ? `?${qs}` : ''}`);
 }

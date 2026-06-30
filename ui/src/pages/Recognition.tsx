@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useState } from 'react';
-import { getApiBase, recognitionCameras, recognitionEvents, recognitionStats, setRecognitionEventFeedback, subjectImages, type EventFeedbackLabel, type RecognitionEvent, type RecognitionStatsResponse } from '../lib/api';
+import { getApiBase, getBranches, recognitionCameras, recognitionEvents, recognitionStats, setRecognitionEventFeedback, subjectImages, type BranchItem, type EventFeedbackLabel, type RecognitionEvent, type RecognitionStatsResponse } from '../lib/api';
+
+// Resolve a stored relative path (/thumbs/.., /images/.., /v1/...) to a full URL.
+function imgUrl(p?: string | null): string {
+  const s = String(p || '').trim();
+  if (!s) return '';
+  return s.startsWith('http') ? s : `${getApiBase()}${s}`;
+}
 import StatCard from '../components/StatCard';
+import { useModalDismiss } from '../lib/useModalDismiss';
 
 function fmtTs(ts: number): string {
   try {
@@ -50,6 +58,66 @@ function fmtDuration(seconds: number): string {
   return `${m}m`;
 }
 
+function num(v: any, d = 1): string {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toFixed(d) : '--';
+}
+
+// Renders meta.quality + meta.decision metrics as small chips.
+function QualityBlock({ ev, compact = false }: { ev: RecognitionEvent; compact?: boolean }) {
+  const q: any = (ev as any)?.meta?.quality;
+  const decStatus: string = (ev as any)?.meta?.decision?.status || '';
+  const hasTiming = ev.similarity != null || ev.processing_ms != null || ev.model_ms != null;
+  if (!q && !decStatus && !hasTiming) return null;
+
+  const yaw = Number(q?.yaw), pitch = Number(q?.pitch), blur = Number(q?.blur);
+  type M = { label: string; value: string; warn?: boolean };
+  const all: M[] = [];
+  if (ev.similarity != null) all.push({ label: 'Sim', value: `${num(Number(ev.similarity) * 100, 1)}%` });
+  if (ev.processing_ms != null) all.push({ label: 'Proc', value: `${ev.processing_ms}ms` });
+  if (ev.model_ms != null) all.push({ label: 'Model', value: `${ev.model_ms}ms` });
+  if (q) {
+    all.push({ label: 'Blur', value: num(q.blur, 0), warn: Number.isFinite(blur) && blur < 50 });
+    all.push({ label: 'Bright', value: num(q.brightness, 0) });
+    all.push({ label: 'Face%', value: num(Number(q.face_ratio) * 100, 1) });
+    all.push({ label: 'Face px', value: num(q.face_abs_px, 0) });
+    all.push({ label: 'Landmark', value: num(q.landmark_score, 2) });
+    all.push({ label: 'Yaw', value: `${num(q.yaw, 1)}°`, warn: Number.isFinite(yaw) && Math.abs(yaw) > 45 });
+    all.push({ label: 'Pitch', value: `${num(q.pitch, 1)}°`, warn: Number.isFinite(pitch) && Math.abs(pitch) > 45 });
+    if (Array.isArray(q.face_crop_shape)) all.push({ label: 'Crop', value: q.face_crop_shape.join('×') });
+  }
+  const shown = compact ? all.filter(m => ['Sim', 'Proc', 'Model', 'Blur', 'Yaw', 'Pitch'].includes(m.label)) : all;
+
+  const statusTone = (s: string) =>
+    s === 'ok' || s === 'match' || s === 'embedded' ? 'var(--success)'
+      : s === 'rejected' ? 'var(--error)' : 'var(--text-secondary)';
+
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', alignItems: 'center' }}>
+      {decStatus && (
+        <span style={{ padding: '2px 8px', borderRadius: '99px', fontSize: '0.625rem', fontWeight: 800, textTransform: 'uppercase', background: 'var(--bg-primary)', border: `1px solid ${statusTone(decStatus)}`, color: statusTone(decStatus) }}>
+          {decStatus}
+        </span>
+      )}
+      {q?.status && !compact && (
+        <span style={{ padding: '2px 8px', borderRadius: '99px', fontSize: '0.625rem', fontWeight: 700, background: 'var(--bg-primary)', border: `1px solid ${statusTone(q.status)}`, color: statusTone(q.status) }}>
+          Q:{q.status}{q.reason ? ` (${q.reason})` : ''}
+        </span>
+      )}
+      {shown.map(m => (
+        <span key={m.label} title={m.label} style={{
+          padding: '2px 6px', borderRadius: '4px', fontSize: '0.625rem', fontWeight: 600,
+          background: m.warn ? 'rgba(239,68,68,0.12)' : 'var(--bg-secondary)',
+          color: m.warn ? 'var(--error)' : 'var(--text-secondary)',
+          border: '1px solid var(--border)'
+        }}>
+          <span style={{ opacity: 0.7 }}>{m.label}</span> {m.value}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 type DecisionFilter = '' | 'match' | 'no_match' | 'rejected';
 
 export default function Recognition() {
@@ -58,20 +126,25 @@ export default function Recognition() {
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [loadingStats, setLoadingStats] = useState<boolean>(false);
-  const [loadingMore, setLoadingMore] = useState<boolean>(false);
   const [camera, setCamera] = useState<string>('');
   const [cameraOptions, setCameraOptions] = useState<string[]>([]);
   const [decision, setDecision] = useState<DecisionFilter>('');
   const [subjectId, setSubjectId] = useState<string>('');
   const [minSim, setMinSim] = useState<string>('');
   const [maxSim, setMaxSim] = useState<string>('');
-  const [nextCursor, setNextCursor] = useState<number | null>(null);
-  const pageSize = 100;
+  const [branchList, setBranchList] = useState<BranchItem[]>([]);
+  const [selectedBranch, setSelectedBranch] = useState<string>('');
+  // Client-side pagination over one large fetch (reliable Prev/Next + branch filter).
+  const FETCH_LIMIT = 2000;
+  const PAGE_ROWS = 25;
+  const [page, setPage] = useState<number>(1);
+  // Only matches with similarity above this fraction are shown.
+  const MATCH_MIN_SIM = 0.5;
 
   const [uniqueCount, setUniqueCount] = useState<number | null>(null);
   const [uniqueCountLoading, setUniqueCountLoading] = useState<boolean>(false);
   const [selectedEvent, setSelectedEvent] = useState<{ sid: string, events: RecognitionEvent[] } | null>(null);
-  const [matchRefPath, setMatchRefPath] = useState<string | null>(null);
+  // Enrolled reference image (one per matched subject), keyed by subject_id.
   const [subjectImgById, setSubjectImgById] = useState<Record<string, string>>({});
   const [dateMode, setDateMode] = useState<'all' | 'day' | 'range'>('all');
   const [day, setDay] = useState<string>(new Date().toLocaleDateString('en-CA'));
@@ -188,67 +261,33 @@ export default function Recognition() {
     }
   }
 
-  async function load(reset: boolean = true) {
+  async function load() {
     setLoading(true);
     setErr(null);
     try {
-      const cur = reset ? null : nextCursor;
       const resp = await recognitionEvents({
         decision: decision || undefined,
         camera: camera || undefined,
+        branch: selectedBranch || undefined,
         subject_id: subjectId || undefined,
         min_similarity: minSimNum != null ? minSimNum : undefined,
         max_similarity: maxSimNum != null ? maxSimNum : undefined,
-        limit: pageSize,
-        cursor: cur,
+        limit: FETCH_LIMIT,
         day: dateMode === 'day' ? (day || null) : null,
         from_day: dateMode === 'range' ? (fromDay || null) : null,
         to_day: dateMode === 'range' ? (toDay || null) : null,
       });
-      if (reset) {
-        setItems(resp.items || []);
-      } else {
-        setItems(prev => [...(prev || []), ...(resp.items || [])]);
-      }
-      setNextCursor(resp.cursor != null ? Number(resp.cursor) : null);
+      setItems(resp.items || []);
     } catch (e: any) {
       setErr(String(e));
-      if (reset) setItems([]);
-      setNextCursor(null);
+      setItems([]);
     } finally {
       setLoading(false);
     }
   }
 
-  async function loadMore() {
-    if (loadingMore) return;
-    if (nextCursor == null) return;
-    setLoadingMore(true);
-    setErr(null);
-    try {
-      const resp = await recognitionEvents({
-        decision: decision || undefined,
-        camera: camera || undefined,
-        subject_id: subjectId || undefined,
-        min_similarity: minSimNum != null ? minSimNum : undefined,
-        max_similarity: maxSimNum != null ? maxSimNum : undefined,
-        limit: pageSize,
-        cursor: nextCursor,
-        day: dateMode === 'day' ? (day || null) : null,
-        from_day: dateMode === 'range' ? (fromDay || null) : null,
-        to_day: dateMode === 'range' ? (toDay || null) : null,
-      });
-      setItems(prev => [...(prev || []), ...(resp.items || [])]);
-      setNextCursor(resp.cursor != null ? Number(resp.cursor) : null);
-    } catch (e: any) {
-      setErr(String(e));
-    } finally {
-      setLoadingMore(false);
-    }
-  }
-
   useEffect(() => {
-    load(true);
+    load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -261,33 +300,36 @@ export default function Recognition() {
         setCameraOptions((resp as any) || []);
       } catch { /* ignore */ }
     })();
+    (async () => {
+      try {
+        const r = await getBranches();
+        if (cancelled) return;
+        setBranchList(r.branches || []);
+      } catch { /* ignore */ }
+    })();
     return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
-    setNextCursor(null);
-    load(true);
+    setPage(1);
+    load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [decision, camera, subjectId, dateMode, day, fromDay, toDay]);
+  }, [decision, camera, selectedBranch, subjectId, dateMode, day, fromDay, toDay, minSim, maxSim]);
 
   useEffect(() => {
     loadStats();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [camera, dateMode, day, fromDay, toDay]);
 
-  useEffect(() => {
-    setNextCursor(null);
-    load(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [minSim, maxSim]);
-
   const filtered = useMemo(() => {
     let out = items;
     if (decision) out = out.filter(i => String(i.decision || '') === decision);
     if (camera) out = out.filter(i => String(i.camera || '') === camera);
     if (subjectId) out = out.filter(i => String(i.subject_id || '') === subjectId);
+    // Match threshold: hide weak matches (similarity <= 50%).
+    out = out.filter(i => String(i.decision || '') !== 'match' || Number(i.similarity || 0) > MATCH_MIN_SIM);
     return out;
-  }, [items, decision, camera, subjectId]);
+  }, [items, decision, camera, subjectId, selectedBranch]);
 
   const displayRows = useMemo(() => {
     const groupMatches = decision === '' || decision === 'match';
@@ -340,69 +382,38 @@ export default function Recognition() {
     }
   }, [filtered, decision]);
 
-  const matchRefSubjectId = useMemo(() => {
-    if (decision !== 'match') return null;
-    const sid = String(subjectId || '').trim();
-    return sid || null;
-  }, [decision, subjectId]);
+  const totalPages = Math.max(1, Math.ceil(displayRows.length / PAGE_ROWS));
+  const pageClamped = Math.min(page, totalPages);
+  const pagedRows = useMemo(
+    () => displayRows.slice((pageClamped - 1) * PAGE_ROWS, pageClamped * PAGE_ROWS),
+    [displayRows, pageClamped]
+  );
+  const rowOffset = (pageClamped - 1) * PAGE_ROWS;
 
+  // Fetch one enrolled reference image per matched subject on the current page.
   useEffect(() => {
     let cancelled = false;
-    async function prefetchRefsForMatchCards() {
-      const group = String(subjectId || '').trim();
-      if (decision !== 'match' || group) return;
-
-      const want: string[] = [];
-      for (const ev of filtered) {
-        const sid = String(ev.subject_id || '').trim();
-        if (!sid) continue;
-        if (subjectImgById[sid]) continue;
-        want.push(sid);
-      }
-      const uniq = Array.from(new Set(want)).slice(0, 50);
-      if (!uniq.length) return;
-
-      for (const sid of uniq) {
+    const sids = Array.from(new Set(
+      pagedRows
+        .map(r => (r.type === 'grouped' ? r.sid : r.event.subject_id))
+        .map(s => String(s || '').trim())
+        .filter(s => s && s !== '—' && !subjectImgById[s])
+    )).slice(0, 40);
+    if (!sids.length) return;
+    (async () => {
+      for (const sid of sids) {
         try {
           const resp = await subjectImages(sid, { limit: 1 });
           const first = resp?.items?.[0];
-          const p = (first?.thumb_path || first?.image_path || '').trim();
-          if (!p) continue;
-          if (cancelled) return;
+          const p = (first?.image_path || first?.thumb_path || '').trim();
+          if (!p || cancelled) continue;
           setSubjectImgById(prev => (prev[sid] ? prev : { ...prev, [sid]: p }));
         } catch { /* ignore */ }
       }
-    }
-    prefetchRefsForMatchCards();
+    })();
     return () => { cancelled = true; };
-  }, [decision, subjectId, filtered, subjectImgById]);
-
-  useEffect(() => {
-    let cancelled = false;
-    async function loadMatchReference() {
-      if (decision !== 'match') {
-        setMatchRefPath(null);
-        return;
-      }
-      const sid = String(matchRefSubjectId || '').trim();
-      if (!sid) {
-        setMatchRefPath(null);
-        return;
-      }
-      try {
-        const resp = await subjectImages(sid, { limit: 1 });
-        const first = resp?.items?.[0];
-        const p = (first?.thumb_path || first?.image_path || '').trim();
-        if (cancelled) return;
-        setMatchRefPath(p || null);
-      } catch {
-        if (cancelled) return;
-        setMatchRefPath(null);
-      }
-    }
-    loadMatchReference();
-    return () => { cancelled = true; };
-  }, [decision, matchRefSubjectId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pagedRows]);
 
   const counts = useMemo(() => {
     let match = 0;
@@ -416,6 +427,8 @@ export default function Recognition() {
     }
     return { match, noMatch, rejected, total: filtered.length };
   }, [filtered]);
+
+  useModalDismiss(!!selectedEvent, () => setSelectedEvent(null));
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
@@ -436,8 +449,9 @@ export default function Recognition() {
           <button
             onClick={() => {
               const today = new Date().toLocaleDateString('en-CA');
-              setNextCursor(null);
+              setPage(1);
               setCamera('');
+              setSelectedBranch('');
               setDecision('');
               setSubjectId('');
               setMinSim('');
@@ -446,14 +460,14 @@ export default function Recognition() {
               setDay(today);
               setFromDay(today);
               setToDay(today);
-              load(true);
+              load();
             }}
             style={{ fontWeight: 600 }}
           >
             Reset
           </button>
-          <button onClick={() => load(true)} className="primary" style={{ fontWeight: 600 }}>
-            {loading ? 'Refreshing...' : 'Refresh Feed'}
+          <button onClick={() => load()} className="primary" style={{ fontWeight: 600 }}>
+            {loading ? <><span className="spinner" />Refreshing...</> : 'Refresh Feed'}
           </button>
         </div>
       </header>
@@ -508,6 +522,16 @@ export default function Recognition() {
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Branch</span>
+          <select value={selectedBranch} onChange={e => setSelectedBranch(e.target.value)} style={{ padding: '8px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)' }}>
+            <option value="">All Branches</option>
+            {branchList.map(b => (
+              <option key={b.branch_id} value={b.branch_id}>{b.name || b.branch_id}</option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
           <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Date Mode</span>
           <select value={dateMode} onChange={(e) => setDateMode(e.target.value as any)} style={{ padding: '8px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)' }}>
             <option value="all">All Dates</option>
@@ -549,32 +573,22 @@ export default function Recognition() {
         </div>
       </div>
 
-      <div style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', fontWeight: 500 }}>
-        {loading ? 'Fetching records...' : `Showing ${counts.total} events ( ${counts.match} matches / ${counts.noMatch} unknown / ${counts.rejected} rejected )`}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap', fontSize: '0.8125rem', fontWeight: 600 }}>
+        {loading ? (
+          <span style={{ color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '8px' }}><span className="spinner" />Fetching records...</span>
+        ) : (
+          <>
+            <span style={{ color: 'var(--text-secondary)' }}>Showing {pagedRows.length} of {displayRows.length} rows</span>
+            <span style={{ padding: '3px 10px', borderRadius: '99px', background: 'rgba(16,185,129,0.12)', color: 'var(--success)' }}>{counts.match} match</span>
+            <span style={{ padding: '3px 10px', borderRadius: '99px', background: 'rgba(107,114,128,0.12)', color: 'var(--text-secondary)' }}>{counts.noMatch} unknown</span>
+            <span style={{ padding: '3px 10px', borderRadius: '99px', background: 'rgba(239,68,68,0.12)', color: 'var(--error)' }}>{counts.rejected} rejected</span>
+          </>
+        )}
       </div>
 
       {err && (
         <div style={{ padding: '16px', background: 'rgba(239, 68, 68, 0.1)', border: '1px solid var(--error)', borderRadius: 'var(--radius-md)', color: 'var(--error)', fontWeight: 500 }}>
           {err}
-        </div>
-      )}
-
-      {decision === 'match' && String(subjectId || '').trim() !== '' && (
-        <div className="card" style={{ maxWidth: '400px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <h4 style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Reference Image</h4>
-            <span style={{ background: 'var(--bg-secondary)', padding: '2px 8px', borderRadius: '99px', fontSize: '0.75rem', fontWeight: 600 }}>{String(subjectId || '').trim()}</span>
-          </div>
-          {matchRefPath ? (
-            <img
-              src={`${getApiBase()}${matchRefPath}`}
-              style={{ width: '100%', height: '200px', objectFit: 'contain', borderRadius: 'var(--radius-md)', background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}
-            />
-          ) : (
-            <div style={{ height: '200px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', border: '2px dashed var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)' }}>
-              No reference available
-            </div>
-          )}
         </div>
       )}
 
@@ -596,7 +610,7 @@ export default function Recognition() {
         <span>#</span>
         <span>Status</span>
         <span>Subject ID</span>
-        <span>Customer Images</span>
+        <span>Reference / Response</span>
         <span>Camera Name</span>
         <span>Entry Time</span>
         <span>Exit Time</span>
@@ -605,13 +619,13 @@ export default function Recognition() {
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-        {displayRows.map((row, idx) => {
+        {pagedRows.map((row, idx) => {
           const isGrouped = row.type === 'grouped';
           const events = isGrouped ? row.events : [row.event];
           const firstEv = events[0];
           const lastEv = events[events.length - 1];
           const sid = isGrouped ? row.sid : (lastEv.subject_id || '—');
-          const ref = subjectImgById[sid] || '';
+          const refSrc = imgUrl(subjectImgById[sid]);
           const duration = lastEv.ts - firstEv.ts;
 
           const cameras = Array.from(new Set(events.map(e => e.camera))).join(', ');
@@ -619,7 +633,7 @@ export default function Recognition() {
           return (
             <div
               key={row.key}
-              className="card"
+              className="card hover-lift"
               style={{
                 display: 'grid',
                 gridTemplateColumns: '40px 100px 1.2fr 180px 1fr 150px 150px 80px 60px',
@@ -630,7 +644,7 @@ export default function Recognition() {
                 cursor: 'default'
               }}
             >
-              <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', fontWeight: 600 }}>{idx + 1}</div>
+              <div style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', fontWeight: 600 }}>{rowOffset + idx + 1}</div>
 
               {/* Status */}
               <div style={{
@@ -648,42 +662,50 @@ export default function Recognition() {
               </div>
 
               {/* Subject ID */}
-              <div style={{ fontWeight: 700, fontSize: '0.875rem', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                {sid}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', overflow: 'hidden' }}>
+                <span style={{ fontWeight: 700, fontSize: '0.875rem', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {sid}
+                </span>
+                <QualityBlock ev={lastEv} compact />
               </div>
 
-              {/* Customer Images */}
+              {/* Reference (enrolled match) + Response (captured frame) */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                 <div style={{ display: 'flex', gap: '4px', height: '60px' }}>
-                  <div style={{ flex: 1, borderRadius: '4px', overflow: 'hidden', border: '1px solid var(--border)', background: 'var(--bg-secondary)', position: 'relative' }}>
-                    {ref ? (
-                      <img src={`${getApiBase()}${ref}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  <div style={{ flex: 1, borderRadius: '4px', overflow: 'hidden', border: '1px solid var(--border)', background: 'var(--bg-secondary)', position: 'relative' }} title="Enrolled reference">
+                    {refSrc ? (
+                      <img src={refSrc} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                     ) : (
-                      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem' }}>REF</div>
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem', color: 'var(--text-muted)' }}>REF</div>
                     )}
                   </div>
-                  <div style={{ flex: 1, borderRadius: '4px', overflow: 'hidden', border: '1px solid var(--border)', background: 'var(--bg-secondary)', position: 'relative' }}>
+                  <div style={{ flex: 1, borderRadius: '4px', overflow: 'hidden', border: '1px solid var(--border)', background: 'var(--bg-secondary)', position: 'relative' }} title="Captured response">
                     {lastEv.image_path ? (
-                      <img src={`${getApiBase()}${lastEv.image_path}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                      <img src={imgUrl(lastEv.image_path)} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                     ) : (
-                      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem' }}>LIVE</div>
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.5rem', color: 'var(--text-muted)' }}>LIVE</div>
                     )}
                   </div>
                 </div>
                 {/* Similarity Bar */}
-                {lastEv.decision === 'match' && (
-                  <div style={{ height: '14px', background: 'var(--bg-secondary)', borderRadius: '2px', overflow: 'hidden', border: '1px solid var(--border)', position: 'relative' }}>
-                    <div style={{
-                      width: `${(lastEv.similarity || 0) * 100}%`,
-                      height: '100%',
-                      background: 'var(--success)',
-                      opacity: 0.8
-                    }} />
-                    <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '9px', fontWeight: 800, color: (lastEv.similarity || 0) > 0.5 ? 'white' : 'var(--text-primary)' }}>
-                      {((lastEv.similarity || 0) * 100).toFixed(0)}%
+                {lastEv.decision === 'match' && (() => {
+                  const pct = (lastEv.similarity || 0) * 100;
+                  const barColor = pct >= 75 ? 'var(--success)' : pct >= 60 ? 'var(--warning)' : 'var(--error)';
+                  return (
+                    <div style={{ height: '16px', background: 'var(--bg-secondary)', borderRadius: '8px', overflow: 'hidden', border: '1px solid var(--border)', position: 'relative' }} title={`Similarity ${pct.toFixed(1)}%`}>
+                      <div style={{
+                        width: `${Math.min(100, pct)}%`,
+                        height: '100%',
+                        background: barColor,
+                        borderRadius: '8px',
+                        transition: 'width 0.3s ease'
+                      }} />
+                      <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '9px', fontWeight: 800, color: pct > 55 ? 'white' : 'var(--text-primary)' }}>
+                        {pct.toFixed(0)}%
+                      </div>
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
               </div>
 
               {/* Camera Name */}
@@ -723,31 +745,53 @@ export default function Recognition() {
         })}
       </div>
 
-      <footer style={{ display: 'flex', justifyContent: 'center', padding: '16px' }}>
-        <button
-          disabled={nextCursor == null || loadingMore}
-          onClick={loadMore}
-          className={nextCursor != null ? 'primary' : ''}
-          style={{ padding: '12px 48px', minWidth: '200px' }}
-        >
-          {loadingMore ? 'Loading...' : (nextCursor == null ? 'No More Records' : 'Load More Results')}
-        </button>
-      </footer>
+      {!loading && displayRows.length === 0 && (
+        <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '64px', color: 'var(--text-muted)', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', border: '2px dashed var(--border)' }}>
+          No recognition events match your filters.
+        </div>
+      )}
+
+      {displayRows.length > 0 && (
+        <footer style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '12px', padding: '16px' }}>
+          <button
+            disabled={pageClamped <= 1 || loading}
+            onClick={() => setPage(p => Math.max(1, p - 1))}
+            style={{ padding: '10px 24px', minWidth: '110px' }}
+          >
+            ← Prev
+          </button>
+          <span style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', fontWeight: 700, minWidth: '120px', textAlign: 'center' }}>
+            Page {pageClamped} / {totalPages}
+          </span>
+          <button
+            disabled={pageClamped >= totalPages || loading}
+            onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+            className={pageClamped < totalPages ? 'primary' : ''}
+            style={{ padding: '10px 24px', minWidth: '110px' }}
+          >
+            Next →
+          </button>
+        </footer>
+      )}
 
       {/* Full View Modal */}
       {selectedEvent && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '40px' }}>
-          <div className="card" style={{ width: '100%', maxWidth: '1000px', maxHeight: '90vh', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '24px', padding: '32px', position: 'relative' }}>
+        <div className="modal-overlay" onClick={() => setSelectedEvent(null)} style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '40px' }}>
+          <div className="card modal-content" onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: '1000px', maxHeight: '90vh', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '24px', padding: '32px', position: 'relative' }}>
             <button
               onClick={() => setSelectedEvent(null)}
-              style={{ position: 'absolute', top: 16, right: 16, border: 'none', background: 'transparent', cursor: 'pointer', fontSize: '1.5rem', color: 'var(--text-muted)' }}
+              className="modal-close"
+              style={{ position: 'absolute', top: 16, right: 16, background: 'transparent', cursor: 'pointer', fontSize: '1.5rem', color: 'var(--text-muted)' }}
             >
               ✕
             </button>
 
             <div style={{ display: 'flex', gap: '24px', alignItems: 'center' }}>
-              <div style={{ width: '120px', height: '120px', borderRadius: 'var(--radius-md)', overflow: 'hidden', border: '2px solid var(--primary)', background: 'var(--bg-secondary)' }}>
-                {subjectImgById[selectedEvent.sid] && <img src={`${getApiBase()}${subjectImgById[selectedEvent.sid]}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
+              <div style={{ width: '120px', height: '120px', borderRadius: 'var(--radius-md)', overflow: 'hidden', border: '2px solid var(--primary)', background: 'var(--bg-secondary)' }} title="Enrolled reference">
+                {(() => {
+                  const src = imgUrl(subjectImgById[selectedEvent.sid]) || imgUrl(selectedEvent.events[0]?.image_path);
+                  return src ? <img src={src} style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : null;
+                })()}
               </div>
               <div>
                 <h2 style={{ fontSize: '1.5rem', fontWeight: 800 }}>{selectedEvent.sid}</h2>
@@ -757,11 +801,14 @@ export default function Recognition() {
               </div>
             </div>
 
+            <h4 style={{ fontSize: '0.8125rem', fontWeight: 800, color: 'var(--text-muted)', textTransform: 'uppercase' }}>
+              Response Images ({selectedEvent.events.length})
+            </h4>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '20px' }}>
               {selectedEvent.events.map(ev => (
                 <div key={ev.event_id} style={{ borderRadius: 'var(--radius-md)', overflow: 'hidden', background: 'var(--bg-secondary)', border: '1px solid var(--border)' }}>
                   <div style={{ height: '160px', position: 'relative' }}>
-                    <img src={`${getApiBase()}${ev.image_path}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    <img src={imgUrl(ev.image_path)} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                     <div style={{ position: 'absolute', top: 8, right: 8, padding: '4px 8px', background: 'rgba(0,0,0,0.6)', color: 'white', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 700 }}>
                       {ev.similarity != null ? (ev.similarity * 100).toFixed(1) : '--'}%
                     </div>
@@ -771,6 +818,9 @@ export default function Recognition() {
                     <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{fmtTs(ev.ts)}</div>
                     <div style={{ fontSize: '0.625rem', color: 'var(--text-muted)', fontFamily: 'monospace', opacity: 0.8, marginTop: '2px' }}>
                       ID: {ev.event_id}
+                    </div>
+                    <div style={{ marginTop: '8px' }}>
+                      <QualityBlock ev={ev} />
                     </div>
                     <div style={{ display: 'flex', gap: '4px', marginTop: '8px' }}>
                       <button onClick={() => setFeedback(ev.event_id, 'tp')} style={{ flex: 1, padding: '4px', fontSize: '0.625rem', background: ev.feedback_label === 'tp' ? 'var(--success)' : 'transparent', color: ev.feedback_label === 'tp' ? 'white' : 'inherit' }}>TP</button>

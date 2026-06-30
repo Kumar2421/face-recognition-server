@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: face-service
+  namespace: face
+  labels:
+    app: face-service
+spec:
+  type: NodePort
+  selector:
+    app: face-service
+  ports:
+    - name: http
+      port: 8000          # in-cluster: http://face-service.face:8000
+      targetPort: 8000
+      nodePort: 30001     # external: <node-ip>:30001  (compose host 8001)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: face-service
+  namespace: face
+spec:
+  replicas: 1                 # single GPU + single sqlite writer -> never scale up
+  strategy:
+    type: Recreate           # RWO hostPath volumes can't be shared across pods
+  selector:
+    matchLabels:
+      app: face-service
+  template:
+    metadata:
+      labels:
+        app: face-service
+    spec:
+      # runtimeClassName: nvidia   # uncomment if your cluster uses the nvidia RuntimeClass
+      initContainers:
+        # Seed events.db from images-old/ only if the events store is empty.
+        - name: seed-events-db
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              if [ ! -f /data/events/events.db ]; then
+                echo "seeding events.db from images-old";
+                mkdir -p /data/events;
+                cp /seed/events.db /data/events/events.db;
+              else
+                echo "events.db already present, skip seed";
+              fi
+          volumeMounts:
+            - name: events
+              mountPath: /data/events
+            - name: events-seed
+              mountPath: /seed
+              readOnly: true
+      containers:
+        - name: face-service
+          image: face-recognition-server:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: face-service-env
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          volumeMounts:
+            - { name: models,     mountPath: /models }
+            - { name: thumbs,     mountPath: /data/thumbs }
+            - { name: images,     mountPath: /data/images }
+            - { name: events,     mountPath: /data/events }
+            - { name: trt-cache,  mountPath: /data/trt_cache }
+            - { name: input,      mountPath: /data/input, readOnly: true }
+            - { name: facefolder, mountPath: /data/facefolder, readOnly: true }
+            - { name: config,     mountPath: /app/config.yaml, subPath: config.yaml, readOnly: true }
+      volumes:
+        - name: models
+          hostPath: { path: /home/fusion-gpu/fusion-projects/face-recognition-server/buffalo_l/models, type: Directory }
+        - name: thumbs
+          hostPath: { path: /home/fusion-gpu/fusion-projects/face-recognition-server/data/thumbs, type: DirectoryOrCreate }
+        - name: images
+          hostPath: { path: /home/fusion-gpu/fusion-projects/face-recognition-server/data/images, type: DirectoryOrCreate }
+        - name: events
+          hostPath: { path: /home/fusion-gpu/fusion-projects/face-recognition-server/images/events, type: DirectoryOrCreate }
+        - name: trt-cache
+          hostPath: { path: /home/fusion-gpu/fusion-projects/face-recognition-server/data/trt_cache, type: DirectoryOrCreate }
+        - name: input
+          hostPath: { path: /home/fusion-gpu/fusion-projects/face-recognition-server/input, type: DirectoryOrCreate }
+        - name: facefolder
+          hostPath: { path: /home/fusion-gpu/fusion-projects/face-recognition-server/facefolder, type: DirectoryOrCreate }
+        # events.db seed source (the old snapshot you asked to include)
+        - name: events-seed
+          hostPath: { path: /home/fusion-gpu/fusion-projects/face-recognition-server/images-old/events, type: Directory }
+        - name: config
+          hostPath: { path: /home/fusion-gpu/fusion-projects/face-recognition-server, type: Directory }

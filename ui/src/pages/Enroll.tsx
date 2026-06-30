@@ -110,14 +110,13 @@ export default function Enroll() {
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Face Images</label>
-          <div style={{ 
-            border: '2px dashed var(--border)', 
-            borderRadius: 'var(--radius-lg)', 
-            padding: '40px', 
+          <div className="dropzone" style={{
+            border: '2px dashed var(--border)',
+            borderRadius: 'var(--radius-lg)',
+            padding: '40px',
             textAlign: 'center',
             background: 'var(--bg-secondary)',
-            cursor: 'pointer',
-            transition: 'border-color 0.2s'
+            cursor: 'pointer'
           }} onClick={() => fileRef.current?.click()}>
             <input type="file" ref={fileRef} multiple accept="image/*" onChange={onFilesChanged} style={{ display: 'none' }} />
             <div style={{ fontSize: '2rem', marginBottom: '8px' }}>📸</div>

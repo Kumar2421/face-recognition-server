@@ -1,5 +1,5 @@
-import { useRef, useState } from 'react';
-import { facesRecognizeUpload, facesSearchUpload, getApiBase, qualityCheckUpload, compareFacesUpload } from '../lib/api';
+import { useEffect, useRef, useState } from 'react';
+import { facesRecognizeUpload, facesSearchUpload, getApiBase, getBranches, qualityCheckUpload, compareFacesUpload, type BranchItem } from '../lib/api';
 
 type Item = { subject_id: string; similarity: number; point_id?: string; image_id?: string; thumb_path?: string };
 
@@ -20,6 +20,24 @@ export default function Search() {
   const [fromDay, setFromDay] = useState<string>('');
   const [toDay, setToDay] = useState<string>('');
   const [showJson, setShowJson] = useState<boolean>(false);
+  const [queryName, setQueryName] = useState<string>('');
+  const [branchList, setBranchList] = useState<BranchItem[]>([]);
+  const [selectedBranch, setSelectedBranch] = useState<string>('');
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await getBranches();
+        if (cancelled) return;
+        const list = r.branches || [];
+        setBranchList(list);
+        // Auto-select when the key has exactly one branch.
+        if (list.length === 1) setSelectedBranch(list[0].branch_id);
+      } catch { /* ignore */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // New state for Comparison feature
   const [mode, setMode] = useState<'search' | 'compare'>('search');
@@ -48,8 +66,8 @@ export default function Search() {
       };
       const r =
         kind === 'search'
-          ? await facesSearchUpload(f, topK, filter)
-          : await facesRecognizeUpload(f, topK, filter);
+          ? await facesSearchUpload(f, topK, filter, selectedBranch || undefined)
+          : await facesRecognizeUpload(f, topK, filter, selectedBranch || undefined);
       setJsonResponse(r);
       const items = (r?.results || []) as Item[];
       setQueryThumb(r?.query_thumb_path ? `${getApiBase()}${r.query_thumb_path}` : null);
@@ -195,7 +213,7 @@ export default function Search() {
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 120px', gap: '20px' }}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
               <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Query Image</label>
-              <div style={{
+              <div className="dropzone" style={{
                 border: '2px dashed var(--border)',
                 borderRadius: 'var(--radius-md)',
                 padding: '24px',
@@ -203,8 +221,8 @@ export default function Search() {
                 background: 'var(--bg-secondary)',
                 cursor: 'pointer'
               }} onClick={() => fileRef.current?.click()}>
-                <input type="file" ref={fileRef} accept="image/*" style={{ display: 'none' }} />
-                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{fileRef.current?.files?.[0]?.name || 'Select Image...'}</span>
+                <input type="file" ref={fileRef} accept="image/*" onChange={(e) => setQueryName(e.target.files?.[0]?.name || '')} style={{ display: 'none' }} />
+                <span style={{ fontWeight: 600, color: queryName ? 'var(--text-primary)' : 'var(--text-muted)' }}>{queryName || 'Select Image...'}</span>
               </div>
             </div>
 
@@ -222,10 +240,23 @@ export default function Search() {
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Advanced Filters</span>
+            <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Branch & Date Filters</span>
             <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
+              <select
+                value={selectedBranch}
+                onChange={(e) => setSelectedBranch(e.target.value)}
+                disabled={branchList.length === 0}
+                title={branchList.length === 0 ? 'No branches for this key — searching all key data' : 'Optional: scope search/recognize to a branch'}
+                style={{ padding: '10px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', minWidth: '160px', opacity: branchList.length === 0 ? 0.6 : 1 }}
+              >
+                <option value="">{branchList.length === 0 ? 'All (no branches)' : 'All Branches'}</option>
+                {branchList.map(b => (
+                  <option key={b.branch_id} value={b.branch_id}>{b.name || b.branch_id}</option>
+                ))}
+              </select>
+
               <select value={dateMode} onChange={(e) => setDateMode(e.target.value as any)} style={{ padding: '10px', borderRadius: 'var(--radius-md)', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }}>
-                <option value="all">All Records</option>
+                <option value="all">All Dates</option>
                 <option value="day">Single Day</option>
                 <option value="range">Custom Range</option>
               </select>
@@ -241,6 +272,11 @@ export default function Search() {
                 </>
               )}
             </div>
+            <span style={{ fontSize: '0.75rem', color: selectedBranch ? 'var(--primary)' : 'var(--text-muted)', fontWeight: 600 }}>
+              {selectedBranch
+                ? `Scoped to branch: ${branchList.find(b => b.branch_id === selectedBranch)?.name || selectedBranch}`
+                : 'Searching all data for this API key (branch optional).'}
+            </span>
           </div>
 
           <div style={{ display: 'flex', gap: '12px', borderTop: '1px solid var(--border)', paddingTop: '20px' }}>
@@ -284,6 +320,7 @@ export default function Search() {
                   overflow: 'hidden',
                   position: 'relative'
                 }}
+                className="dropzone"
                 onClick={() => compareFile1Ref.current?.click()}
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={(e) => handleDrop(e, setCompareFile1, setComparePreview1)}
@@ -316,6 +353,7 @@ export default function Search() {
                   overflow: 'hidden',
                   position: 'relative'
                 }}
+                className="dropzone"
                 onClick={() => compareFile2Ref.current?.click()}
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={(e) => handleDrop(e, setCompareFile2, setComparePreview2)}
@@ -434,7 +472,7 @@ export default function Search() {
         </div>
       )}
 
-      {loading && <div style={{ color: 'var(--text-muted)' }}>Processing request...</div>}
+      {loading && <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: 'var(--text-muted)', fontWeight: 500 }}><span className="spinner" />Processing request...</div>}
       {error && <div style={{ padding: '16px', background: 'rgba(239, 68, 68, 0.1)', color: 'var(--error)', borderRadius: 'var(--radius-md)', border: '1px solid var(--error)' }}>{error}</div>}
 
       {mode === 'search' && quality && (

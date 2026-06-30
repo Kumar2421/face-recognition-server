@@ -22,7 +22,10 @@ Environment variables (Docker Compose sets most of these):
 - `BUFFALO_MIN_DET_SCORE` (default: `0.5`) minimum detector score for accepting a face
 - `BUFFALO_PROVIDERS` (example: `CUDAExecutionProvider,CPUExecutionProvider`)
 
-- `FACE_SERVICE_API_KEY` (default: `your-secret-key`) security key for protected endpoints
+- `FACE_SERVICE_API_KEY` (default: `your-secret-key`) security key for the `standard` data bucket
+- `FACE_SERVICE_LEGACY_API_KEY` (optional) **master key**. Owns the `legacy` data bucket AND is the only key allowed to manage tenant keys via `/v1/keys` (create / list / delete). See **Key management**.
+- `KEYS_COLLECTION` (default: `api_keys`) Qdrant collection that stores tenant keys.
+- `KEY_RELOAD_SEC` (default: `15`) interval for auto-reloading the key registry from Qdrant (also force-reloaded on create/delete).
 
 GPU / performance:
 
@@ -40,7 +43,14 @@ Storage:
 
 Notes:
 
-- Endpoints marked with **Auth: API key** require an `x-api-key` header matching `FACE_SERVICE_API_KEY`.
+- Endpoints marked with **Auth: API key** require an `x-api-key` header.
+- **Data Segregation (Isolation)** — every key maps to its own data bucket (`access_key`). The resolver order:
+  - empty key → `standard` (on optional/read endpoints) or `403` (on protected ones).
+  - matches `FACE_SERVICE_API_KEY` → `standard` bucket.
+  - matches `FACE_SERVICE_LEGACY_API_KEY` (master) → `legacy` bucket.
+  - matches a **tenant key** created via `/v1/keys` → that key's assigned bucket (`t_…`).
+  - any other non-empty key → its own deterministic ad-hoc bucket (`k_…`).
+  - Isolation applies to Subjects, Recognition Events, Search History, Groups, and Branches. Data enrolled under one key is invisible to all other keys. A single key scopes the **entire** dashboard.
 - **Flexible Routing**: The API supports an optional `/api` prefix. Both `/v1/...` and `/api/v1/...` are valid.
 - **Image Input Flexibility**: 
   - Most endpoints accept `image_b64`, `images_b64`, or `image` as field names.
@@ -62,12 +72,12 @@ here is the reference for the api: fs_9f2b8a71c4d04e5e9b3d8a7c6b5a4f3e
 - The service stores one vector per uploaded/enrolled image in Qdrant
 - Each vector has payload:
   - `subject_id` (string)
-  - `group_id` (string, optional)
   - `image_id` (string, UUID per image)
   - `created_at` (ISO8601 string)
   - `thumb_path` (string, e.g. `/thumbs/{image_id}.jpg`)
   - `image_path` (string, e.g. `/images/{subject_id}/{image_id}.jpg`)
   - `source` (one of: `enroll`, `external`, `ingested`, `auto_recognized`)
+  - `branch` (string, optional)
   - optional `filename` (string) for upload endpoints
 
 ## Endpoints
@@ -119,7 +129,7 @@ curl -s http://localhost:8001/health | python3 -m json.tool
 
 Returns global counters and Qdrant status.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Response (example):
 ```json
@@ -276,6 +286,184 @@ curl -s -X DELETE "http://localhost:8001/v1/groups/employees" \
 
 ---
 
+## Branch management
+
+### `POST /v1/branches`
+
+Create a new branch.
+
+**Auth:** API key
+
+Request body:
+```json
+{
+  "branch_id": "branch-001",
+  "name": "Main Branch",
+  "meta": {}
+}
+```
+
+Response:
+```json
+{
+  "branch_id": "branch-001",
+  "name": "Main Branch",
+  "meta": {}
+}
+```
+
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/branches" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"branch_id":"branch-001","name":"Main Branch","meta":{}}'
+```
+
+### `GET /v1/branches`
+
+List all branches.
+
+**Auth:** API key
+
+Response:
+```json
+{
+  "branches": [
+    {"branch_id": "branch-001", "name": "Main Branch", "meta": {}}
+  ]
+}
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/branches" \
+  -H "x-api-key: YOUR_API_KEY"
+```
+
+### `DELETE /v1/branches/{branch_id}`
+
+Delete a branch.
+
+**Auth:** API key
+
+Response:
+```json
+{
+  "deleted": true,
+  "branch_id": "branch-001"
+}
+```
+
+Curl:
+```bash
+curl -s -X DELETE "http://localhost:8001/v1/branches/branch-001" \
+  -H "x-api-key: YOUR_API_KEY"
+```
+
+---
+
+## Key management
+
+Manage tenant API keys. Each tenant key isolates its own data bucket (`access_key`).
+
+**Auth:** Master key only — `x-api-key` must equal `FACE_SERVICE_LEGACY_API_KEY`. Any other key (or none) → `403`. If the master key is not configured → `503`.
+
+Keys are stored in the Qdrant `api_keys` collection and auto-reloaded into memory (every `KEY_RELOAD_SEC`, plus an immediate reload on create/delete) so new keys take effect **without a restart**.
+
+### `POST /v1/keys`
+
+Create a tenant key. The raw key is returned **once** here; later listings only show a masked value.
+
+**Auth:** Master key
+
+Request body:
+```json
+{
+  "name": "TMJ branch dashboard",
+  "api_key": "fs_optional_custom_key"
+}
+```
+
+- `name` (string, optional) human label.
+- `api_key` (string, optional; alias `key`) supply your own key value. If omitted, the server generates one (`fs_<random>`).
+
+Response:
+```json
+{
+  "key_id": "8f1c1e2a-....",
+  "name": "TMJ branch dashboard",
+  "access_key": "t_4b8c1d2e3f4a5b6c",
+  "created_at": "2026-06-01T10:00:00+00:00",
+  "active": true,
+  "api_key": "fs_9a8b7c6d5e4f...   (RAW — shown only once)",
+  "api_key_masked": "fs_9a8…f3e2"
+}
+```
+
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/keys" \
+  -H "x-api-key: MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"TMJ branch dashboard"}'
+```
+
+### `GET /v1/keys`
+
+List all tenant keys (masked).
+
+**Auth:** Master key
+
+Response:
+```json
+{
+  "keys": [
+    {
+      "key_id": "8f1c1e2a-....",
+      "name": "TMJ branch dashboard",
+      "access_key": "t_4b8c1d2e3f4a5b6c",
+      "created_at": "2026-06-01T10:00:00+00:00",
+      "active": true,
+      "api_key_masked": "fs_9a8…f3e2"
+    }
+  ]
+}
+```
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/keys" \
+  -H "x-api-key: MASTER_KEY"
+```
+
+### `DELETE /v1/keys/{key_id}`
+
+Revoke a tenant key. After deletion the key no longer resolves to its bucket, so that tenant's data becomes inaccessible (hidden, not erased).
+
+**Auth:** Master key
+
+Response:
+```json
+{
+  "key_id": "8f1c1e2a-....",
+  "deleted": true
+}
+```
+
+Curl:
+```bash
+curl -s -X DELETE "http://localhost:8001/v1/keys/8f1c1e2a-...." \
+  -H "x-api-key: MASTER_KEY"
+```
+
+Notes:
+- After creating a key, use it as `x-api-key` on any normal endpoint (enroll, search, recognize, events, etc.) — all data is scoped to that key's bucket automatically.
+- A freshly created key starts with an **empty** dataset until you enroll/ingest under it.
+- Raw keys are stored in the Qdrant payload to allow header matching.
+
+---
+
 ## Enrollment (Add)
 
 You can enroll faces using JSON (base64/URL), multipart upload, or image URLs.
@@ -290,14 +478,18 @@ Request body:
   "subject_id": "alice",
   "images_b64": ["<base64-encoded-image>"],
   "image_urls": ["https://example.com/photo.jpg"],
-  "group_id": "employees"
+  "branch": "branch-001",
+  "created_at": "2024-05-20T10:00:00Z",
+  "ts": 1716199200
 }
 ```
 
 - `subject_id` (string, required)
 - `images_b64` (array of strings, optional) base64-encoded images or HTTP/HTTPS URLs
 - `image_urls` (array of strings, optional) HTTP/HTTPS image URLs
-- `group_id` (string, optional)
+- `branch` (string, optional)
+- `created_at` (string, optional) ISO8601 string
+- `ts` (float, optional) Unix timestamp
 
 At least one of `images_b64` or `image_urls` must be provided.
 
@@ -335,7 +527,9 @@ curl -s -X POST "http://localhost:8001/v1/faces/add" \
 Form fields:
 
 - `subject_id` (text, required)
-- `group_id` (text, optional)
+- `branch` (text, optional)
+- `created_at` (text, optional) ISO8601 string
+- `ts` (float, optional) Unix timestamp
 - `files` (one or more images, optional)
 - `image_urls` (one or more URLs, optional)
 
@@ -383,7 +577,7 @@ Request body:
 {
   "image_b64": "<base64-encoded-image or http-url>",
   "top_k": 5,
-  "group_id": "employees"
+  "branch": "branch-001"
 }
 ```
 
@@ -416,7 +610,7 @@ Form fields:
 
 - `file` (image, required)
 - `top_k` (optional, default `5`)
-- `group_id` (optional)
+- `branch` (optional)
 
 Response: Same as `/v1/faces/search`.
 
@@ -425,11 +619,12 @@ Curl:
 curl -s -X POST "http://localhost:8001/v1/faces/search_upload" \
   -H "x-api-key: YOUR_API_KEY" \
   -F "top_k=5" \
-  -F "group_id=employees" \
+  -F "branch=branch-001" \
   -F "file=@/path/to/query.jpg;type=image/jpeg"
 ```
 
 ---
+
 
 ## Recognize (Best match + threshold)
 
@@ -443,7 +638,12 @@ Request body:
   "image_b64": "<base64-encoded-image>",
   "top_k": 5,
   "min_similarity": 0.75,
-  "group_id": "employees"
+  "branch": "branch-001",
+  "day": "2024-05-20",
+  "from_day": "2024-05-01",
+  "to_day": "2024-05-31",
+  "since_ts": 1716163200,
+  "until_ts": 1717113600
 }
 ```
 
@@ -491,13 +691,13 @@ curl -s -X POST "http://localhost:8001/v1/faces/recognize" \
 ### `POST /v1/faces/recognize_upload` (multipart)
 
 **Auth:** API key
-
 Form fields:
 
 - `file` (image, required)
 - `top_k` (optional, default `5`)
 - `min_similarity` (optional)
-- `group_id` (optional)
+- `branch` (optional)
+- `day`, `from_day`, `to_day`, `since_ts`, `until_ts` (optional)
 
 Response: Same as `/v1/faces/recognize`.
 
@@ -507,6 +707,7 @@ curl -s -X POST "http://localhost:8001/v1/faces/recognize_upload" \
   -H "x-api-key: YOUR_API_KEY" \
   -F "top_k=5" \
   -F "min_similarity=0.75" \
+  -F "branch=branch-001" \
   -F "file=@/path/to/query.jpg;type=image/jpeg"
 ```
 
@@ -560,7 +761,7 @@ curl -s -X POST "http://localhost:8001/v1/face/compare_upload" \
 
 Find other subjects that look similar to the given subject. Useful for finding duplicate enrollments.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Path params:
 
@@ -655,7 +856,7 @@ curl -s -X POST "http://localhost:8001/v1/face/search_upload" \
 
 Returns unique `subject_id` values currently present in Qdrant.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Response:
 ```json
@@ -673,7 +874,7 @@ curl -s "http://localhost:8001/v1/faces/subjects"
 
 Deletes all vectors for a subject from Qdrant.
 
-**Auth:** None
+**Auth:** API key (Required)
 
 Response:
 ```json
@@ -696,7 +897,7 @@ These endpoints are used by the web UI to browse subjects and their images.
 
 ### `GET /v1/subjects`
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Query params:
 
@@ -735,7 +936,7 @@ curl -s "http://localhost:8001/v1/subjects?with_counts=true&limit=50"
 
 Get details for a single subject.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Response:
 ```json
@@ -754,7 +955,7 @@ curl -s "http://localhost:8001/v1/subjects/alice"
 
 ### `GET /v1/subjects/{subject_id}/images`
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Query params:
 
@@ -790,7 +991,7 @@ Use this endpoint when you want to know whether an image is **eligible** to be e
 
 ### `POST /v1/quality/check_upload` (multipart)
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Form fields:
 
@@ -864,7 +1065,6 @@ Request body:
   "recognition": false,
   "top_k": 1,
   "branch": "optional-branch-filter",
-  "group_id": "optional-group-filter",
   "day": "2026-05-22",
   "since_ts": 1777713396.0
 }
@@ -908,7 +1108,7 @@ Notes:
 - `image_b64`: A base64-encoded JPEG crop (with exactly 150px padding) where all *other* detected faces in the original frame have been obscured with a Gaussian blur.
 - `recognition`: (Optional) Recognition results. Only included if `recognition: true` is passed in the request.
 - `top_k`: (Optional) Max results for recognition. Default is 1. Supports `top_n` as alias.
-- `branch`, `group_id`: (Optional) Filters for recognition.
+- `branch`: (Optional) Filter for recognition.
 - Date Filtering: Recognition search can be limited by time using `day`, `from_day`, `to_day`, `since_ts`, or `until_ts`.
 
 Curl:
@@ -921,13 +1121,74 @@ curl -s -X POST "http://localhost:8001/v1/faces/privacy_extract" \
 
 ---
 
+## Privacy Blur (v2 — bbox-targeted)
+
+### `POST /v1/faces/privacy_blur` (JSON)
+
+**Auth:** API key
+
+Blur every detected face on the **full frame** except the one at the supplied `bbox`. Unlike `privacy_extract` (which auto-detects subjects and returns per-face crops), v2 lets the **caller specify which face to keep** and returns a single full-size image. Useful when you already know the target face box (e.g. from a prior detection/recognition call).
+
+Request body:
+```json
+{
+  "image_b64": "<base64-encoded-image or http-url>",
+  "bbox": [271.8, 109.6, 452.7, 370.1],
+  "blur_all": false
+}
+```
+
+- `image_b64` (string, required) base64 **or** HTTP/HTTPS URL. Aliases: `image`, `images_b64`, `url`.
+- `bbox` (array `[x1, y1, x2, y2]`, optional) the face to **keep** unblurred. The detected face with the highest IoU overlap is kept.
+- `blur_all` (bool, default `false`) when `true`, blur **every** detected face including the `bbox` target.
+
+Behavior:
+
+- All other detected faces are obscured with a Gaussian blur scaled to face size.
+- If `bbox` overlaps no detected face, that region simply stays clear (only detected faces are blurred).
+- If `bbox` is omitted and `blur_all=false`, all detected faces are blurred (no target kept).
+- If no faces are detected, the original image is returned with `blurred_count = 0`.
+
+Response:
+```json
+{
+  "image_b64": "data:image/jpeg;base64,...",
+  "faces_total": 5,
+  "blurred_count": 4,
+  "kept_bbox": [271.8, 109.6, 452.7, 370.1]
+}
+```
+
+- `image_b64`: full-frame JPEG (base64 data URL) with the non-target faces blurred.
+- `faces_total`: number of faces detected in the frame.
+- `blurred_count`: number of faces actually blurred.
+- `kept_bbox`: the box left unblurred (detected match, or the raw input bbox if no overlap), `null` when `blur_all=true` or no bbox given.
+
+Curl (base64):
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/privacy_blur" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"image_b64":"...base64...","bbox":[271.8,109.6,452.7,370.1]}'
+```
+
+Curl (URL + blur all):
+```bash
+curl -s -X POST "http://localhost:8001/v1/faces/privacy_blur" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"image_b64":"https://example.com/photo.jpg","blur_all":true}'
+```
+
+---
+
 ## Recognition events (ingestion + audit)
 
 These endpoints store recognition attempts in the local events DB (SQLite) and save event images/thumbnails.
 
 ### `POST /v1/events/recognition` (multipart)
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Form fields:
 
@@ -938,7 +1199,7 @@ Form fields:
 - `top_k` (int, optional, default `5`)
 - `min_similarity` (float, optional)
 - `process_all_faces` (bool, optional, default `false`) process multiple faces per image
-- `group_id` (text, optional) filter recognition by group
+- `branch` (text, optional) filter recognition by branch
 
 Response:
 ```json
@@ -1002,7 +1263,7 @@ curl -s -X POST "http://localhost:8001/v1/events/recognition" \
 
 List recognition events with filtering and pagination.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Query params:
 
@@ -1037,7 +1298,7 @@ curl -s "http://localhost:8001/v1/events/recognition?camera=front_door&limit=10"
 
 Fetch a single stored event by ID.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Response: Single `RecognitionEventResponse` object (same shape as items in the list).
 
@@ -1050,7 +1311,7 @@ curl -s "http://localhost:8001/v1/events/recognition/42c72ad0-1f38-4015-9986-0d5
 
 Submit human feedback for a recognition event (used for accuracy tracking).
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Request body:
 ```json
@@ -1084,7 +1345,7 @@ curl -s -X POST "http://localhost:8001/v1/events/recognition/42c72ad0-.../feedba
 
 Forward a stored recognition event to an external webhook URL.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Request body:
 ```json
@@ -1113,7 +1374,7 @@ curl -s -X POST "http://localhost:8001/v1/events/recognition/forward" \
 
 List all unique camera names from stored events.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Query params:
 
@@ -1133,7 +1394,7 @@ curl -s "http://localhost:8001/v1/events/recognition/cameras"
 
 Get aggregated recognition statistics.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Query params:
 
@@ -1167,7 +1428,7 @@ curl -s "http://localhost:8001/v1/events/recognition/stats?day=2026-05-14"
 
 Get feedback accuracy statistics.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Query params:
 
@@ -1207,7 +1468,7 @@ These endpoints log and query face search operations.
 
 List search events with pagination.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Query params:
 
@@ -1247,7 +1508,7 @@ curl -s "http://localhost:8001/v1/search_history?limit=20"
 
 Get search history statistics.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Query params:
 
@@ -1276,7 +1537,7 @@ curl -s "http://localhost:8001/v1/search_history/stats?match_threshold=0.8"
 
 Serve the full query image for a search event.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Response: JPEG image (`image/jpeg`).
 
@@ -1289,7 +1550,7 @@ curl -s "http://localhost:8001/v1/search_history/asset/image/EVENT_ID" -o query.
 
 Serve the thumbnail for a search event query.
 
-**Auth:** None
+**Auth:** Optional (x-api-key for segregation)
 
 Response: JPEG image (`image/jpeg`).
 

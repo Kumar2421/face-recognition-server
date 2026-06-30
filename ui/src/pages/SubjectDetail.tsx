@@ -45,7 +45,7 @@ export default function SubjectDetail() {
     (async () => {
       if (!subjectId) return;
       try {
-        const s = await getSubject(subjectId);
+        const s = await getSubject(subjectId, currentFilter());
         setSubject(s);
       } catch {
         setSubject(null);
@@ -181,7 +181,7 @@ export default function SubjectDetail() {
               cursor: !cursor || loading ? 'not-allowed' : 'pointer'
             }}
           >
-            {loading ? 'Loading More...' : 'Load More Images'}
+            {loading ? <><span className="spinner" />Loading More...</> : 'Load More Images'}
           </button>
         </div>
       </div>

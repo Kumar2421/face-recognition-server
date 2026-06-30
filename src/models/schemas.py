@@ -23,7 +23,9 @@ class FaceAddRequest(BaseModel):
     subject_id: str
     images_b64: List[str] = []
     image_urls: List[str] = []
-    group_id: Optional[str] = None
+    branch: Optional[str] = None
+    created_at: Optional[str] = None
+    ts: Optional[float] = None
 
 class GroupCreateRequest(BaseModel):
     group_id: str
@@ -38,6 +40,21 @@ class GroupResponse(BaseModel):
 class GroupListResponse(BaseModel):
     groups: List[GroupResponse]
 
+class BranchCreateRequest(BaseModel):
+    branch_id: str
+    name: Optional[str] = None
+    meta: Optional[dict] = None
+
+class BranchResponse(BaseModel):
+    branch_id: str
+    name: Optional[str] = None
+    meta: Optional[dict] = None
+    subject_count: Optional[int] = 0
+    enrollment_count: Optional[int] = 0
+
+class BranchListResponse(BaseModel):
+    branches: List[BranchResponse]
+
 class FaceAddResponse(BaseModel):
     subject_id: str
     num_images: int
@@ -48,7 +65,12 @@ class FaceAddResponse(BaseModel):
 class FaceSearchTopKRequest(BaseModel):
     image_b64: str = Field(..., validation_alias=AliasChoices("image_b64", "image", "images_b64"))
     top_k: int = 5
-    group_id: Optional[str] = None
+    branch: Optional[str] = None
+    day: Optional[str] = None
+    from_day: Optional[str] = None
+    to_day: Optional[str] = None
+    since_ts: Optional[float] = None
+    until_ts: Optional[float] = None
 
 class FaceSearchTopKItem(BaseModel):
     subject_id: str
@@ -65,7 +87,12 @@ class FaceRecognizeRequest(BaseModel):
     image_b64: str = Field(..., validation_alias=AliasChoices("image_b64", "image", "images_b64"))
     top_k: int = 5
     min_similarity: Optional[float] = None
-    group_id: Optional[str] = None
+    branch: Optional[str] = None
+    day: Optional[str] = None
+    from_day: Optional[str] = None
+    to_day: Optional[str] = None
+    since_ts: Optional[float] = None
+    until_ts: Optional[float] = None
 
 class FaceRecognizeResponse(BaseModel):
     matched: bool
@@ -90,7 +117,8 @@ class QualityCheckResponse(BaseModel):
 class RecognitionEventResponse(BaseModel):
     event_id: str
     ts: float
-    camera: str
+    camera: str = ""
+    branch: Optional[str] = None
     source_path: str
     decision: str
     subject_id: Optional[str] = None
@@ -170,7 +198,6 @@ class RecognitionFetchRequest(BaseModel):
     top_k: int = 5
     min_similarity: Optional[float] = None
     process_all_faces: bool = False
-    group_id: Optional[str] = None
 
 class FaceCompareRequest(BaseModel):
     image1_b64: Optional[str] = None
@@ -196,7 +223,6 @@ class PrivacyExtractRequest(BaseModel):
     recognition: bool = False
     top_k: int = Field(1, validation_alias=AliasChoices("top_k", "top_n"))
     branch: Optional[str] = None
-    group_id: Optional[str] = None
     day: Optional[str] = None
     from_day: Optional[str] = None
     to_day: Optional[str] = None
@@ -211,3 +237,39 @@ class PrivacyCropItem(BaseModel):
 
 class PrivacyExtractResponse(BaseModel):
     results: List[PrivacyCropItem]
+
+class PrivacyBlurRequest(BaseModel):
+    # base64 string or http(s) URL
+    image_b64: str = Field(..., validation_alias=AliasChoices("image_b64", "image", "images_b64", "url"))
+    # [x1, y1, x2, y2] of the face to KEEP unblurred
+    bbox: Optional[List[float]] = None
+    # If true, blur every detected face (including the bbox target)
+    blur_all: bool = False
+
+class PrivacyBlurResponse(BaseModel):
+    image_b64: str
+    faces_total: int
+    blurred_count: int
+    kept_bbox: Optional[List[float]] = None
+
+class KeyCreateRequest(BaseModel):
+    name: Optional[str] = None
+    # Optional explicit key value; if omitted the server generates one.
+    api_key: Optional[str] = Field(None, validation_alias=AliasChoices("api_key", "key"))
+
+class KeyInfo(BaseModel):
+    key_id: str
+    name: Optional[str] = None
+    access_key: str
+    created_at: Optional[str] = None
+    active: bool = True
+    # Masked key for listing; raw value returned only once on creation.
+    api_key: Optional[str] = None
+    api_key_masked: Optional[str] = None
+
+class KeyListResponse(BaseModel):
+    keys: List[KeyInfo]
+
+class KeyDeleteResponse(BaseModel):
+    key_id: str
+    deleted: bool

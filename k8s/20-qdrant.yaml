@@ -1,0 +1,82 @@
+# Single stateful Qdrant container.
+# hostPath-backed PV (single-node) so storage survives pod restarts and can
+# reuse migrated data. Bound statically to the StatefulSet's volumeClaimTemplate
+# via storageClassName: manual.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: qdrant-pv
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  hostPath:
+    path: /home/fusion-gpu/fusion-projects/face-recognition-server/data/qdrant_storage
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  namespace: face
+  labels:
+    app: qdrant
+spec:
+  clusterIP: None        # headless: stable DNS qdrant.face.svc.cluster.local
+  selector:
+    app: qdrant
+  ports:
+    - name: http
+      port: 6333
+      targetPort: 6333
+    - name: grpc
+      port: 6334
+      targetPort: 6334
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: qdrant
+  namespace: face
+spec:
+  serviceName: qdrant
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qdrant
+  template:
+    metadata:
+      labels:
+        app: qdrant
+    spec:
+      containers:
+        - name: qdrant
+          image: qdrant/qdrant:latest
+          ports:
+            - containerPort: 6333
+            - containerPort: 6334
+          volumeMounts:
+            - name: qdrant-storage
+              mountPath: /qdrant/storage
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 6333
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+  volumeClaimTemplates:
+    - metadata:
+        name: qdrant-storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: manual
+        resources:
+          requests:
+            storage: 20Gi

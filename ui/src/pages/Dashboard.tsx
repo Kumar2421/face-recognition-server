@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { getApiBase, recognitionFeedbackStats, stats, subjects, type FeedbackStatsResponse, type Stats, type SubjectItem } from '../lib/api';
+import { getApiBase, getBranches, recognitionFeedbackStats, stats, type FeedbackStatsResponse, type Stats } from '../lib/api';
 import StatCard from '../components/StatCard';
 
 export default function Dashboard() {
@@ -9,37 +9,30 @@ export default function Dashboard() {
   const [loading, setLoading] = useState<boolean>(false);
   const [employeeStats, setEmployeeStats] = useState<{ total: number; byBranch: Record<string, number> }>({ total: 0, byBranch: {} });
 
-  function getBranchFromSid(sid: string): string {
-    const parts = sid.split('-');
-    if (parts.length <= 2) return 'Main';
-    const branchParts = parts.slice(2).filter(p => !/^\d+$/.test(p));
-    return branchParts.join('-') || 'Main';
-  }
-
   async function fetchStats() {
     setLoading(true);
     setErr(null);
     try {
-      const s = await stats();
+      const [s, f, b] = await Promise.all([
+        stats(),
+        recognitionFeedbackStats({ 
+          since_ts: Math.floor(Date.now() / 1000) - 24 * 3600, 
+          until_ts: Math.floor(Date.now() / 1000) 
+        }),
+        getBranches()
+      ]);
+      
       setData(s);
-
-      const now = Math.floor(Date.now() / 1000);
-      const since = now - 24 * 3600;
-      const f = await recognitionFeedbackStats({ since_ts: since, until_ts: now });
       setFb(f);
 
-      // Fetch all employees to calculate counts
-      const empResp = await subjects({ q: 'employee-', limit: 10000 });
-      const emps = (empResp.items || []).filter((it: SubjectItem) => 
-        String(it.subject_id || '').toLowerCase().startsWith('employee-')
-      );
-      
       const byBranch: Record<string, number> = {};
-      for (const e of emps) {
-        const b = getBranchFromSid(e.subject_id);
-        byBranch[b] = (byBranch[b] || 0) + 1;
+      let totalEmps = 0;
+      for (const branch of b.branches || []) {
+        const count = branch.subject_count || 0;
+        byBranch[branch.name || branch.branch_id] = count;
+        totalEmps += count;
       }
-      setEmployeeStats({ total: emps.length, byBranch });
+      setEmployeeStats({ total: totalEmps, byBranch });
 
     } catch (e: any) {
       setErr(String(e));
@@ -80,7 +73,7 @@ export default function Dashboard() {
           <div style={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>API Base: <code style={{ background: 'var(--bg-secondary)', padding: '2px 4px', borderRadius: 4 }}>{getApiBase()}</code></div>
         </div>
         <button onClick={fetchStats} className="primary" style={{ height: '40px' }}>
-          {loading ? 'Refreshing...' : 'Refresh Stats'}
+          {loading ? <><span className="spinner" />Refreshing...</> : 'Refresh Stats'}
         </button>
       </header>
 
