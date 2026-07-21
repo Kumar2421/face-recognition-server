@@ -21,6 +21,10 @@ export default function Subjects() {
   const [branchList, setBranchList] = useState<BranchItem[]>([]);
   const [selectedBranch, setSelectedBranch] = useState<string>('');
 
+  // Multi-select for bulk delete.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState<boolean>(false);
+
   const dateFilter: DateFilter = useMemo(() => {
     return {
       day: dateMode === 'day' ? (day || null) : null,
@@ -133,19 +137,74 @@ export default function Subjects() {
     if (!confirm(`Delete subject ${s}?`)) return;
     try {
       await deleteSubject(s);
+      setSelected((prev) => { const n = new Set(prev); n.delete(s); return n; });
       load();
     } catch (e: any) {
       alert(`Delete failed: ${String(e)}`);
     }
   }
 
+  function toggleSelect(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  // Are all subjects on the current page selected?
+  const pageAllSelected = pageItems.length > 0 && pageItems.every((it) => selected.has(it.subject_id));
+
+  function toggleSelectPage() {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (pageAllSelected) pageItems.forEach((it) => next.delete(it.subject_id));
+      else pageItems.forEach((it) => next.add(it.subject_id));
+      return next;
+    });
+  }
+
+  function clearSelection() { setSelected(new Set()); }
+
+  async function onBulkDelete() {
+    const ids = Array.from(selected);
+    if (ids.length === 0) return;
+    if (!confirm(`Delete ${ids.length} subject${ids.length > 1 ? 's' : ''}? This cannot be undone.`)) return;
+    setBulkBusy(true);
+    try {
+      const results = await Promise.allSettled(ids.map((id) => deleteSubject(id)));
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      clearSelection();
+      await load();
+      if (failed > 0) alert(`${failed} of ${ids.length} deletions failed.`);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '16px', flexWrap: 'wrap' }}>
         <div>
           <h2 style={{ fontSize: '1.875rem', fontWeight: 800, color: 'var(--text-primary)', marginBottom: '4px' }}>Subjects Directory</h2>
-          <p style={{ color: 'var(--text-secondary)', fontSize: '0.9375rem' }}>Manage and monitor enrolled subjects and their face embeddings.</p>
+          <p style={{ color: 'var(--text-secondary)', fontSize: '0.9375rem' }}>
+            Manage and monitor enrolled subjects and their face embeddings.
+            {!loading && !error && (
+              <span style={{ marginLeft: '8px', color: 'var(--text-muted)', fontWeight: 600 }}>
+                · {filtered.length} subject{filtered.length !== 1 ? 's' : ''}
+              </span>
+            )}
+          </p>
         </div>
+        {pageItems.length > 0 && (
+          <button
+            onClick={toggleSelectPage}
+            style={{ height: '38px', padding: '0 16px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontWeight: 600, fontSize: '0.875rem', display: 'flex', alignItems: 'center', gap: '8px' }}
+          >
+            <input type="checkbox" readOnly checked={pageAllSelected} style={{ width: '16px', height: '16px', accentColor: 'var(--primary)', pointerEvents: 'none' }} />
+            {pageAllSelected ? 'Deselect Page' : 'Select Page'}
+          </button>
+        )}
       </header>
 
       <div className="card" style={{ display: 'flex', flexWrap: 'wrap', gap: '24px', alignItems: 'flex-end', background: 'var(--bg-primary)' }}>
@@ -204,14 +263,63 @@ export default function Subjects() {
         </button>
       </div>
 
+      {selected.size > 0 && (
+        <div
+          className="card"
+          style={{
+            position: 'sticky', top: '12px', zIndex: 10,
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '16px', flexWrap: 'wrap',
+            padding: '12px 20px', background: 'var(--bg-primary)', border: '1px solid var(--primary)',
+            boxShadow: 'var(--shadow-md, 0 4px 12px rgba(0,0,0,0.15))',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span style={{ background: 'var(--primary)', color: 'white', borderRadius: '99px', padding: '2px 12px', fontWeight: 700, fontSize: '0.875rem' }}>
+              {selected.size}
+            </span>
+            <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+              subject{selected.size !== 1 ? 's' : ''} selected
+            </span>
+          </div>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+            <button onClick={clearSelection} disabled={bulkBusy} style={{ padding: '8px 16px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border)', background: 'var(--bg-secondary)', color: 'var(--text-primary)', fontWeight: 600 }}>
+              Clear
+            </button>
+            <button
+              onClick={onBulkDelete}
+              disabled={bulkBusy}
+              style={{ padding: '8px 18px', borderRadius: 'var(--radius-sm)', border: 'none', background: 'var(--error)', color: 'white', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', cursor: bulkBusy ? 'not-allowed' : 'pointer', opacity: bulkBusy ? 0.7 : 1 }}
+            >
+              {bulkBusy ? <span className="spinner" /> : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+              )}
+              Delete Selected ({selected.size})
+            </button>
+          </div>
+        </div>
+      )}
+
       {loading && <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px', padding: '40px', color: 'var(--text-muted)', fontWeight: 500 }}><span className="spinner" />Loading subjects...</div>}
       {error && <div style={{ color: 'var(--error)', background: 'rgba(239, 68, 68, 0.1)', padding: '16px', borderRadius: 'var(--radius-md)', border: '1px solid var(--error)' }}>{error}</div>}
 
       {!loading && !error && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: '16px' }}>
-          {pageItems.map((it) => (
-            <div key={it.subject_id} className="card hover-lift" style={{ display: 'flex', flexDirection: 'column', gap: '12px', padding: '12px', borderRadius: 'var(--radius-sm)', cursor: 'default' }}>
+          {pageItems.map((it) => {
+            const isSel = selected.has(it.subject_id);
+            return (
+            <div key={it.subject_id} className="card hover-lift" style={{ display: 'flex', flexDirection: 'column', gap: '12px', padding: '12px', borderRadius: 'var(--radius-sm)', cursor: 'default', border: isSel ? '2px solid var(--primary)' : '2px solid transparent', background: isSel ? 'color-mix(in srgb, var(--primary) 6%, var(--bg-primary))' : undefined, transition: 'border-color 0.15s, background 0.15s' }}>
               <div style={{ height: '160px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-sm)', overflow: 'hidden', position: 'relative' }}>
+                <label
+                  onClick={(e) => e.stopPropagation()}
+                  style={{ position: 'absolute', top: '8px', left: '8px', zIndex: 3, display: 'flex', alignItems: 'center', justifyContent: 'center', width: '28px', height: '28px', borderRadius: 'var(--radius-sm)', background: 'rgba(0,0,0,0.35)', backdropFilter: 'blur(2px)', cursor: 'pointer' }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={isSel}
+                    onChange={() => toggleSelect(it.subject_id)}
+                    style={{ width: '18px', height: '18px', accentColor: 'var(--primary)', cursor: 'pointer' }}
+                  />
+                </label>
                 {(() => {
                   const p = previews[it.subject_id];
                   const src = p?.image_path || p?.thumb_path ? `${getApiBase()}${p.image_path || p.thumb_path}` : '';
@@ -256,7 +364,8 @@ export default function Subjects() {
                 </button>
               </div>
             </div>
-          ))}
+            );
+          })}
           {filtered.length === 0 && (
             <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '80px', color: 'var(--text-muted)', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', border: '2px dashed var(--border)' }}>
               No subjects found matching your criteria.

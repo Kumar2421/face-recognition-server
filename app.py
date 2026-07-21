@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, Depends, Security, BackgroundTasks
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, Depends, Security, BackgroundTasks, Request
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -269,6 +269,9 @@ _QDRANT_SEARCH_LAT = Histogram("qdrant_search_latency_seconds", "Qdrant search l
 _QDRANT_UPSERT_LAT = Histogram("qdrant_upsert_latency_seconds", "Qdrant upsert latency seconds")
 _QDRANT_ERR = Counter("qdrant_errors_total", "Qdrant errors total")
 
+# Load-shedding: requests rejected with 503 because the in-flight cap was hit.
+_REQ_SHED_TOTAL = Counter("face_requests_shed_total", "Heavy requests rejected by concurrency gate")
+
 
 def _t() -> float:
     try:
@@ -470,6 +473,56 @@ def _quality_check_and_embed(bgr: np.ndarray) -> tuple[np.ndarray, dict[str, Any
     return emb, meta
 
 
+# --- Event-loop safety: blocking CPU/GPU work (image decode, quality+embed,
+#     face detection) must never run inline in an `async def` handler, or it
+#     freezes the single event loop and starves /health -> orchestrator kills
+#     the container under load. These helpers push the blocking call onto a
+#     worker thread (ort/cv2/httpx all release the GIL) so the loop stays live.
+async def _decode_b64_image_async(image_b64: str) -> np.ndarray:
+    return await asyncio.to_thread(_decode_b64_image, image_b64)
+
+
+async def _quality_check_and_embed_async(bgr: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    return await asyncio.to_thread(_quality_check_and_embed, bgr)
+
+
+async def _detect_all_async(infer: Any, bgr: np.ndarray) -> list[Any]:
+    return list(await asyncio.to_thread(infer.detect_all, bgr))
+
+
+def _build_decode_pool() -> "concurrent.futures.ProcessPoolExecutor":
+    """CPU decode pool. `max_tasks_per_child` recycles workers so a slow memory
+    leak or a single huge image can't grow a child unbounded (py>=3.11); falls
+    back cleanly on older runtimes."""
+    workers = os.cpu_count() or 4
+    try:
+        recycle = int(os.environ.get("DECODE_POOL_RECYCLE", "200") or "200")
+    except Exception:
+        recycle = 200
+    try:
+        return concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers, max_tasks_per_child=max(1, recycle)
+        )
+    except TypeError:
+        # Python < 3.11: max_tasks_per_child unsupported.
+        return concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+
+
+async def _decode_image_bytes_offloaded(image_bytes: bytes) -> np.ndarray:
+    """Decode raw image bytes on the CPU pool. If a child died (OOM ->
+    BrokenProcessPool) rebuild the pool once and retry, instead of returning
+    500 forever until the container is restarted."""
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(app.state.executor, _decode_image_bytes, image_bytes)
+    except concurrent.futures.process.BrokenProcessPool:
+        try:
+            app.state.executor = _build_decode_pool()
+        except Exception:
+            pass
+        return await loop.run_in_executor(app.state.executor, _decode_image_bytes, image_bytes)
+
+
 def _quality_check_all(bgr: np.ndarray) -> tuple[list[dict[str, Any]], dict[str, Any], np.ndarray]:
     try:
         evaluator = getattr(app.state, "quality", None)
@@ -483,10 +536,19 @@ def _quality_check_all(bgr: np.ndarray) -> tuple[list[dict[str, Any]], dict[str,
 
     t0 = _t()
     try:
-        # Use detect_all to get all faces
-        faces = embedder.detect_all(bgr)
+        # Use detect_all to get all faces. A faceless image is a VALID input
+        # (client sent a photo with no detectable face), not a server error:
+        # return an empty result so the handler responds 200 with
+        # total_quality="fail" instead of crashing with 500.
+        try:
+            faces = embedder.detect_all(bgr)
+        except ValueError as e:
+            if "no face" in str(e).lower():
+                timing = {"detect_ms": int(max(0.0, (_t() - t0)) * 1000.0)}
+                return [], {"timing": timing, "reason": "no_face_detected"}, bgr.copy()
+            raise
         results = []
-        
+
         annotated = bgr.copy()
         
         for i, face in enumerate(faces):
@@ -963,10 +1025,6 @@ def _load_index_json_embeddings(index_path: str) -> FaceIndex:
     return FaceIndex(subject_ids=subject_ids, mean_embeddings=mat)
 
 
-def _infer_tflite(model_path: str, input_data: np.ndarray) -> np.ndarray:
-    raise RuntimeError("tflite inference not supported in Buffalo-L only mode")
-
-
 ## BuffaloLEmbedder moved to embedders.buffalo_l
 
 
@@ -1044,12 +1102,143 @@ async def _metrics_middleware(request, call_next):
         _REQ_TOTAL.labels(endpoint=path).inc()
     except Exception:
         pass
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except RuntimeError as e:
+        # Starlette BaseHTTPMiddleware raises "No response returned." when the
+        # client disconnects mid-request (slow upload, Postman cancel/retry,
+        # proxy timeout). Benign — the peer is already gone. Swallow quietly
+        # instead of dumping a multi-frame traceback per aborted request.
+        if "No response returned" in str(e):
+            return Response(status_code=499)
+        raise
     try:
         _REQ_LAT.labels(endpoint=path).observe(max(0.0, _t() - t0))
     except Exception:
         pass
     return response
+
+
+# --- Load-shedding concurrency gate -----------------------------------------
+# Bound the number of in-flight *heavy* (image-decoding / GPU) requests. When
+# the cap is hit we reject immediately with 503 instead of accepting unbounded
+# work that decodes big images into RAM and floods the GPU queue -> OOM SIGKILL.
+# Cheap/monitoring paths (/health, /metrics, static, GET list endpoints) are
+# never gated. Registered last -> runs outermost -> sheds before any real work.
+_INFLIGHT_MAX = max(1, int(os.environ.get("FACE_SERVICE_MAX_INFLIGHT", "32") or "32"))
+# Max requests allowed to WAIT for a processing slot before we shed (protects
+# memory/event-loop from an unbounded backlog). Beyond this depth -> 503.
+_MAX_QUEUE = max(1, int(os.environ.get("FACE_SERVICE_MAX_QUEUE", "512") or "512"))
+# How long a queued request may wait for a slot before we give up with 503.
+_QUEUE_WAIT_SEC = float(os.environ.get("FACE_SERVICE_QUEUE_WAIT_SEC", "60") or "60")
+_inflight_count = 0
+# Path markers for handlers that decode an image / touch the GPU. Matched even
+# with the optional /api prefix still attached (gate runs before prefix strip).
+_HEAVY_MARKERS = ("/faces", "/face/", "/quality/", "/events/recognition")
+
+
+def _is_heavy_request(request) -> bool:
+    if request.method not in ("POST", "PUT"):
+        return False
+    p = request.url.path
+    if not any(m in p for m in _HEAVY_MARKERS):
+        return False
+    # GET-style sub-resources are cheap; only the base decoding POSTs are heavy.
+    # Feedback/forward sub-paths carry no image -> exempt.
+    if p.endswith("/feedback") or p.endswith("/forward"):
+        return False
+    return True
+
+
+class _ConcurrencyGateASGI:
+    """Leak-proof heavy-request concurrency gate with a bounded wait queue.
+
+    Pure ASGI middleware (NOT BaseHTTPMiddleware) so the slot release ALWAYS
+    runs on client disconnect/cancel -- BaseHTTPMiddleware orphaned its finally
+    and leaked the counter until every heavy request 503'd until restart.
+
+    Behaviour (queue-and-process, don't drop):
+      - At most `_INFLIGHT_MAX` heavy requests run concurrently (caps GPU/GIL
+        contention so each stays fast).
+      - Excess requests WAIT in FIFO for a free slot instead of being dropped,
+        so a burst of events is fully processed (each returns its real result),
+        just staggered.
+      - A request is shed with 503 ONLY under true overload: the wait queue is
+        already `_MAX_QUEUE` deep, or a request waits longer than
+        `_QUEUE_WAIT_SEC`. That protects memory + the event loop.
+
+    The GET path and non-heavy POSTs bypass the gate entirely and stay instant.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self._sem: "asyncio.Semaphore | None" = None
+        self._waiters = 0
+
+    @staticmethod
+    def _is_heavy_scope(scope) -> bool:
+        if scope.get("method") not in ("POST", "PUT"):
+            return False
+        p = scope.get("path", "") or ""
+        if not any(m in p for m in _HEAVY_MARKERS):
+            return False
+        # Feedback/forward sub-paths carry no image -> exempt.
+        if p.endswith("/feedback") or p.endswith("/forward"):
+            return False
+        return True
+
+    def _get_sem(self) -> "asyncio.Semaphore":
+        # Lazily created on the running loop (single event loop).
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(_INFLIGHT_MAX)
+        return self._sem
+
+    async def _shed(self, scope, receive, send, detail: str):
+        try:
+            _REQ_SHED_TOTAL.inc()
+        except Exception:
+            pass
+        resp = JSONResponse(
+            status_code=503,
+            content={"detail": detail},
+            headers={"Retry-After": "1"},
+        )
+        await resp(scope, receive, send)
+
+    async def __call__(self, scope, receive, send):
+        global _inflight_count
+        if scope.get("type") != "http" or not self._is_heavy_scope(scope):
+            return await self.app(scope, receive, send)
+
+        # Stamp arrival so the handler can report queue-wait (time spent waiting
+        # for a slot, BEFORE the model runs) in a response header.
+        scope["_gate_enter"] = time.perf_counter()
+
+        # Overflow guard: refuse to grow the backlog without bound.
+        if self._waiters >= _MAX_QUEUE:
+            return await self._shed(scope, receive, send, "server overloaded, retry later")
+
+        sem = self._get_sem()
+        acquired = False
+        self._waiters += 1
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=_QUEUE_WAIT_SEC)
+            acquired = True
+        except asyncio.TimeoutError:
+            return await self._shed(scope, receive, send, "server busy (queue wait exceeded), retry later")
+        finally:
+            self._waiters -= 1
+
+        # acquired == True here (timeout path returned above).
+        _inflight_count += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _inflight_count -= 1
+            sem.release()
+
+
+app.add_middleware(_ConcurrencyGateASGI)
 
 
 @app.get("/metrics")
@@ -1123,13 +1312,22 @@ def debug_providers() -> dict[str, Any]:
 
 
 from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
     logger.error("422 Validation Error at %s: %s", request.url, exc.errors())
+    # exc.errors() can embed the raw request input as bytes (e.g. a multipart
+    # file sent to a JSON endpoint, or a malformed body). Plain json.dumps on
+    # bytes raises "Object of type bytes is not JSON serializable", which
+    # crashed THIS handler -> 500. jsonable_encoder + a bytes encoder keeps the
+    # 422 response JSON-safe regardless of the offending input.
     return JSONResponse(
         status_code=422,
-        content={"detail": exc.errors(), "body": str(exc)},
+        content=jsonable_encoder(
+            {"detail": exc.errors(), "body": str(exc)},
+            custom_encoder={bytes: lambda b: f"<{len(b)} bytes>"},
+        ),
     )
 
 
@@ -1232,7 +1430,7 @@ def _startup() -> None:
             app.state.qdrant = None
 
     # CPU-bound task offloading (e.g., image decoding)
-    app.state.executor = concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count() or 4)
+    app.state.executor = _build_decode_pool()
 
     # Dedicated thread pool for model inference (embedding/quality). The ONNX
     # session can't be shipped to a process pool, but ort releases the GIL so a
@@ -1241,6 +1439,25 @@ def _startup() -> None:
         max_workers=int(os.environ.get("EMBED_THREADS", "2") or 2),
         thread_name_prefix="embed",
     )
+
+    # Starvation fix: GPU-manager submits (asyncio.to_thread -> detect_*_timed)
+    # park a worker thread on threading.Event (done.wait) for the ENTIRE GPU
+    # queue-wait + exec. The default asyncio.to_thread pool is only
+    # min(32, cpu+4) threads, so under a burst those slots fill with parked
+    # waiters and newly-admitted requests block waiting for a *thread* before
+    # they can even enqueue GPU work -- adding seconds of latency that is not
+    # GPU compute. Parked-on-Event threads are cheap (no GIL/CPU while waiting),
+    # so size the default executor comfortably above the inflight cap.
+    try:
+        _tt_workers = max(64, _INFLIGHT_MAX * 2 + 16)
+        asyncio.get_event_loop().set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=_tt_workers, thread_name_prefix="to-thread"
+            )
+        )
+        logger.info("default to_thread executor sized to %d workers", _tt_workers)
+    except Exception as e:
+        logger.warning("could not resize default executor: %s", str(e))
 
     embeddings_index = os.environ.get("FACE_EMBEDDINGS_INDEX")
     try:
@@ -2089,9 +2306,9 @@ async def faces_add_upload(
         if existing >= cap:
             break
         image_bytes = await f.read()
-        bgr = _decode_image_bytes(image_bytes)
+        bgr = await _decode_image_bytes_offloaded(image_bytes)
         try:
-            emb, meta = _quality_check_and_embed(bgr)
+            emb, meta = await _quality_check_and_embed_async(bgr)
         except HTTPException as e:
             _debug(f"add_skip subject_id={subject_id} idx={i} reason={e.detail}")
             continue
@@ -2181,10 +2398,10 @@ async def faces_add_upload(
         url = str(url or "").strip()
         if not url:
             continue
-        image_bytes = _decode_b64_bytes(url)
-        bgr = _decode_image_bytes(image_bytes)
+        image_bytes = await asyncio.to_thread(_decode_b64_bytes, url)
+        bgr = await _decode_image_bytes_offloaded(image_bytes)
         try:
-            emb, meta = _quality_check_and_embed(bgr)
+            emb, meta = await _quality_check_and_embed_async(bgr)
         except HTTPException as e:
             _debug(f"add_skip subject_id={subject_id} url_idx={i} reason={e.detail}")
             continue
@@ -2365,8 +2582,8 @@ async def faces_search_upload(
     top_k = int(top_k or 5)
     top_k = max(1, min(top_k, 50))
     image_bytes = await file.read()
-    bgr = _decode_image_bytes(image_bytes)
-    emb, _meta = _quality_check_and_embed(bgr)
+    bgr = await _decode_image_bytes_offloaded(image_bytes)
+    emb, _meta = await _quality_check_and_embed_async(bgr)
     results = _qdrant_search(q, app.state.qdrant_collection, emb, top_k=top_k, branch=branch, since_ts=s_ts, until_ts=e_ts, access_key=access_key)
 
     thumb_path = None
@@ -2570,7 +2787,7 @@ async def ingest_recognition_event(
     t_total0 = _pc()
     t_decode0 = _pc()
     image_bytes = await file.read()
-    bgr = _decode_image_bytes(image_bytes)
+    bgr = await _decode_image_bytes_offloaded(image_bytes)
     decode_ms = int(max(0.0, (_pc() - t_decode0)) * 1000.0)
     h, w = bgr.shape[:2]
 
@@ -2664,39 +2881,46 @@ async def ingest_recognition_event(
     infer_timing: dict[str, Any] = {}
     try:
         infer = getattr(app.state, "gpu", None) or app.state.embedder
-        if process_all_faces:
-            if hasattr(infer, "detect_all_timed"):
-                faces, tinfo = infer.detect_all_timed(bgr)
-                infer_timing = dict(tinfo or {})
-            else:
-                faces = list(infer.detect_all(bgr))
-        else:
-            use_largest = str(os.environ.get("FACE_SERVICE_USE_LARGEST_FACE", "0") or "0").strip() in (
-                "1",
-                "true",
-                "True",
-                "yes",
-                "YES",
-            )
-            if use_largest:
+
+        # Detection + embedding blocks (GPU queue wait can be seconds). Run it on
+        # a worker thread so the event loop stays free to serve /health etc.
+        def _run_detect() -> tuple[list[Any], dict[str, Any]]:
+            _timing: dict[str, Any] = {}
+            if process_all_faces:
                 if hasattr(infer, "detect_all_timed"):
-                    faces_all, tinfo = infer.detect_all_timed(bgr)
-                    infer_timing = dict(tinfo or {})
-                    face0 = _pick_best_face_by_area(list(faces_all or []))
-                    faces = [face0]
+                    _faces, tinfo = infer.detect_all_timed(bgr)
+                    _timing = dict(tinfo or {})
                 else:
-                    faces = [
-                        _pick_best_face_by_area(list(infer.detect_all(bgr)))
-                        if hasattr(infer, "detect_all")
-                        else infer.detect_best(bgr)
-                    ]
+                    _faces = list(infer.detect_all(bgr))
             else:
-                if hasattr(infer, "detect_best_timed"):
-                    face0, tinfo = infer.detect_best_timed(bgr)
-                    faces = [face0]
-                    infer_timing = dict(tinfo or {})
+                use_largest = str(os.environ.get("FACE_SERVICE_USE_LARGEST_FACE", "0") or "0").strip() in (
+                    "1",
+                    "true",
+                    "True",
+                    "yes",
+                    "YES",
+                )
+                if use_largest:
+                    if hasattr(infer, "detect_all_timed"):
+                        faces_all, tinfo = infer.detect_all_timed(bgr)
+                        _timing = dict(tinfo or {})
+                        _faces = [_pick_best_face_by_area(list(faces_all or []))]
+                    else:
+                        _faces = [
+                            _pick_best_face_by_area(list(infer.detect_all(bgr)))
+                            if hasattr(infer, "detect_all")
+                            else infer.detect_best(bgr)
+                        ]
                 else:
-                    faces = [infer.detect_best(bgr)]
+                    if hasattr(infer, "detect_best_timed"):
+                        face0, tinfo = infer.detect_best_timed(bgr)
+                        _faces = [face0]
+                        _timing = dict(tinfo or {})
+                    else:
+                        _faces = [infer.detect_best(bgr)]
+            return _faces, _timing
+
+        faces, infer_timing = await asyncio.to_thread(_run_detect)
         faces_total = len(faces)
     except ValueError:
         if primary_resp is None:
@@ -2805,17 +3029,17 @@ async def ingest_recognition_event(
         if evaluator is not None:
             try:
                 t_e0 = _pc()
-                emb = _embed_from_face(face)
+                emb = await asyncio.to_thread(_embed_from_face, face)
                 if emb is not None:
                     try:
-                        quality_meta = evaluator.evaluate(bgr, face)
+                        quality_meta = await asyncio.to_thread(evaluator.evaluate, bgr, face)
                     except Exception:
                         quality_meta = None
                     if isinstance(quality_meta, dict) and quality_meta.get("status") == "rejected":
                         raise ValueError(f"quality_reject:{str(quality_meta.get('reason') or 'unknown')}")
                 else:
                     bgr_face = _crop_face(bgr, face)
-                    emb, quality_meta = _quality_check_and_embed(bgr_face)
+                    emb, quality_meta = await _quality_check_and_embed_async(bgr_face)
                 quality_ms = int(max(0.0, (_pc() - t_e0)) * 1000.0)
 
                 try:
@@ -3816,12 +4040,12 @@ async def faces_recognize_upload(
     image_bytes = await file.read()
 
     t_decode_start = _pc()
-    loop = asyncio.get_event_loop()
-    bgr = await loop.run_in_executor(app.state.executor, _decode_image_bytes, image_bytes)
+    bgr = await _decode_image_bytes_offloaded(image_bytes)
     if bgr is None:
         raise HTTPException(status_code=400, detail="unable to decode image")
     decode_ms = int((_pc() - t_decode_start) * 1000.0)
 
+    loop = asyncio.get_event_loop()
     t_embed_start = _pc()
     # Run model inference off the event loop so concurrent camera traffic
     # doesn't block frontend API calls (stats/events) from being served.
@@ -3887,20 +4111,27 @@ async def faces_recognize_upload(
 
 
 @app.post("/v1/quality/check_upload", response_model=QualityCheckResponse)
-async def quality_check_upload(file: UploadFile = File(...)) -> QualityCheckResponse:
+async def quality_check_upload(
+    file: UploadFile = File(...),
+    annotate: bool = Form(default=True),
+) -> QualityCheckResponse:
     t0 = _pc()
     image_bytes = await file.read()
     decode_t0 = _pc()
-    bgr = _decode_image_bytes(image_bytes)
+    bgr = await _decode_image_bytes_offloaded(image_bytes)
     decode_ms = int(max(0.0, (_pc() - decode_t0)) * 1000.0)
 
     q_t0 = _pc()
-    results, meta, annotated = _quality_check_all(bgr)
+    results, meta, annotated = await asyncio.to_thread(_quality_check_all, bgr)
     quality_ms = int(max(0.0, (_pc() - q_t0)) * 1000.0)
 
-    # Convert annotated image to base64
-    _, buffer = cv2.imencode('.jpg', annotated)
-    annotated_b64 = base64.b64encode(buffer).decode('utf-8')
+    # The annotated JPEG (boxes drawn) is base64'd into the response — it is the
+    # single biggest part of the payload (~30 KB). Callers that only need the
+    # quality verdict can pass annotate=false to skip the encode + download.
+    annotated_image = ""
+    if annotate:
+        _, buffer = cv2.imencode('.jpg', annotated)
+        annotated_image = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}"
 
     total_ok = all(r["ok"] for r in results) if results else False
     total_quality = "pass" if total_ok else "fail"
@@ -3913,7 +4144,7 @@ async def quality_check_upload(file: UploadFile = File(...)) -> QualityCheckResp
         ok=bool(total_ok),
         total_quality=str(total_quality),
         faces=[FaceQualityResult(**r) for r in results],
-        annotated_image=f"data:image/jpeg;base64,{annotated_b64}",
+        annotated_image=annotated_image,
         timing=timing,
     )
 
@@ -3921,19 +4152,28 @@ async def quality_check_upload(file: UploadFile = File(...)) -> QualityCheckResp
 @app.post("/v1/faces/privacy_extract", response_model=PrivacyExtractResponse)
 async def privacy_extract(
     req: PrivacyExtractRequest,
+    request: Request,
+    response: Response,
     access_key: str = Depends(get_optional_access_key),
 ) -> PrivacyExtractResponse:
     t0 = _pc()
-    bgr = _decode_b64_image(req.image_b64)
-    
+    _tm = {}
+    # queue-wait = handler start - gate arrival (time spent waiting for a slot).
+    _gate_enter = request.scope.get("_gate_enter")
+    _queue_wait_ms = int(max(0.0, (t0 - _gate_enter)) * 1000) if _gate_enter else 0
+    bgr = await _decode_b64_image_async(req.image_b64)
+    _tm["decode_ms"] = int((_pc() - t0) * 1000); _t1 = _pc()
+
     # Use GPU manager if available, else direct embedder
     infer = getattr(app.state, "gpu", None) or app.state.embedder
     try:
-        faces = infer.detect_all(bgr)
+        faces = await _detect_all_async(infer, bgr)
     except Exception as e:
         if "no face" in str(e).lower():
             return PrivacyExtractResponse(results=[])
         raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
+    _tm["detect_ms"] = int((_pc() - _t1) * 1000)
+    _tm["quality_ms"] = 0; _tm["blur_ms"] = 0; _tm["encode_ms"] = 0; _tm["rec_ms"] = 0
 
     evaluator = getattr(app.state, "quality", None)
     results = []
@@ -3958,10 +4198,12 @@ async def privacy_extract(
         # 1. Quality filtering BEFORE any processing (on original image)
         quality_meta = None
         if evaluator:
+            _q0 = _pc()
             try:
                 quality_meta = evaluator.evaluate(bgr, target_face)
             except Exception:
                 pass
+            _tm["quality_ms"] += int((_pc() - _q0) * 1000)
         
         # 2. Define crop region with 150px padding
         target_bbox = np.asarray(getattr(target_face, "bbox", None), dtype=np.float32).reshape(-1)
@@ -4053,9 +4295,11 @@ async def privacy_extract(
                     )
 
         # 5. Encode to base64
+        _e0 = _pc()
         _, buffer = cv2.imencode('.jpg', crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
         crop_b64 = base64.b64encode(buffer).decode('utf-8')
-        
+        _tm["encode_ms"] += int((_pc() - _e0) * 1000)
+
         results.append(PrivacyCropItem(
             bbox=target_bbox.tolist() if target_bbox.size == 4 else None,
             quality=quality_meta,
@@ -4063,6 +4307,13 @@ async def privacy_extract(
             recognition=rec_res
         ))
 
+    _tm["total_ms"] = int((_pc() - t0) * 1000)
+    # Expose the per-layer split so a client/benchmark can attribute latency
+    # without correlating logs: queue wait vs model processing.
+    response.headers["X-Queue-Ms"] = str(_queue_wait_ms)
+    response.headers["X-Model-Ms"] = str(_tm["total_ms"])
+    response.headers["X-Detect-Ms"] = str(_tm.get("detect_ms", 0))
+    logger.info("privacy_extract timing: queue=%dms %s faces=%d", _queue_wait_ms, _tm, len(faces))
     return PrivacyExtractResponse(results=results)
 
 
@@ -4087,12 +4338,12 @@ async def privacy_blur(req: PrivacyBlurRequest) -> PrivacyBlurResponse:
     """Privacy v2: blur every detected face on the full frame EXCEPT the one at
     `bbox`. `blur_all=true` blurs all faces (including the bbox target).
     Returns the full image as base64. Input accepts base64 or http(s) URL."""
-    bgr = _decode_b64_image(req.image_b64)
+    bgr = await _decode_b64_image_async(req.image_b64)
     h, w = bgr.shape[:2]
 
     infer = getattr(app.state, "gpu", None) or app.state.embedder
     try:
-        faces = infer.detect_all(bgr)
+        faces = await _detect_all_async(infer, bgr)
     except Exception as e:
         if "no face" in str(e).lower():
             faces = []
@@ -4198,29 +4449,29 @@ async def face_compare_upload(
 ) -> FaceCompareResponse:
     # Resolve image 1: file takes priority, then URL
     if file1 and file1.size:
-        bgr1 = _decode_image_bytes(await file1.read())
+        bgr1 = await _decode_image_bytes_offloaded(await file1.read())
     elif image1_url:
-        bgr1 = _decode_image_bytes(_decode_b64_bytes(image1_url))
+        bgr1 = await _decode_image_bytes_offloaded(await asyncio.to_thread(_decode_b64_bytes, image1_url))
     else:
         raise HTTPException(status_code=400, detail="image 1 required: provide file1 or image1_url")
 
     # Resolve image 2: file takes priority, then URL
     if file2 and file2.size:
-        bgr2 = _decode_image_bytes(await file2.read())
+        bgr2 = await _decode_image_bytes_offloaded(await file2.read())
     elif image2_url:
-        bgr2 = _decode_image_bytes(_decode_b64_bytes(image2_url))
+        bgr2 = await _decode_image_bytes_offloaded(await asyncio.to_thread(_decode_b64_bytes, image2_url))
     else:
         raise HTTPException(status_code=400, detail="image 2 required: provide file2 or image2_url")
 
-    return _compare_two_faces(bgr1, bgr2)
+    return await asyncio.to_thread(_compare_two_faces, bgr1, bgr2)
 
 
 @app.post("/v1/face/search_upload", response_model=FaceSearchResponse, dependencies=[Depends(get_api_key)])
 async def face_search_upload(file: UploadFile = File(...)) -> FaceSearchResponse:
     image_bytes = await file.read()
-    bgr = _decode_image_bytes(image_bytes)
-    req = FaceSearchRequest(image_b64="")
-    return face_search(req.model_copy(update={"image_b64": base64.b64encode(image_bytes).decode("ascii")}))
+    req = FaceSearchRequest(image_b64=base64.b64encode(image_bytes).decode("ascii"))
+    # face_search is a sync handler (decode + GPU embed); run it off the event loop.
+    return await asyncio.to_thread(face_search, req)
 
 
 @app.get("/ui")
@@ -4722,3 +4973,172 @@ def health() -> dict[str, Any]:
             "gc_objects": len(gc.get_objects()),
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# Async job queue — "202 + poll" facade over the heavy image endpoints.
+#
+# Burst-friendly ingestion: the client submits a job and returns immediately
+# (202 + job_id); background workers drain the queue at server capacity by
+# self-calling the existing endpoint (reusing ALL its logic including the
+# concurrency gate). Results are written to a shared file store so a poll can
+# land on EITHER uvicorn worker process (the two workers do not share memory).
+#
+#   POST /v1/jobs            {endpoint, payload}      -> 202 {job_id}
+#   GET  /v1/jobs/{job_id}                            -> {status, result}
+#
+# Bounded everywhere: per-process queue caps at JOB_QUEUE_MAX (503 past it),
+# JOB_WORKERS concurrent executors, results expire after JOB_TTL_SEC.
+# ---------------------------------------------------------------------------
+
+_JOBS_DIR = os.environ.get("JOBS_DIR", "/data/jobs")
+_JOB_TTL_SEC = int(os.environ.get("JOB_TTL_SEC", "3600") or 3600)
+_JOB_WORKERS = max(1, int(os.environ.get("JOB_WORKERS", "4") or 4))
+_JOB_QUEUE_MAX = max(1, int(os.environ.get("JOB_QUEUE_MAX", "256") or 256))
+_JOB_SELF_BASE = os.environ.get("JOB_SELF_BASE", "http://127.0.0.1:8000")
+# Only heavy processing endpoints may be run as jobs.
+_JOB_ALLOWED_ENDPOINTS = {
+    "/v1/faces/privacy_extract",
+    "/v1/faces/privacy_blur",
+    "/v1/faces/recognize",
+    "/v1/faces/search",
+    "/v1/face/search",
+}
+
+_job_queue: "asyncio.Queue | None" = None
+
+
+class JobSubmitRequest(BaseModel):
+    endpoint: str
+    payload: dict
+
+
+def _job_path(job_id: str) -> str:
+    # job_id is a server-generated uuid4 -> safe as a filename.
+    return os.path.join(_JOBS_DIR, f"{job_id}.json")
+
+
+def _job_write(job_id: str, data: dict) -> None:
+    """Atomic write (tmp + rename) so a concurrent poll never reads a torn file."""
+    os.makedirs(_JOBS_DIR, exist_ok=True)
+    tmp = _job_path(job_id) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, _job_path(job_id))
+
+
+def _job_read(job_id: str) -> dict | None:
+    try:
+        with open(_job_path(job_id)) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _jobs_cleanup_expired() -> None:
+    try:
+        now = time.time()
+        for name in os.listdir(_JOBS_DIR):
+            p = os.path.join(_JOBS_DIR, name)
+            try:
+                if now - os.path.getmtime(p) > _JOB_TTL_SEC:
+                    os.unlink(p)
+            except OSError:
+                pass
+    except FileNotFoundError:
+        pass
+
+
+@app.post("/v1/jobs", status_code=202)
+async def submit_job(req: JobSubmitRequest, request: Request):
+    if req.endpoint not in _JOB_ALLOWED_ENDPOINTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"endpoint not allowed for jobs; allowed: {sorted(_JOB_ALLOWED_ENDPOINTS)}",
+        )
+    if _job_queue is None:
+        raise HTTPException(status_code=503, detail="job queue not ready")
+    if _job_queue.full():
+        raise HTTPException(
+            status_code=503,
+            detail="job queue full, retry later",
+            headers={"Retry-After": "2"},
+        )
+    job_id = str(uuid.uuid4())
+    _job_write(job_id, {
+        "job_id": job_id,
+        "status": "queued",
+        "endpoint": req.endpoint,
+        "created_at": time.time(),
+    })
+    api_key = request.headers.get("x-api-key", "")
+    _job_queue.put_nowait((job_id, req.endpoint, req.payload, api_key))
+    return {"job_id": job_id, "status": "queued", "poll": f"/v1/jobs/{job_id}"}
+
+
+@app.get("/v1/jobs/{job_id}")
+async def get_job(job_id: str):
+    data = _job_read(job_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="job not found (unknown id or expired)")
+    return data
+
+
+async def _job_worker(worker_idx: int) -> None:
+    """Drains the queue by self-calling the real endpoint on localhost.
+
+    Self-call reuses the endpoint's full logic (validation, auth bucket,
+    concurrency gate, metrics) with zero duplication; the gate bounds how many
+    jobs actually hit the GPU at once.
+    """
+    async with httpx.AsyncClient(base_url=_JOB_SELF_BASE, timeout=300) as client:
+        while True:
+            job_id, endpoint, payload, api_key = await _job_queue.get()
+            started = time.time()
+            base = {"job_id": job_id, "endpoint": endpoint, "started_at": started}
+            _job_write(job_id, {**base, "status": "running"})
+            try:
+                r = await client.post(endpoint, json=payload,
+                                      headers={"x-api-key": api_key} if api_key else {})
+                try:
+                    result = r.json()
+                except Exception:
+                    result = {"raw": r.text[:10000]}
+                _job_write(job_id, {
+                    **base,
+                    "status": "done" if r.status_code == 200 else "failed",
+                    "http_status": r.status_code,
+                    "finished_at": time.time(),
+                    "duration_ms": int((time.time() - started) * 1000),
+                    "result": result,
+                })
+            except Exception as e:
+                _job_write(job_id, {
+                    **base,
+                    "status": "failed",
+                    "error": str(e)[:2000],
+                    "finished_at": time.time(),
+                })
+            finally:
+                _job_queue.task_done()
+
+
+async def _job_ttl_task() -> None:
+    while True:
+        await asyncio.sleep(600)
+        _jobs_cleanup_expired()
+
+
+@app.on_event("startup")
+async def _jobs_startup() -> None:
+    global _job_queue
+    os.makedirs(_JOBS_DIR, exist_ok=True)
+    _jobs_cleanup_expired()
+    _job_queue = asyncio.Queue(maxsize=_JOB_QUEUE_MAX)
+    for i in range(_JOB_WORKERS):
+        asyncio.create_task(_job_worker(i))
+    asyncio.create_task(_job_ttl_task())
+    logger.info("async jobs ready: workers=%d queue_max=%d dir=%s ttl=%ds",
+                _JOB_WORKERS, _JOB_QUEUE_MAX, _JOBS_DIR, _JOB_TTL_SEC)
