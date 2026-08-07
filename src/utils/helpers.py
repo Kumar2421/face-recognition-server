@@ -33,8 +33,17 @@ def _decode_b64_image(image_b64: str) -> np.ndarray:
         except Exception:
             raise HTTPException(status_code=400, detail="invalid base64")
     
+    # Empty / invalid base64 -> empty buffer. cv2.imdecode RAISES
+    # "(-215:Assertion failed) !buf.empty()" on an empty array (it does not
+    # return None), which escaped as a 500. Guard the empty case and wrap
+    # imdecode so any decode failure surfaces as a clean 400.
     arr = np.frombuffer(img_bytes, dtype=np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if arr.size == 0:
+        raise HTTPException(status_code=400, detail="empty image data (base64 decoded to 0 bytes)")
+    try:
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except cv2.error:
+        raise HTTPException(status_code=400, detail="unable to decode image")
     if bgr is None:
         raise HTTPException(status_code=400, detail="unable to decode image")
     return bgr

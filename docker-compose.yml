@@ -22,6 +22,13 @@ services:
       context: .
       dockerfile: Dockerfile
 
+    # 2 uvicorn worker PROCESSES = 2 separate Python interpreters = 2 separate
+    # GILs. The throughput ceiling was the single process's GIL (CPU pre/post
+    # serialized), NOT the GPU (4 GPU workers gave no gain). Two processes double
+    # effective RPS. Each process loads its own model (~7.5 GB VRAM) -> ~15 GB of
+    # 16 GB; TRT workspace is capped below to keep 2 instances inside VRAM.
+    command: ["python3.11", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+
     volumes:
       - ./app.py:/app/app.py
       - ./cross_check.py:/app/cross_check.py
@@ -46,7 +53,7 @@ services:
       - FACE_DIR=/data/facefolder/security
       - CONFIG_PATH=/app/config.yaml
       - QDRANT_URL=http://qdrant:6333
-      - QDRANT_COLLECTION=frigate_faces_v27
+      - QDRANT_COLLECTION=frigate_faces_v28
       # - QDRANT_COLLECTION=frigate_faces_v10
       # - QDRANT_COLLECTION=frigate_faces_v3
       # - QDRANT_COLLECTION=frigate_faces_v2
@@ -55,23 +62,32 @@ services:
       - QDRANT_EXACT=0
       - BUFFALO_MODEL_ROOT=/models
       - BUFFALO_MODEL_NAME=buffalo_l
-      - BUFFALO_DET_SIZE=640
+      - BUFFALO_DET_SIZE=320
       - FACE_SERVICE_DEBUG=1
       - BUFFALO_MIN_DET_SCORE=0.3
       - BUFFALO_ENABLE_FALLBACK_VARIANTS=0
       - BUFFALO_PROVIDERS=CUDAExecutionProvider,CPUExecutionProvider
-      - ORT_TENSORRT_ENGINE_CACHE_ENABLE=0
+      - ORT_TENSORRT_ENGINE_CACHE_ENABLE=1
       - ORT_TENSORRT_CACHE_PATH=/data/trt_cache
-      - ORT_TENSORRT_FP16_ENABLE=0
+      - ORT_TENSORRT_FP16_ENABLE=1
       - FACE_EMBEDDINGS_INDEX=/data/facefolder/security_embeddings/index.json
       - GPU_INFERENCE_MANAGER=1
       - GPU_QUEUE_MAX=2048
-      - GPU_BATCH_WINDOW_MS=0
+      - GPU_BATCH_WINDOW_MS=8
       - GPU_NUM_WORKERS=2
       - GPU_JOB_TIMEOUT_SEC=180
+      # Heavy-request concurrency gate: cap parallel GPU work so each request
+      # stays fast; excess WAITS in a bounded FIFO queue (processed, not dropped);
+      # 503 only when queue >512 deep or a request waits >60s (true overload).
+      - FACE_SERVICE_MAX_INFLIGHT=12
+      - FACE_SERVICE_MAX_QUEUE=512
+      - FACE_SERVICE_QUEUE_WAIT_SEC=60
       # ONNXRuntime Memory Optimizations
       - ORT_CUDA_MEMORY_LIMIT_MB=2048
       - ORT_CUDA_ARENA_EXTEND_STRATEGY=kSameAsRequested
+      # Cap TensorRT workspace so TWO worker processes fit in 16 GB VRAM
+      # (each instance ~7.5 GB -> tight; smaller TRT workspace shrinks each).
+      - ORT_TENSORRT_MAX_WORKSPACE_SIZE=1073741824
       # Lean cuDNN workspace (EXHAUSTIVE default reserves GBs per session)
       - ORT_CUDNN_CONV_ALGO_SEARCH=HEURISTIC
       # Load only used models (drop unused genderage + landmark_2d_106)

@@ -1182,6 +1182,91 @@ curl -s -X POST "http://localhost:8001/v1/faces/privacy_blur" \
 
 ---
 
+## Async Jobs (202 + poll) — burst-friendly ingestion
+
+Submit heavy image work as a **job**: the call returns **immediately** (202 + `job_id`) and background workers process it at server capacity. Use this when firing **bursts of events** — the client never waits on the processing queue.
+
+**Measured:** 30-job burst → all submits answered in ~37 ms each, all 30 processed in ~2 s, zero drops.
+
+### `POST /v1/jobs`
+
+**Auth:** API key (forwarded to the underlying endpoint — data segregation applies as usual)
+
+Request body:
+```json
+{
+  "endpoint": "/v1/faces/privacy_extract",
+  "payload": { "image_b64": "<base64 or http-url>", "recognition": true, "top_k": 1 }
+}
+```
+
+- `endpoint` (string, required) — which heavy endpoint to run. Allowed:
+  `/v1/faces/privacy_extract`, `/v1/faces/privacy_blur`, `/v1/faces/recognize`, `/v1/faces/search`, `/v1/face/search`
+- `payload` (object, required) — the exact JSON body that endpoint normally takes.
+
+Response — **202 Accepted, returns in milliseconds**:
+```json
+{ "job_id": "4d7d1c85-9b74-4273-afc4-0830f267e8da", "status": "queued", "poll": "/v1/jobs/4d7d1c85-..." }
+```
+
+Errors: `400` endpoint not allowed · `503 Retry-After` job queue full (> `JOB_QUEUE_MAX`).
+
+Curl:
+```bash
+curl -s -X POST "http://localhost:8001/v1/jobs" \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"endpoint":"/v1/faces/privacy_extract","payload":{"image_b64":"...base64...","recognition":true}}'
+```
+
+### `GET /v1/jobs/{job_id}`
+
+Poll job status and fetch the result.
+
+**Auth:** none required for polling (job_id is an unguessable UUID)
+
+Response while running:
+```json
+{ "job_id": "...", "status": "running", "endpoint": "/v1/faces/privacy_extract", "started_at": 1783156000.1 }
+```
+
+Response when finished:
+```json
+{
+  "job_id": "...",
+  "status": "done",
+  "http_status": 200,
+  "duration_ms": 746,
+  "result": { "results": [ { "bbox": [...], "quality": {...}, "image_b64": "data:image/jpeg;base64,...", "recognition": {...} } ] }
+}
+```
+
+- `status`: `queued` → `running` → `done` | `failed`
+- `result`: the **exact response body** the underlying endpoint would have returned synchronously.
+- `http_status`: the underlying endpoint's status (a 4xx there → job `status:"failed"` with the error in `result`).
+- `404`: unknown `job_id` or the job expired (`JOB_TTL_SEC`, default 1 h).
+
+Curl:
+```bash
+curl -s "http://localhost:8001/v1/jobs/4d7d1c85-9b74-4273-afc4-0830f267e8da" | python3 -m json.tool
+```
+
+### Configuration
+
+- `JOB_WORKERS` (default `4`) — background executors per server process.
+- `JOB_QUEUE_MAX` (default `256`) — max queued jobs per process; beyond → `503 Retry-After`.
+- `JOB_TTL_SEC` (default `3600`) — results kept this long, then deleted.
+- `JOBS_DIR` (default `/data/jobs`) — shared result store (works across worker processes).
+
+### Notes / semantics
+
+- **Fire a burst safely:** submit N jobs (each 202 in ms), poll each `job_id` — the server drains at its own capacity; nothing is dropped up to `JOB_QUEUE_MAX`.
+- Jobs are **best-effort ephemeral**: a server restart loses queued/running jobs (their status stops updating). Re-submit on timeout.
+- The job executes with the submitter's `x-api-key`, so tenant data-segregation is identical to calling the endpoint directly.
+- Sync endpoints are unchanged — use them when you want the answer in one round-trip; use jobs for bursts.
+
+---
+
 ## Recognition events (ingestion + audit)
 
 These endpoints store recognition attempts in the local events DB (SQLite) and save event images/thumbnails.
